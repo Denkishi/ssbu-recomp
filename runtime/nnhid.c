@@ -425,7 +425,72 @@ static DWORD WINAPI synth_get_caps(DWORD slot, DWORD flags, XCaps *out) {
     out->flags = (WORD)(g_xs[slot].wireless ? 0x0002 : 0);    /* XINPUT_CAPS_WIRELESS */
     return 0;
 }
+/* SSBU_INPUT_LAT=1 (measurement only; not set, nothing is recorded): WHEN the game reads the pad, for the first player
+ * the game reads as connected. Five times per read or per frame, in microseconds, the last 65536 of each, printed at exit:
+ *   took:    how long the read itself (nn::hid::GetNpadState) kept the game's thread;
+ *   gap:     from the read before to this read (the game's own polling rate);
+ *   phase:   from the last refresh signal (display.c, the 60 Hz clock the game counts) to this read;
+ *   age:     how old the pad thread's record was at this read (nnpad_sdl.c; only with a device);
+ *   to show: from the last read before a frame was handed over for display (nvnQueuePresentTexture) to that moment.
+ * What it does NOT tell: how many of the game's frames pass between a read and the frame whose picture shows its effect.
+ * That is inside the game (which read a logic frame uses, and which logic frame a picture shows); "to show" is only the
+ * shortest possible way, a read that was used by the very frame that followed it. */
+#define LAT_N 65536
+static int g_lat = -1, g_lat_id = -1;
+static struct { uint32_t v[LAT_N]; LONG64 n; } g_lat_s[5];
+static LONG64 g_lat_last_read, g_lat_reads, g_lat_frames, g_lat_per_frame[4], g_lat_tid_changes;
+static volatile LONG g_lat_since_present;
+static DWORD g_lat_tid;
+static int lat_on(void) { if (g_lat < 0) { const char *e = getenv("SSBU_INPUT_LAT"); g_lat = e && atoi(e) != 0; } return g_lat; }
+static void lat_add(int k, LONG64 us) { if (us < 0) us = 0; g_lat_s[k].v[g_lat_s[k].n++ % LAT_N] = us > 0xffffffffll ? 0xffffffffu : (uint32_t)us; }
+static LONG64 lat_us(LONG64 ticks) { static LARGE_INTEGER f; if (!f.QuadPart) QueryPerformanceFrequency(&f); return ticks * 1000000 / f.QuadPart; }
+long long display_refresh_qpc(void);                         /* display.c */
+static void lat_read(uint32_t id) {
+    LARGE_INTEGER t;
+    if (g_lat_id < 0) g_lat_id = (int)id;
+    if ((int)id != g_lat_id) return;
+    QueryPerformanceCounter(&t);
+    if (g_lat_last_read) lat_add(0, lat_us(t.QuadPart - g_lat_last_read));
+    { long long r = display_refresh_qpc(); if (r) lat_add(1, lat_us(t.QuadPart - r)); }
+    { long long a = sdl_on() ? nnpad_sample_age_us((int)id) : -1; if (a >= 0) lat_add(2, a); }
+    if (g_lat_tid && g_lat_tid != GetCurrentThreadId()) g_lat_tid_changes++;
+    g_lat_tid = GetCurrentThreadId();
+    g_lat_last_read = t.QuadPart;
+    g_lat_reads++;
+    InterlockedIncrement(&g_lat_since_present);
+}
+void input_lat_present(long long qpc) {                      /* display.c, once per frame handed over for display */
+    if (!lat_on() || !g_lat_last_read) return;
+    LONG n = InterlockedExchange(&g_lat_since_present, 0);
+    g_lat_frames++;
+    g_lat_per_frame[n > 3 ? 3 : n]++;
+    lat_add(3, lat_us(qpc - g_lat_last_read));
+}
+static int lat_cmp(const void *a, const void *b) { uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b; return x < y ? -1 : x > y; }
+static void lat_line(FILE *out, int k, const char *what) {
+    LONG64 n = g_lat_s[k].n > LAT_N ? LAT_N : g_lat_s[k].n;
+    if (!n) { fprintf(out, "  %-58s no sample\n", what); return; }
+    qsort(g_lat_s[k].v, (size_t)n, sizeof(uint32_t), lat_cmp);
+    fprintf(out, "  %-58s median %7.3f ms, 1%% %7.3f, 99%% %7.3f, longest %7.3f (%lld samples)\n", what, g_lat_s[k].v[n / 2] / 1000.0, g_lat_s[k].v[n / 100] / 1000.0,
+            g_lat_s[k].v[n - 1 - n / 100] / 1000.0, g_lat_s[k].v[n - 1] / 1000.0, (long long)n);
+}
+static void lat_report(FILE *out) {
+    if (!lat_on() || !g_lat_reads) return;
+    fprintf(out, "nn::hid: SSBU_INPUT_LAT, player %d: %lld reads (last on thread %lu, the thread changed %lld times), %lld frames handed over for display\n",
+            g_lat_id + 1, (long long)g_lat_reads, (unsigned long)g_lat_tid, (long long)g_lat_tid_changes, (long long)g_lat_frames);
+    lat_line(out, 4, "the read itself took:");
+    lat_line(out, 0, "from one read to the next:");
+    lat_line(out, 1, "from the refresh signal to the read:");
+    lat_line(out, 2, "age of the pad thread's record at the read:");
+    lat_line(out, 3, "from the last read to the frame handed over for display:");
+    fprintf(out, "  reads between two frames handed over: none %lld, one %lld, two %lld, three or more %lld\n",
+            (long long)g_lat_per_frame[0], (long long)g_lat_per_frame[1], (long long)g_lat_per_frame[2], (long long)g_lat_per_frame[3]);
+    { long long st[4];
+      if (sdl_on() && nnpad_thread_stats(st)) fprintf(out, "  pad thread: %lld rounds, %lld of them over 1 ms, longest %.3f ms, longest time from one round to the next %.3f ms\n", st[0], st[1], st[2] / 1000.0, st[3] / 1000.0);
+      else fprintf(out, "  pad thread: none (SSBU_PAD_THREAD=0 or another backend): the reads above did SDL's work themselves\n"); }
+}
 void hid_report(FILE *out) {
+    lat_report(out);
     if (g_x_synth != 1) return;
     fprintf(out, "nn::hid: synthetic XInput pad on slot 0 (SSBU_XINPUT_SYNTH): %lld XInputGetState calls, %lld state changes, %lld XInputSetState calls "
                  "(vibration), largest motor values left %u right %u of 65535, last left %u right %u\n",
@@ -518,12 +583,22 @@ static int key_for(uint32_t id, int vk, int kbidx) {         /* vk = the fixed k
     return down;
 }
 
+static void fill_pad_1(uint64_t out, uint32_t id, int style_is_fullkey);
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
+    LARGE_INTEGER a, b;
+    if (!lat_on()) { fill_pad_1(out, id, style_is_fullkey); return; }
+    QueryPerformanceCounter(&a);
+    fill_pad_1(out, id, style_is_fullkey);
+    QueryPerformanceCounter(&b);
+    if ((int)id == g_lat_id) lat_add(4, lat_us(b.QuadPart - a.QuadPart));
+}
+static void fill_pad_1(uint64_t out, uint32_t id, int style_is_fullkey) {
     memset((void *)(uintptr_t)out, 0, 0x28);
     wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
     if (id > 7 || !style_is_fullkey) return;                  /* every controller here is a full-key (Pro) controller */
     if (id == 0) { int fight_seq_ticks(void); for (int n = fight_seq_ticks(); n > 0; n--) seq_tick(); }      /* S11: 1 per poll; SSBU_DETERMINISTIC in a fight: per fight frame (fighter_sdk\fighter_host.c) */
     if (!player_connected(id)) return;
+    if (lat_on()) lat_read(id);
     static const struct { int vk, bit; } map[] = {
         {'Z', BTN_A}, {'X', BTN_B}, {'C', BTN_X}, {'V', BTN_Y}, {'Q', BTN_L}, {'E', BTN_R}, {'A', BTN_ZL}, {'S', BTN_ZR},
         {VK_RETURN, BTN_PLUS}, {VK_BACK, BTN_MINUS}, {'J', BTN_LEFT}, {'I', BTN_UP}, {'L', BTN_RIGHT}, {'K', BTN_DOWN},

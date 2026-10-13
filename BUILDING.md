@@ -122,7 +122,9 @@ shader preparation (on a normal run it works for about 15 minutes of play and wr
 
 Options are environment variables, set with `--env NAME=VALUE` (full list: comments at the top of the runtime sources):
 `SSBU_RENDERER=vk|gl`, `SSBU_SHOW=1` (show the window of a test exe), `SSBU_STRICT=1|report|path` (list the host
-functions that are not the real behaviour), `SSBU_TRACE`, `SSBU_PAD_BACKEND=xinput`, `SSBU_FIXED_SEED=<n>`.
+functions that are not the real behaviour), `SSBU_TRACE`, `SSBU_PAD_BACKEND=xinput`, `SSBU_FIXED_SEED=<n>`,
+`SSBU_PAD_THREAD=0` (pads are read on the game's thread, as before the pad thread), `SSBU_INPUT_LAT=1` (at exit: when the
+game reads the pad, relative to the refresh and to the frame it hands over for display).
 Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
 
 ## Troubleshooting
