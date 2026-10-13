@@ -106,9 +106,11 @@ class Ctx:
         t0 = time.time()
         with open(path, 'ab') as f:
             f.write(('\n$ %s\n' % ' '.join(argv)).encode())
-            p = subprocess.run(argv, cwd=cwd or self.work, env=env or self.env(), stdout=f, stderr=subprocess.STDOUT)
+            f.flush()                            # the header goes above the child's output, not after it
+            start = f.tell()                     # the log is appended to: only what this child wrote is returned, or a
+            p = subprocess.run(argv, cwd=cwd or self.work, env=env or self.env(), stdout=f, stderr=subprocess.STDOUT)      # caller's check reads the result of an earlier, failed run
         with open(path, 'rb') as f:
-            f.seek(max(0, os.path.getsize(path) - 6000))
+            f.seek(max(start, os.path.getsize(path) - 6000))
             tail = f.read().decode('utf-8', 'replace')
         if p.returncode not in ok:
             raise Fail('%s failed (exit %s) after %s; see %s\n%s' % (' '.join(argv[:3]), p.returncode, fmt(time.time() - t0), path, tail[-1500:]))
