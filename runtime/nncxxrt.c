@@ -60,30 +60,82 @@ uint64_t cxxrt_main_symbol(const char *name) {           /* address of a functio
  * page tables to the end of the run of pages with the same state, which takes 2-3 ms inside the game's heap (gigabytes
  * committed in one run), and one throw asks about 22 addresses there (the fiber's stack). The answer for memory the GAME
  * manages (regions from nn::os::AllocateAddressRegion, registered with cxxrt_guest_region) is therefore remembered per
- * thread, and forgotten whenever any guest memory is decommitted, released or protected (cxxrt_mem_changed, called by
- * those entry points): between two such events the committed, accessible run that contains an address cannot shrink.
- * Host memory is asked about every time, as before. SSBU_NO_READABLE_CACHE=1 = ask every time everywhere. */
+ * thread. Host memory is asked about every time, as before. SSBU_NO_READABLE_CACHE=1 = ask every time everywhere.
+ *
+ * What makes a remembered run wrong is guest memory being decommitted, released or protected (cxxrt_mem_changed, called
+ * by those entry points before and after the change). Forgetting everything at each such event left one slow question
+ * per throw whenever the game had freed pages anywhere since the thread's last throw (measured, scripted match of 300 s,
+ * RX 9070 XT PC: 73 of 1,545 throws took 1.0-7.4 ms up to their landing pad, each of them one VirtualQuery over a run of
+ * 200-700 MB; the other throws 0.02-0.1 ms). The events are therefore kept with their address range (the last
+ * RD_CHANGES of them), and a remembered run is only cut back by the events that overlap it: the part of a committed,
+ * accessible run that no such event touched is still committed and accessible. A record older than the kept events is
+ * forgotten. Same match with this: 8 of 1,497 throws over 1 ms (1.4-6.3 ms). Those are the first question a thread asks
+ * about a run (the record starts at the page asked about, so a fiber stack lower in the same run asks again), which
+ * this does not remove. SSBU_READABLE_FORGET_ALL=1 = the behaviour before: every event forgets every record. */
 static struct { uint64_t base, size; } g_guest_region[64];
 static volatile LONG g_guest_regions, g_mem_epoch = 1;
-static int g_rd_nocache = -1;
-static volatile LONG64 g_rd_asked, g_rd_cached;
+#define RD_CHANGES 256
+static struct { uint64_t lo, hi; } g_rd_change[RD_CHANGES];       /* event number k (the value g_mem_epoch got) is in slot k % RD_CHANGES */
+static SRWLOCK g_rd_change_lock = SRWLOCK_INIT;
+static int g_rd_nocache = -1, g_rd_forget_all;
+static volatile LONG64 g_rd_asked, g_rd_cached, g_rd_kept;
 void cxxrt_guest_region(uint64_t base, uint64_t size) {
     LONG i = InterlockedIncrement(&g_guest_regions) - 1;
     if (i < 64) { g_guest_region[i].size = size; g_guest_region[i].base = base; } else InterlockedDecrement(&g_guest_regions);
 }
-void cxxrt_mem_changed(void) { InterlockedIncrement(&g_mem_epoch); }
-void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory\n", (long long)g_rd_asked, (long long)g_rd_cached); }
+/* Guest memory [base, base + size) is about to change or has just changed. size 0 = the whole region that starts at
+ * base (a release), or everything when no such region is registered. */
+void cxxrt_mem_changed(uint64_t base, uint64_t size) {
+    uint64_t lo = base & ~0xfffull, hi = (base + size + 0xfff) & ~0xfffull;      /* the OS changes whole pages */
+    if (!size || hi < lo) {
+        lo = 0; hi = ~0ull;
+        if (!size) for (int i = 0; i < g_guest_regions && i < 64; i++) if (g_guest_region[i].base == base) { lo = base; hi = base + g_guest_region[i].size; break; }
+    }
+    AcquireSRWLockExclusive(&g_rd_change_lock);
+    ULONG k = (ULONG)g_mem_epoch + 1;
+    g_rd_change[k % RD_CHANGES].lo = lo; g_rd_change[k % RD_CHANGES].hi = hi;
+    g_mem_epoch = (LONG)k;
+    ReleaseSRWLockExclusive(&g_rd_change_lock);
+}
+void cxxrt_readable_report(FILE *out) {
+    fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory (%lld of them from a record that was older than a change of guest memory elsewhere)\n",
+            (long long)g_rd_asked, (long long)g_rd_cached, (long long)g_rd_kept);
+}
+typedef struct { uint64_t lo, hi; LONG epoch; } RdRecord;
+/* The record holds [p, p + n) and is older than the newest event: applies the events since then to it. 0 = one of them
+ * touches [p, p + n) or the events are no longer kept (the record is dropped). */
+static int rd_bring_up_to_date(RdRecord *r, uint64_t p, size_t n) {
+    int ok = 1;
+    AcquireSRWLockShared(&g_rd_change_lock);
+    ULONG now = (ULONG)g_mem_epoch, from = (ULONG)r->epoch;
+    if (now - from > RD_CHANGES) ok = 0;
+    for (ULONG k = from + 1; ok && k - from <= now - from; k++) {
+        uint64_t lo = g_rd_change[k % RD_CHANGES].lo, hi = g_rd_change[k % RD_CHANGES].hi;
+        if (hi <= r->lo || lo >= r->hi) continue;
+        if (lo >= p + n) r->hi = lo;                  /* the event is above what is asked about: the run ends there now */
+        else if (hi <= p) r->lo = hi;                 /* below: it starts there */
+        else ok = 0;
+    }
+    r->epoch = (LONG)now;
+    ReleaseSRWLockShared(&g_rd_change_lock);
+    if (!ok) r->lo = r->hi = 0;
+    return ok;
+}
 int cxxrt_readable(uint64_t p, size_t n) {
-    static __declspec(thread) struct { uint64_t lo, hi; LONG epoch; } t_ok[4];
+    static __declspec(thread) RdRecord t_ok[4];
     static __declspec(thread) unsigned t_next;
     MEMORY_BASIC_INFORMATION mi;
     if (p < 0x10000) return 0;
     LONG epoch = g_mem_epoch;
     int guest = 0;
-    if (g_rd_nocache < 0) g_rd_nocache = getenv("SSBU_NO_READABLE_CACHE") != NULL;
+    if (g_rd_nocache < 0) { g_rd_forget_all = getenv("SSBU_READABLE_FORGET_ALL") != NULL; g_rd_nocache = getenv("SSBU_NO_READABLE_CACHE") != NULL; }
     if (!g_rd_nocache) {
         for (int i = 0; i < g_guest_regions && i < 64 && !guest; i++) guest = p - g_guest_region[i].base < g_guest_region[i].size;
-        if (guest) for (int i = 0; i < 4; i++) if (t_ok[i].epoch == epoch && p >= t_ok[i].lo && p + n <= t_ok[i].hi) { g_rd_cached++; return 1; }
+        if (guest) for (int i = 0; i < 4; i++) {
+            if (p < t_ok[i].lo || p + n > t_ok[i].hi) continue;
+            if (t_ok[i].epoch == epoch) { g_rd_cached++; return 1; }
+            if (!g_rd_forget_all && rd_bring_up_to_date(&t_ok[i], p, n)) { g_rd_cached++; g_rd_kept++; return 1; }
+        }
     }
     g_rd_asked++;
     if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi)) return 0;

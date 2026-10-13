@@ -421,8 +421,9 @@ static void os_FreeMemoryBlock(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0],
 static void os_SetMemoryPermission(Ctx *c) {
     DWORD old, prot = (uint32_t)c->x[2] == 3 ? PAGE_READWRITE : (uint32_t)c->x[2] == 1 ? PAGE_READONLY : PAGE_NOACCESS;
     if ((uint32_t)c->x[2] != 0 && (uint32_t)c->x[2] != 1 && (uint32_t)c->x[2] != 3) guest_trap("nn::os::SetMemoryPermission: invalid permission", c->x[30] - 4);
-    { void cxxrt_mem_changed(void); cxxrt_mem_changed(); }      /* nncxxrt.c: remembered readable checks are forgotten (P3) */
+    { void cxxrt_mem_changed(uint64_t base, uint64_t size); cxxrt_mem_changed(c->x[0], c->x[1]); }      /* nncxxrt.c: remembered readable checks of this range are forgotten (P3) */
     if (!VirtualProtect((void *)(uintptr_t)c->x[0], (SIZE_T)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
+    { void cxxrt_mem_changed(uint64_t base, uint64_t size); cxxrt_mem_changed(c->x[0], c->x[1]); }      /* and after it, as the frees do: a check that ran in between saw the old state */
 }
 static void os_SetMemoryAttribute(Ctx *c) { (void)c; }
 static void os_FreeAddressRegion2(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0], 0, MEM_RELEASE); c->x[0] = 0; }

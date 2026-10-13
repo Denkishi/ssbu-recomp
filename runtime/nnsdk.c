@@ -79,7 +79,7 @@ static void err_Variant_assign(Ctx *c) { wr32(A0, rd32(A1)); }      /* returns *
 static void ldn_MakeIpv4Address(Ctx *c) { RET(((A0 & 0xff) << 24) | ((A1 & 0xff) << 16) | ((A2 & 0xff) << 8) | (A3 & 0xff)); }
 
 /* ---- nn::os: virtual memory, used by the game's own allocator (jemalloc) */
-void cxxrt_guest_region(uint64_t base, uint64_t size); void cxxrt_mem_changed(void);      /* nncxxrt.c (P3) */
+void cxxrt_guest_region(uint64_t base, uint64_t size); void cxxrt_mem_changed(uint64_t base, uint64_t size);      /* nncxxrt.c (P3) */
 static void os_AllocateAddressRegion(Ctx *c) {
     void *p = VirtualAlloc(NULL, (SIZE_T)A1, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);      /* write watch: nvn_gl.c asks the OS which texture pages were written (P3) */
     if (p) cxxrt_guest_region((uint64_t)(uintptr_t)p, A1);      /* nncxxrt.c: readable checks inside this region are remembered (P3) */
@@ -87,8 +87,8 @@ static void os_AllocateAddressRegion(Ctx *c) {
     RET(p ? 0 : 0x1015);                                 /* any non-zero nn::Result means failure */
 }
 static void os_AllocateMemoryPages(Ctx *c) { RET(VirtualAlloc(P(0), (SIZE_T)A1, MEM_COMMIT, PAGE_READWRITE) ? 0 : 0x1015); }
-static void os_FreeMemoryPages(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), (SIZE_T)A1, MEM_DECOMMIT); cxxrt_mem_changed(); RET(0); }
-static void os_FreeAddressRegion(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(); RET(0); }
+static void os_FreeMemoryPages(Ctx *c) { cxxrt_mem_changed(A0, A1); VirtualFree(P(0), (SIZE_T)A1, MEM_DECOMMIT); cxxrt_mem_changed(A0, A1); RET(0); }
+static void os_FreeAddressRegion(Ctx *c) { cxxrt_mem_changed(A0, 0); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(A0, 0); RET(0); }
 
 /* ---- more libc */
 static void c_strtol(Ctx *c) {

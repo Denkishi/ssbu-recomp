@@ -646,6 +646,35 @@ static void st_main_unwind(Ctx *c) {
     CHECK((uint8_t)r == 1 && out == -0.125f, "the function works again afterwards (returned %d, value %g)", (int)(uint8_t)r, out);
 }
 
+/* cxxrt_readable's record of game-managed memory: which changes of guest memory it survives, and which not. */
+static void st_readable(void) {
+    const uint64_t pg = 0x1000;
+    uint8_t *mem = VirtualAlloc(NULL, 64 * pg, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE), *other = VirtualAlloc(NULL, 4 * pg, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint64_t m = P64(mem), p = m + 16 * pg + 0x80, q = m + 30 * pg + 0x10;
+    if (!mem || !other) { CHECK(0, "VirtualAlloc"); return; }
+    cxxrt_guest_region(m, 64 * pg); cxxrt_guest_region(P64(other), 4 * pg);
+    LONG64 asked = g_rd_asked, kept = g_rd_kept;
+    CHECK(cxxrt_readable(p, 8) && g_rd_asked == asked + 1, "the first question about a run goes to the OS");
+    if (g_rd_nocache || g_rd_forget_all) { printf("  (SSBU_NO_READABLE_CACHE / SSBU_READABLE_FORGET_ALL is set: the record is not tested)\n"); return; }
+    CHECK(cxxrt_readable(p + 0x100, 8) && g_rd_asked == asked + 1, "the next one in the same run is answered from the record");
+    cxxrt_mem_changed(P64(other), pg); VirtualFree(other, pg, MEM_DECOMMIT); cxxrt_mem_changed(P64(other), pg);
+    CHECK(cxxrt_readable(p, 8) && g_rd_asked == asked + 1 && g_rd_kept == kept + 1, "pages freed in another region: the record stays");
+    cxxrt_mem_changed(m + 40 * pg + 0x10, 8 * pg - 0x20); VirtualFree(mem + 40 * pg, 8 * pg, MEM_DECOMMIT); cxxrt_mem_changed(m + 40 * pg + 0x10, 8 * pg - 0x20);
+    CHECK(cxxrt_readable(p, 8) && g_rd_asked == asked + 1, "pages freed higher up in the same run: the record stays for what is below them");
+    CHECK(!cxxrt_readable(m + 41 * pg, 8) && !cxxrt_readable(m + 40 * pg, 1) && g_rd_asked == asked + 3, "the freed pages are not readable (whole pages, whatever the range that was named)");
+    CHECK(cxxrt_readable(m + 40 * pg - 8, 8) && !cxxrt_readable(m + 40 * pg - 8, 9) && g_rd_asked == asked + 4, "the record ends where the freed pages begin");
+    cxxrt_mem_changed(m + 20 * pg, 3 * pg); VirtualFree(mem + 20 * pg, 3 * pg, MEM_DECOMMIT); cxxrt_mem_changed(m + 20 * pg, 3 * pg);
+    CHECK(cxxrt_readable(q, 8) && g_rd_asked == asked + 4, "pages freed lower down in the same run: the record stays for what is above them");
+    CHECK(!cxxrt_readable(m + 21 * pg, 8) && cxxrt_readable(p, 8) && g_rd_asked == asked + 6, "and the part below them is asked about again");
+    cxxrt_mem_changed(m + 30 * pg, pg); VirtualFree(mem + 30 * pg, pg, MEM_DECOMMIT); cxxrt_mem_changed(m + 30 * pg, pg);
+    CHECK(!cxxrt_readable(q, 8) && g_rd_asked == asked + 7, "the page that was asked about is freed: not readable");
+    for (int i = 0; i <= RD_CHANGES; i++) cxxrt_mem_changed(P64(other), pg);
+    CHECK(cxxrt_readable(p, 8) && g_rd_asked == asked + 8, "more changes than are kept: the record is forgotten and the OS is asked");
+    cxxrt_mem_changed(m, 0); VirtualFree(mem, 0, MEM_RELEASE); cxxrt_mem_changed(m, 0);
+    CHECK(!cxxrt_readable(p, 8) && g_rd_asked == asked + 9, "the region is released: not readable");
+    VirtualFree(other, 0, MEM_RELEASE);
+}
+
 static DWORD WINAPI st_main(LPVOID arg) {
     int mode = atoi(getenv("SSBU_CXXRT_SELFTEST"));
     (void)arg;
@@ -654,6 +683,7 @@ static DWORD WINAPI st_main(LPVOID arg) {
     printf("sscanf / printf\n"); st_scanf();
     printf("gmtime, localeconv, random_device\n"); st_libc();
     printf("guard variables\n"); st_guard();
+    printf("record of readable game-managed memory\n"); st_readable();
     printf("exception classes and vtables\n"); st_exceptions();
     printf("locale facets and stream vtables\n"); st_facets();
     printf("promise / future\n"); st_future();
