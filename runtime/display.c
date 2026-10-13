@@ -40,6 +40,8 @@ static LARGE_INTEGER g_freq;
 static int g_old_pacing = -1, g_clockstat;
 static volatile LONG64 g_vsync_n;            /* refreshes passed (published after the event was signalled) */
 static volatile LONG64 g_vsync_signals, g_vsync_late;
+static volatile LONG64 g_vsync_qpc;          /* when the last refresh was signalled (nnhid.c, SSBU_INPUT_LAT) */
+long long display_refresh_qpc(void) { return g_vsync_qpc; }
 static SRWLOCK g_vsync_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_vsync_cv = CONDITION_VARIABLE_INIT;
 static LONG64 g_latch;                       /* refresh at which the last queued frame is shown */
@@ -150,6 +152,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
+            InterlockedExchange64(&g_vsync_qpc, now.QuadPart);
             if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
             AcquireSRWLockExclusive(&g_vsync_lock);
             InterlockedExchange64(&g_vsync_n, n);
@@ -239,6 +242,7 @@ static void frame_queued(void) {
     if (!second_start.QuadPart) second_start = now;
     LONG64 n = InterlockedIncrement64(&g_frames);
     second_frames++;
+    { void input_lat_present(long long qpc); input_lat_present(now.QuadPart); }      /* nnhid.c: SSBU_INPUT_LAT */
     LONG64 at = g_vsync_n + 1, iv = g_interval;
     if (!iv) at = g_vsync_n;                                       /* interval 0: shown at once, nobody waits */
     else if (at < g_latch + iv) at = g_latch + iv;

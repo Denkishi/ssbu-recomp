@@ -15,7 +15,9 @@ typedef struct {
 } NnPadState;
 
 int  nnpad_init(void);                           /* SDL up (no video, no window); 0 = failed. Also loads controllers.ini. */
-void nnpad_poll(int force);                      /* hot-plug, config reload; cheap when called often (at most once per ms) */
+void nnpad_poll(int force);                      /* hot-plug, config reload; cheap when called often (at most once per ms). With the pad thread: nothing, or (force) one full round of it, waited for */
+int  nnpad_thread_stats(long long out[4]);       /* the pad thread's rounds: count, count over 1 ms, longest (us), longest start-to-start (us); 0 = no pad thread */
+long long nnpad_sample_age_us(int player);       /* microseconds since the pad thread read this player's device; -1 = no device or no pad thread */
 int  nnpad_present(int player);                  /* a device is assigned to this player slot */
 int  nnpad_get(int player, NnPadState *out);     /* 0 = none */
 void nnpad_rumble(int player, float low, float high);   /* amplitudes 0..1 of the low and high band */

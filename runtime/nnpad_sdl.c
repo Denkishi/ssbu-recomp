@@ -1,6 +1,6 @@
 /* nnpad_sdl.c: every pad the game can see, through SDL3 (public release 3.4.18, reference\upstream).
  * SDL is started with the gamepad / joystick / events subsystems only: no video, no window, nothing that touches this
- * process's window messages. Devices are enumerated with SDL_GetJoysticks on each poll (hot-plug by diffing the list);
+ * process's window messages. Devices are enumerated with SDL_GetJoysticks (hot-plug by diffing the list) by the pad thread, see there;
  * SDL's own event queue is flushed unread. A device SDL has a mapping for is opened as a GAMEPAD (Xbox, PlayStation,
  * Switch Pro / Joy-Con, GameCube adapter, 8BitDo, generic mapped HID / DirectInput pads); one without a mapping is
  * opened as a plain JOYSTICK and gets a guessed default (buttons in order, hat 0 = d-pad, axes 0..3 = sticks) that
@@ -65,6 +65,15 @@ static int g_kb_slot = -3;                  /* resolved lazily */
 static ULONGLONG g_init_ms;
 static LARGE_INTEGER g_qpf, g_last_poll;
 static ULONGLONG g_last_cfg_check;
+/* The pad thread (see "the pad thread" below): what the game reads, one record per player. */
+typedef struct { int present, live; NnPadState st; LONGLONG qpc; } Snap;      /* present: nnpad_present; live: nnpad_get has a state; qpc: when SDL was read */
+static SRWLOCK g_snap_lock = SRWLOCK_INIT;
+static Snap g_snap[8];
+static struct { float low, high; int dirty; } g_rumble_req[8];                 /* g_snap_lock */
+static int g_threaded = -1;
+static HANDLE g_pad_wake, g_pad_done;
+static volatile LONG g_force_want, g_force_done;
+static volatile LONG64 g_round_n, g_round_slow, g_round_max, g_round_gap_max;  /* rounds; rounds over 1 ms; longest round; longest time from one round's start to the next (QPC ticks) */
 
 static void lock(void) { if (!g_cs_ready) { if (InterlockedCompareExchange(&g_cs_ready, 2, 0) == 0) { InitializeCriticalSection(&g_cs); g_cs_ready = 1; } while (g_cs_ready != 1) Sleep(0); } EnterCriticalSection(&g_cs); }
 static void unlock(void) { LeaveCriticalSection(&g_cs); }
@@ -456,6 +465,95 @@ static void check_config(int force) {             /* lock held */
     if (memcmp(before, g_cfg.pguid, sizeof before) || memcmp(bn, g_cfg.pnone, sizeof bn)) reassign_all();
 }
 
+static int sdl_start(void) {                      /* lock held */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");     /* the game's own focus rule decides (nnhid.c devices_live) */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS)) { printf("nn::pad: SDL_Init failed: %s\n", SDL_GetError()); return 0; }
+    SDL_SetJoystickEventsEnabled(false); SDL_SetGamepadEventsEnabled(false);       /* state is read directly; events would only fill a queue */
+    g_sdl_ok = 1;
+    poll_devices();
+    say("nn::pad: SDL %d.%d.%d ready (no video); %s\n", SDL_GetVersion() / 1000000, SDL_GetVersion() / 1000 % 1000, SDL_GetVersion() % 1000, g_cfg.path);
+    return 1;
+}
+
+/* ================================================================ the pad thread
+ * Before, the game's own thread did everything inside nn::hid::GetNpadState: SDL_UpdateJoysticks, the device list, the
+ * look at controllers.ini, and (from the thread that sends vibration) the write to the device, all under one lock. Now
+ * ONE thread owns SDL: it starts it, reads the devices about 1000 times per second, compares the device list about 15 times
+ * per second, looks at the file once per second, sends the vibration the game asked for, and after each round stores
+ * what every player's pad reads with the time of the reading. nnpad_get / nnpad_present copy that record and
+ * nnpad_rumble leaves a request: none of them calls SDL or waits for the lock above.
+ * A record is about one round old at most; nnpad_sample_age_us tells the age. Measured (Xbox One S pad, a 200 s run with a
+ * fight): 972 rounds per second; age of the record at the game's read 0.5 ms median, 1.4 ms at 99%, 2.5 ms longest; plugging
+ * the pad in during another run cost one round of 252 ms, which the game did not wait for.
+ * nnpad_poll(1) (the tools and the self-test) asks for a full round and waits for it, so what follows it sees the
+ * devices as they are. SSBU_PAD_THREAD=0: as before, no thread, everything on the caller. */
+static void dev_state(const Dev *d, NnPadState *o);
+static Dev *dev_of(int player);
+static void rumble_apply(int player, float low, float high);
+static void publish(void) {                       /* lock held */
+    Snap n[8];
+    struct { float low, high; int dirty; } rq[8];
+    LARGE_INTEGER t;
+    AcquireSRWLockExclusive(&g_snap_lock);
+    memcpy(rq, g_rumble_req, sizeof rq);
+    for (int p = 0; p < 8; p++) g_rumble_req[p].dirty = 0;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+    for (int p = 0; p < 8; p++) if (rq[p].dirty) rumble_apply(p, rq[p].low, rq[p].high);
+    QueryPerformanceCounter(&t);
+    memset(n, 0, sizeof n);
+    for (int p = 0; p < 8; p++) {
+        Dev *d = dev_of(p);
+        if (!d) continue;
+        dev_state(d, &n[p].st);
+        if (d->dropped && n[p].st.buttons) d->dropped = 0;
+        n[p].present = n[p].live = !d->dropped;
+        n[p].qpc = t.QuadPart;
+    }
+    AcquireSRWLockExclusive(&g_snap_lock);
+    memcpy(g_snap, n, sizeof n);
+    ReleaseSRWLockExclusive(&g_snap_lock);
+}
+static DWORD WINAPI pad_thread(LPVOID arg) {
+    HANDLE h[2];
+    LARGE_INTEGER due;
+    unsigned round = 0;
+    LONGLONG before = 0;
+    (void)arg;
+    lock();
+    sdl_start();
+    if (g_sdl_ok) publish();
+    unlock();
+    SetEvent(g_pad_done);
+    if (!g_sdl_ok) return 0;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);      /* a round is short and must not wait behind the game's worker threads */
+    h[0] = g_pad_wake;
+    h[1] = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    for (;;) {
+        LONG want = g_force_want;
+        int force = want != g_force_done;
+        LARGE_INTEGER a, b;
+        QueryPerformanceCounter(&a);
+        lock();
+        if (force || (round++ & 63) == 0) poll_devices();
+        else { SDL_UpdateJoysticks(); SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST); }
+        check_config(force);
+        publish();
+        unlock();
+        QueryPerformanceCounter(&b);
+        g_round_n++;
+        if ((b.QuadPart - a.QuadPart) * 1000 > g_qpf.QuadPart) g_round_slow++;
+        if (b.QuadPart - a.QuadPart > g_round_max) g_round_max = b.QuadPart - a.QuadPart;
+        if (before && a.QuadPart - before > g_round_gap_max) g_round_gap_max = a.QuadPart - before;
+        before = a.QuadPart;
+        if (force) { InterlockedExchange(&g_force_done, want); SetEvent(g_pad_done); }
+        QueryPerformanceCounter(&b);                       /* the next round is asked for 0.5 ms after this one started: the timer then comes about 1 ms after it (asking for 1 ms gave 670 rounds per second) */
+        due.QuadPart = (b.QuadPart - a.QuadPart) * 10000000 / g_qpf.QuadPart - 5000;
+        if (due.QuadPart >= 0) continue;
+        if (h[1] && SetWaitableTimer(h[1], &due, 0, NULL, NULL, FALSE)) WaitForMultipleObjects(2, h, FALSE, 100); else WaitForSingleObject(h[0], 1);
+    }
+}
+
 int nnpad_init(void) {
     lock();
     if (g_inited) { unlock(); return g_sdl_ok; }
@@ -463,19 +561,27 @@ int nnpad_init(void) {
     g_init_ms = GetTickCount64();
     QueryPerformanceFrequency(&g_qpf);
     cfg_load(1);
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");     /* the game's own focus rule decides (nnhid.c devices_live) */
-    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS)) { printf("nn::pad: SDL_Init failed: %s\n", SDL_GetError()); unlock(); return 0; }
-    SDL_SetJoystickEventsEnabled(false); SDL_SetGamepadEventsEnabled(false);       /* state is read directly; events would only fill a queue */
-    g_sdl_ok = 1;
-    poll_devices();
-    say("nn::pad: SDL %d.%d.%d ready (no video); %s\n", SDL_GetVersion() / 1000000, SDL_GetVersion() / 1000 % 1000, SDL_GetVersion() % 1000, g_cfg.path);
+    { const char *e = getenv("SSBU_PAD_THREAD"); g_threaded = !(e && e[0] == '0'); }
+    if (!g_threaded) { int ok = sdl_start(); unlock(); return ok; }
+    g_pad_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_pad_done = CreateEventA(NULL, FALSE, FALSE, NULL);
     unlock();
-    return 1;
+    HANDLE th = CreateThread(NULL, 0, pad_thread, NULL, 0, NULL);
+    if (!th) { printf("nn::pad: the pad thread could not be started\n"); return 0; }
+    WaitForSingleObject(g_pad_done, INFINITE);
+    CloseHandle(th);
+    return g_sdl_ok;
 }
 void nnpad_poll(int force) {
     LARGE_INTEGER t;
     if (!g_sdl_ok) return;
+    if (g_threaded > 0) {
+        if (!force) return;
+        LONG want = InterlockedIncrement(&g_force_want);
+        SetEvent(g_pad_wake);
+        while ((LONG)(g_force_done - want) < 0) WaitForSingleObject(g_pad_done, 2);
+        return;
+    }
     QueryPerformanceCounter(&t);
     if (!force && (t.QuadPart - g_last_poll.QuadPart) * 1000 < g_qpf.QuadPart) return;
     lock();
@@ -483,6 +589,22 @@ void nnpad_poll(int force) {
     poll_devices();
     check_config(force);
     unlock();
+}
+int nnpad_thread_stats(long long out[4]) {        /* rounds, rounds over 1 ms, longest round (us), longest start-to-start (us); 0 = no pad thread */
+    if (g_threaded <= 0 || !g_qpf.QuadPart) return 0;
+    out[0] = g_round_n; out[1] = g_round_slow; out[2] = g_round_max * 1000000 / g_qpf.QuadPart; out[3] = g_round_gap_max * 1000000 / g_qpf.QuadPart;
+    return 1;
+}
+long long nnpad_sample_age_us(int player) {
+    LARGE_INTEGER t;
+    LONGLONG q;
+    if (g_threaded <= 0 || player < 0 || player > 7) return -1;
+    AcquireSRWLockShared(&g_snap_lock);
+    q = g_snap[player].qpc;
+    ReleaseSRWLockShared(&g_snap_lock);
+    if (!q) return -1;
+    QueryPerformanceCounter(&t);
+    return (t.QuadPart - q) * 1000000 / g_qpf.QuadPart;
 }
 
 /* ================================================================ state */
@@ -594,6 +716,12 @@ static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].u
 int nnpad_present(int player) {
     int r = 0;
     if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (g_threaded > 0) {
+        AcquireSRWLockShared(&g_snap_lock);
+        r = g_snap[player].present;
+        ReleaseSRWLockShared(&g_snap_lock);
+        return r;
+    }
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -605,6 +733,12 @@ int nnpad_present(int player) {
 int nnpad_get(int player, NnPadState *out) {
     int r = 0;
     if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (g_threaded > 0) {
+        AcquireSRWLockShared(&g_snap_lock);
+        if ((r = g_snap[player].live) != 0) *out = g_snap[player].st;
+        ReleaseSRWLockShared(&g_snap_lock);
+        return r;
+    }
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -616,6 +750,7 @@ void nnpad_disconnect(int player) {
     Dev *d;
     lock();
     if ((d = dev_of(player)) != NULL) { d->dropped = 1; if (d->gp) SDL_RumbleGamepad(d->gp, 0, 0, 0); d->rl = d->rh = 0; }
+    if (g_threaded > 0) publish();
     unlock();
 }
 void nnpad_swap(int a, int b) {
@@ -625,12 +760,11 @@ void nnpad_swap(int a, int b) {
     if (y) y->slot = a;
     if (x) apply_player_index(x);
     if (y) apply_player_index(y);
+    if (g_threaded > 0) publish();
     unlock();
 }
-void nnpad_rumble(int player, float low, float high) {
+static void rumble_apply(int player, float low, float high) {       /* lock held */
     Dev *d;
-    if (!g_sdl_ok || player < 0 || player > 7) return;
-    lock();
     if ((d = dev_of(player)) != NULL && (d->gp || d->js)) {
         float s = eff_rumble(d) ? EFF(d, rstr) : 0.0f;
         float l = low * s, h = high * s;
@@ -641,6 +775,17 @@ void nnpad_rumble(int player, float low, float high) {
             if (d->gp) SDL_RumbleGamepad(d->gp, rl, rh, rl || rh ? 30000 : 0); else SDL_RumbleJoystick(d->js, rl, rh, rl || rh ? 30000 : 0);
         }
     }
+}
+void nnpad_rumble(int player, float low, float high) {
+    if (!g_sdl_ok || player < 0 || player > 7) return;
+    if (g_threaded > 0) {                                  /* the pad thread sends it in its next round */
+        AcquireSRWLockExclusive(&g_snap_lock);
+        g_rumble_req[player].low = low; g_rumble_req[player].high = high; g_rumble_req[player].dirty = 1;
+        ReleaseSRWLockExclusive(&g_snap_lock);
+        return;
+    }
+    lock();
+    rumble_apply(player, low, high);
     unlock();
 }
 
@@ -973,9 +1118,9 @@ int nnpad_selftest(const NnHidHooks *h) {
 
     /* ---- rumble, six-axis */
     {
-        h->vibrate(0, 0.5f, 0.25f);
+        h->vibrate(0, 0.5f, 0.25f); settle();               /* the pad thread sends it: one round */
         check(g_vj[0].calls > 0 && near_(g_vj[0].lo, 32767, 2) && near_(g_vj[0].hi, 16383, 2), "rumble: the game's low band 0.5 / high band 0.25 reach the pad as 32767 / 16383");
-        h->vibrate(0, 0, 0);
+        h->vibrate(0, 0, 0); settle();
         check(g_vj[0].lo == 0 && g_vj[0].hi == 0, "rumble stop reaches the pad");
         float a[3] = {9, 9, 9}, g[3] = {9, 9, 9}; int rest = 0;
         float acc[3] = {0, 0, SDL_STANDARD_GRAVITY}, gy[3] = {0, 0, 0};
@@ -1050,7 +1195,7 @@ int nnpad_selftest(const NnHidHooks *h) {
         SDL_SetJoystickVirtualAxis(js[0], SDL_GAMEPAD_AXIS_LEFTY, -32768); settle(); h->state(0, &btn, st, &attr);
         check(st[1] == -32767, "remap: invert.LY = on flips the up/down axis");
         SDL_SetJoystickVirtualAxis(js[0], SDL_GAMEPAD_AXIS_LEFTY, 0);
-        h->vibrate(0, 1.0f, 1.0f);
+        h->vibrate(0, 1.0f, 1.0f); settle();
         check(g_vj[0].lo == 0 && g_vj[0].hi == 0, "rumble = off for this device: nothing reaches the pad");
         /* writer used by --pad-map: write a mapping, reload, effect */
         {
