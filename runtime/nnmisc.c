@@ -539,8 +539,67 @@ static void err_ShowErrorCode(Ctx *c) {                   /* (ErrorCode { uint32
  * [sdk] PlayReport(): byte @0 = 0, three 8-byte fields @0x20..0x37 = 0. */
 static void prepo_PlayReport_ctor(Ctx *c) { wr8(A0, 0); wr64(A0 + 0x20, 0); wr64(A0 + 0x28, 0); wr64(A0 + 0x30, 0); }
 
-/* ---------------------------------------------------------------- nn::aoc: no add-on content installed */
-static void aoc_ListAddOnContent(Ctx *c) { RET(0); }      /* (int *out, int offset, int count) -> number written */
+/* ---------------------------------------------------------------- nn::aoc: the add-on content of the user's own console
+ * The game imports only CountAddOnContent and ListAddOnContent (no MountAddOnContent: it never reads files of an add-on
+ * content; what the add-on contents unlock is in data.arc). Its one caller [game 0x710354ca20; 13.0.5:
+ * 0x710354cfd0] asks for up to 128 indices from offset 0 and keeps them XOR-scrambled with a key taken from the clock.
+ * The list: config\addon_content.ini beside controllers.ini (SSBU_AOC_CONFIG=<file> overrides), one add-on content title
+ * id per line as the user's console lists them; index = title id - (application id + 0x1000), so 01006A800016F001 is
+ * index 1. No file (the default) = no add-on content, as before. Answered in ascending order, as ns does. */
+#define AOC_BASE_ID 0x01006A800016F000ULL
+#define AOC_MAX 2048
+static int g_aoc[AOC_MAX], g_aoc_n;
+static INIT_ONCE g_aoc_once = INIT_ONCE_STATIC_INIT;
+static int aoc_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+static void aoc_path(char *out) {
+    const char *e = getenv("SSBU_AOC_CONFIG"), *c = getenv("SSBU_CONFIG");
+    char tmp[MAX_PATH], exe[MAX_PATH];
+    if (e && e[0]) { snprintf(out, MAX_PATH, "%s", e); return; }
+    if (c && c[0]) {
+        snprintf(tmp, sizeof tmp, "%s", c);
+        char *s = strrchr(tmp, '\\'), *s2 = strrchr(tmp, '/');
+        if (s2 > s) s = s2;
+        if (s) { *s = 0; snprintf(out, MAX_PATH, "%s\\addon_content.ini", tmp); } else snprintf(out, MAX_PATH, "addon_content.ini");
+        return;
+    }
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    char *s = strrchr(exe, '\\');
+    if (s) *s = 0;
+    snprintf(tmp, sizeof tmp, "%s\\..\\config\\addon_content.ini", exe);
+    if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
+}
+static BOOL CALLBACK aoc_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
+    (void)once; (void)arg; (void)ctx;
+    char path[MAX_PATH], line[256];
+    aoc_path(path);
+    FILE *f = fopen(path, "r");
+    if (!f) { printf("nn::aoc: no %s: no add-on content\n", path); return TRUE; }
+    int bad = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *p = line, *end;
+        for (char *q = p; *q; q++) if (*q == ';' || *q == '#' || *q == '\r' || *q == '\n') { *q = 0; break; }
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        unsigned long long id = _strtoui64(p, &end, 16);  /* the rest of the line after a space is a note (e.g. the name) */
+        if ((*end && *end != ' ' && *end != '\t') || id <= AOC_BASE_ID || id >= AOC_BASE_ID + AOC_MAX) { printf("nn::aoc: %s: \"%s\" is not an add-on content title id of this game (0100 6A80 0016 Fxxx), ignored\n", path, p); bad++; continue; }
+        int idx = (int)(id - AOC_BASE_ID), dup = 0;
+        for (int i = 0; i < g_aoc_n; i++) dup |= g_aoc[i] == idx;
+        if (!dup && g_aoc_n < AOC_MAX) g_aoc[g_aoc_n++] = idx;
+    }
+    fclose(f);
+    qsort(g_aoc, (size_t)g_aoc_n, sizeof g_aoc[0], aoc_cmp);
+    printf("nn::aoc: %d add-on content(s) from %s%s:", g_aoc_n, path, bad ? " (some lines ignored)" : "");
+    for (int i = 0; i < g_aoc_n; i++) printf(" %d", g_aoc[i]);
+    printf("\n");
+    return TRUE;
+}
+static void aoc_CountAddOnContent(Ctx *c) { InitOnceExecuteOnce(&g_aoc_once, aoc_load, NULL, NULL); RET(g_aoc_n); }
+static void aoc_ListAddOnContent(Ctx *c) {               /* (int *out, int offset, int count) -> number written */
+    InitOnceExecuteOnce(&g_aoc_once, aoc_load, NULL, NULL);
+    int off = (int)(int32_t)A1, cnt = (int)(int32_t)A2, n = 0;
+    for (int i = off; i >= 0 && i < g_aoc_n && n < cnt; i++, n++) wr32(A0 + 4ull * (uint64_t)n, (uint32_t)g_aoc[i]);
+    RET(n);
+}
 
 /* ---------------------------------------------------------------- nn::util */
 static HCRYPTPROV crypt_provider(void) {
@@ -734,7 +793,7 @@ static const ImportDef fill_imports[] = {
     {PR("3AddEPKcRKNS0_10Any64BitIdE"), ret0}, {PR("3AddEPKcl"), ret0}, {PR("3AddEPKcd"), ret0}, {PR("3AddEPKcS3_"), ret0},
     {PR("4SaveERKNS_7account3UidE"), ret0},
     /* nn::aoc, nn::pctl, nn::pdm */
-    {"_ZN2nn3aoc17CountAddOnContentEv", ret0}, {"_ZN2nn3aoc16ListAddOnContentEPiii", aoc_ListAddOnContent},
+    {"_ZN2nn3aoc17CountAddOnContentEv", aoc_CountAddOnContent}, {"_ZN2nn3aoc16ListAddOnContentEPiii", aoc_ListAddOnContent},
     /* close5: both return a BOOL, not a Result: [sdk 0x33a620] `cset w0, eq` on the service Result (slot +0x28), [sdk 0x33aef0] the
      * byte the service writes (slot +0x148). A console without parental controls: true (suyu pctl/parental_control_service.cpp
      * CheckFreeCommunicationPermissionImpl / ConfirmStereoVisionPermissionImpl: no PIN -> true). The old ret0 answered "refused". */
