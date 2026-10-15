@@ -48,6 +48,11 @@
 #define UPDATE_RATE 0x710523c004ULL
 #define UPDATE_ACC 0x710593a454ULL
 #define HFR_RATE 119
+/* The match timer [SEEN]: *(*0x710532e7a0) + 0x3d4 = the remaining frames, decremented by 1 per update in the battle scene's
+ * state 0x7103303d60, which skips the decrement on the game's catch-up updates (0x710593a44c != 0) and frees the timer
+ * when the count goes below 0 (0x710532e7a0 = 0). It does not read the update rate. An added update gives its frame back. */
+#define TIMER_HOLDER 0x710532e7a0ULL
+#define CATCH_UP 0x710593a44cULL
 #define RNG_ROOT 0x71052c25b0ULL                      /* -> -> -> the 9 script random generators of app::sv_math::rand, 20 bytes each (fighter_sdk\fighter_host.c) */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 
@@ -55,7 +60,7 @@ static int g_setting;                                  /* 60 or 120 once hfr_ini
 static ImportFn g_orig_step, g_orig_max;
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
 static volatile LONG g_doubled_now;                    /* the current cycle runs with the doubled divisor */
-static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added;
+static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added, g_timer;
 
 int hfr_setting(void) { return g_setting == 120 ? 120 : 60; }
 static int battle_running(LONG64 now) { return g_step_qpc && now - g_step_qpc < g_qpf / 4; }
@@ -93,7 +98,12 @@ static void slow_step_hook(Ctx *c, void *user) {
     g_orig_step(c);
     InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
     if (g_doubled_now) wr32(UPDATE_RATE, HFR_RATE);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
-    if (added) { memcpy((void *)(uintptr_t)rb, keep, sizeof keep); g_added++; }
+    if (added) {
+        memcpy((void *)(uintptr_t)rb, keep, sizeof keep);
+        g_added++;
+        uint64_t h = rd64(TIMER_HOLDER), t = h ? rd64(h) : 0;
+        if (t && !rd32(CATCH_UP) && (int32_t)rd32(t + 0x3d4) >= 0) { wr32(t + 0x3d4, rd32(t + 0x3d4) + 1); g_timer++; }
+    }
 }
 static void slow_max_hook(Ctx *c, void *user) {
     (void)user;
@@ -128,5 +138,5 @@ void hfr_picture(void) {
 }
 
 void hfr_report(FILE *out) {
-    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled);
+    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times, match timer frames given back %lld\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled, (long long)g_timer);
 }
