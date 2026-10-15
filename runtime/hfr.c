@@ -17,7 +17,8 @@
  *                 The step calls it when the table's dirty flag (+0x40) is set, stores the clamped result as the N
  *                 asked for, and takes it as the cycle's N at the next cycle boundary (at once when N is 1).
  * The hook on 0x71014a2cd0 doubles its result in a battle; the hook on the step marks the battle as running and sets the
- * dirty flag at its first update, so the doubled N is taken even when no request changes. Every other value (the cycle,
+ * dirty flag whenever the N asked for is 1 (the battle's set-up writes 1 there), so the doubled N is taken even when no
+ * request changes. Every other value (the cycle,
  * the rate, the per-update records) is the game's own work. Not done: writing N after the step returns (the objects have
  * been updated inside it by then: a cycle-end update ran with N = 1 and the next one reset each motion to a saved frame
  * that was never written: frozen fighters, measured 2026-10-15).
@@ -57,10 +58,11 @@ static void slow_step_hook(Ctx *c, void *user) {
     (void)user;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!battle_running(now.QuadPart)) {               /* the first update of a battle: have the step ask for N again */
+    if (!battle_running(now.QuadPart)) g_battles++;
+    if (rd8(SLOW + 5) < 2) {                           /* N asked for is 1: never a doubled value, so the game set it (a battle's set-up does, after
+                                                        * its first updates: measured 2026-10-15); have the step ask the request maximum again */
         uint64_t t = rd64(SLOW_TABLE_PTR);
         if (t) wr8(t + 0x40, 1);
-        g_battles++;
     }
     InterlockedExchange64(&g_step_qpc, now.QuadPart);
     g_steps++;
