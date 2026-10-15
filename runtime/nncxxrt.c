@@ -72,6 +72,8 @@ void cxxrt_guest_region(uint64_t base, uint64_t size) {
     if (i < 64) { g_guest_region[i].size = size; g_guest_region[i].base = base; } else InterlockedDecrement(&g_guest_regions);
 }
 void cxxrt_mem_changed(void) { InterlockedIncrement(&g_mem_epoch); }
+LONG cxxrt_mem_epoch(void) { return g_mem_epoch; }      /* nvn_vk_m4.c: its record of readable runs is valid while this stays the same */
+int cxxrt_is_guest(uint64_t p) { for (int i = 0; i < g_guest_regions && i < 64; i++) if (p - g_guest_region[i].base < g_guest_region[i].size) return 1; return 0; }
 void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery, %lld from the per-thread record of game-managed memory\n", (long long)g_rd_asked, (long long)g_rd_cached); }
 int cxxrt_readable(uint64_t p, size_t n) {
     static __declspec(thread) struct { uint64_t lo, hi; LONG epoch; } t_ok[4];

@@ -5200,9 +5200,33 @@ static void vk_shutdown_at_exit(void) {
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
+/* Performance: this walked every texture record ever made (about 5,000 in a fight) at every flush, 3 % of the main thread's
+ * samples. Now an index sorted by start address with the running maximum of the ends (rebuilt when a texture was made since,
+ * dead ones dropped then): the textures marked are the same (alive, storage overlapping the range). */
+typedef struct { uint64_t lo, hi, maxhi; Tex *t; } TexIv;
+static TexIv *g_tiv;
+static int g_ntiv, g_tiv_cap;
+static Tex *g_tiv_head;
+static SRWLOCK g_tiv_lock = SRWLOCK_INIT;
+static int tiv_cmp(const void *a, const void *b) { const TexIv *x = a, *y = b; return x->lo < y->lo ? -1 : x->lo > y->lo; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
-    for (Tex *t = g_all_tex; t; t = t->all_next)
-        if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    AcquireSRWLockExclusive(&g_tiv_lock);
+    Tex *head = g_all_tex;
+    if (head != g_tiv_head) {                      /* textures were made since the index was built: build it again */
+        int n = 0;
+        for (Tex *t = head; t; t = t->all_next) if (!t->dead && t->mem) n++;
+        if (n > g_tiv_cap) { g_tiv_cap = n * 2 + 256; g_tiv = realloc(g_tiv, sizeof *g_tiv * (size_t)g_tiv_cap); }
+        n = 0;
+        for (Tex *t = head; t; t = t->all_next) if (!t->dead && t->mem) { g_tiv[n].lo = (uint64_t)(uintptr_t)t->mem; g_tiv[n].hi = g_tiv[n].lo + t->storage; g_tiv[n].t = t; n++; }
+        qsort(g_tiv, (size_t)n, sizeof *g_tiv, tiv_cmp);
+        for (int i = 0; i < n; i++) g_tiv[i].maxhi = i && g_tiv[i - 1].maxhi > g_tiv[i].hi ? g_tiv[i - 1].maxhi : g_tiv[i].hi;
+        g_ntiv = n; g_tiv_head = head;
+    }
+    int lo = 0, hi = g_ntiv;                       /* first entry with start >= addr + size */
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_tiv[mid].lo < addr + size) lo = mid + 1; else hi = mid; }
+    for (int i = lo - 1; i >= 0 && g_tiv[i].maxhi > addr; i--)
+        if (g_tiv[i].hi > addr && !g_tiv[i].t->dead) g_tiv[i].t->dirty = 1;
+    ReleaseSRWLockExclusive(&g_tiv_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {

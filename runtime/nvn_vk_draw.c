@@ -11,6 +11,7 @@
  * after destroy, barrier inside a pass, a view of an image in an unexpected layout) and prints every new pipeline. */
 #include <stdarg.h>
 #include <math.h>
+#include <psapi.h>
 #include "tex_decode.h"
 static int have_targets_live(void);
 
@@ -2710,6 +2711,11 @@ swap: ;
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+        {   extern volatile LONG64 g_mp_alloc_n, g_mp_alloc_b, g_mp_free_n, g_mp_free_b; static LONG64 mpl[4], pfl;
+            PROCESS_MEMORY_COUNTERS pmc; memset(&pmc, 0, sizeof pmc); GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
+            printf("nvn_vk_mem: frames %lld..%lld per frame: AllocateMemoryPages %.2f (%.0f KB), FreeMemoryPages %.2f (%.0f KB), page faults %.0f | working set %llu MB\n", (long long)frame - 300, (long long)frame,
+                   (g_mp_alloc_n - mpl[0]) / 300.0, (g_mp_alloc_b - mpl[1]) / 307200.0, (g_mp_free_n - mpl[2]) / 300.0, (g_mp_free_b - mpl[3]) / 307200.0, (pmc.PageFaultCount - pfl) / 300.0, (unsigned long long)(pmc.WorkingSetSize >> 20));
+            mpl[0] = g_mp_alloc_n; mpl[1] = g_mp_alloc_b; mpl[2] = g_mp_free_n; mpl[3] = g_mp_free_b; pfl = pmc.PageFaultCount; }
         {   static LONG64 sl[9], stl, gl[6], cbl;
             printf("nvn_vk_stream: frames %lld..%lld KB/frame: c2 %.0f code %.0f ubo %.0f ssbo %.0f vbuf %.0f ibuf %.0f compute %.0f texture %.0f | stale-gen misses %.0f KB | gen bumps/frame: wrap %.2f cb_land %.2f copybuf %.2f update_ubo %.2f clearbuf %.2f copytexbuf %.2f | cb copy-back KB/frame %.0f | ring: chunk waits %lld (%.1f ms), drains %lld | helper copies %lld (%.0f MB), render thread waited %.1f ms\n",
                    (long long)frame - 300, (long long)frame, (g_sb[0] - sl[0]) / 307200.0, (g_sb[1] - sl[1]) / 307200.0, (g_sb[2] - sl[2]) / 307200.0, (g_sb[3] - sl[3]) / 307200.0, (g_sb[4] - sl[4]) / 307200.0, (g_sb[5] - sl[5]) / 307200.0, (g_sb[6] - sl[6]) / 307200.0, (g_sb[7] - sl[7]) / 307200.0,
