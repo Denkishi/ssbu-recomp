@@ -14,6 +14,7 @@ typedef struct {
     int overlay;             /* 1: frame time in the title bar and a "frame-time:" log line every second */
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a fight the draw is left out until they are ready; nvn_vk_m4.c skip_on; env SSBU_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
+    int pace_early;          /* pacing = early: a frame goes to the window at once when a refresh has passed since the last one (display.c);   env SSBU_PACE_EARLY wins */
     int frame_rate;          /* 60 (the console's) or 120: battles at 120 Hz (hfr.c, display.c);   env SSBU_FRAME_RATE wins */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */

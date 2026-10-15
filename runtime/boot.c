@@ -158,6 +158,79 @@ static DWORD WINAPI profiler(LPVOID arg) {
                 printf("[prof] f_%llx lr %llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
         return 0;
     }
+    if (mode == 'h') {        /* SSBU_PROF=<start>,<dur>,h : self time of the main guest thread and the render thread by module,
+                               * lifted function (game DLL) and host address (exe; resolve with the link map), sampled every ~1 ms */
+        DWORD nvn_render_tid(void);
+        HANDLE th[2] = {g_prof_target, NULL};
+        DWORD rtid = nvn_render_tid();
+        if (rtid) th[1] = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, rtid);
+        HMODULE exe = GetModuleHandleA(NULL), dll = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&fn_table[0], &dll);
+        enum { HK = 16384 };
+        static struct { uint64_t key; unsigned n[2]; } hs[HK];
+        static struct { char name[48]; unsigned n[2]; } mods[64];
+        int nmods = 0;
+        unsigned tot[2] = {0, 0};
+        while (GetTickCount64() < end) {
+            for (int t = 0; t < 2; t++) {
+                if (!th[t]) continue;
+                CONTEXT ctx;
+                memset(&ctx, 0, sizeof ctx);
+                ctx.ContextFlags = CONTEXT_FULL;
+                if (SuspendThread(th[t]) == (DWORD)-1) continue;
+                BOOL ok = GetThreadContext(th[t], &ctx);
+                ResumeThread(th[t]);
+                if (!ok) continue;
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ctx.Rip, &m);
+                char name[48] = "?";
+                if (m == dll) strcpy(name, "game dll (lifted)");
+                else if (m == exe) strcpy(name, "exe (host)");
+                else if (m) { char full[MAX_PATH]; GetModuleFileNameA(m, full, MAX_PATH); const char *b = strrchr(full, '\\'); snprintf(name, sizeof name, "%s", b ? b + 1 : full); }
+                int i;
+                for (i = 0; i < nmods && strcmp(mods[i].name, name); i++) ;
+                if (i == nmods && nmods < 64) { strcpy(mods[nmods].name, name); nmods++; }
+                if (i < 64) mods[i].n[t]++;
+                uint64_t key = 0;
+                if (m == dll) key = guest_function_of(ctx.Rip);
+                else if (m == exe) key = 0x8000000000000000ull | (ctx.Rip - (uint64_t)(uintptr_t)exe);
+                else {                /* a system DLL: the first exe address up the stack (who waits / calls the system) */
+                    CONTEXT u = ctx;
+                    __try {
+                    for (int depth = 0; depth < 64; depth++) {
+                        DWORD64 base;
+                        RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(u.Rip, &base, NULL);
+                        if (!rf) break;
+                        void *hd; DWORD64 est;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, u.Rip, rf, &u, &hd, &est, NULL);
+                        if (!u.Rip) break;
+                        HMODULE um = NULL;
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)u.Rip, &um);
+                        if (um == exe) { key = 0xC000000000000000ull | (u.Rip - (uint64_t)(uintptr_t)exe); break; }
+                        if (um == dll) { key = 0x4000000000000000ull | guest_function_of(u.Rip); break; }
+                    }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { key = 0; }
+                }
+                if (key) {
+                    unsigned h = (unsigned)((key >> 2) * 2654435761u) % HK;
+                    while (hs[h].key && hs[h].key != key) h = (h + 1) % HK;
+                    if (!hs[h].key) hs[h].key = key;
+                    hs[h].n[t]++;
+                }
+                tot[t]++;
+            }
+            for (ULONGLONG t0 = GetTickCount64(); GetTickCount64() - t0 < 1;) YieldProcessor();
+        }
+        printf("\n[profh] samples: main %u, render %u\n", tot[0], tot[1]);
+        for (int i = 0; i < nmods; i++) printf("[profh] module %-28s main %6u render %6u\n", mods[i].name, mods[i].n[0], mods[i].n[1]);
+        for (int j = 0; j < HK; j++)
+            if (hs[j].key && hs[j].n[0] + hs[j].n[1] >= 3) {
+                uint64_t k = hs[j].key, v = k & 0x3fffffffffffffffull;
+                const char *kind = (k >> 62) == 3 ? "sys<-exe+" : (k >> 62) == 2 ? "exe+" : (k >> 62) == 1 ? "sys<-f_" : "f_";
+                printf("[profh] %s%llx main %u render %u\n", kind, (unsigned long long)v, hs[j].n[0], hs[j].n[1]);
+            }
+        return 0;
+    }
     while (GetTickCount64() < end) {
         CONTEXT ctx;
         uint64_t chain[64];

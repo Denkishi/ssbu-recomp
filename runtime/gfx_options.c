@@ -147,10 +147,12 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
+        else if (!_stricmp(key, "pacing")) o->pace_early = !_stricmp(val, "early");
         else if (!_stricmp(key, "frame_rate")) o->frame_rate = atoi(val) == 120 ? 120 : 60;
         else unknown++;
     }
     if (f) fclose(f);
+    { const char *e = getenv("SSBU_PACE_EARLY"); if (e && e[0]) o->pace_early = atoi(e) != 0; }
     { const char *e = getenv("SSBU_FRAME_RATE"); if (e && e[0]) o->frame_rate = atoi(e) == 120 ? 120 : 60; }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;

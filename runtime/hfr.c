@@ -63,6 +63,8 @@ static volatile uint64_t g_timer_comp;                  /* the rule component, f
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
 static volatile LONG g_doubled_now;                    /* the current cycle runs with the doubled divisor */
 static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added, g_timer;
+static LONG64 g_upd_ticks[2], g_upd_n[2], g_last_step_qpc;   /* time from one battle step to the next: [0] after a console update, [1] after an added one */
+static int g_last_added;
 
 int hfr_setting(void) { return g_setting == 120 ? 120 : 60; }
 /* TEST ONLY (SSBU_SHOT_BATTLE lines): the update within the slow cycle as the render thread sees it, -1 at 60 Hz. */
@@ -97,6 +99,8 @@ static void slow_step_hook(Ctx *c, void *user) {
     if (rb) rb = rd64(rb);
     if (rb) rb = rd64(rb);
     int added = n > 1 && next < n && (next & 1) && rb;
+    if (g_last_step_qpc && now.QuadPart - g_last_step_qpc < g_qpf / 10) { g_upd_ticks[g_last_added] += now.QuadPart - g_last_step_qpc; g_upd_n[g_last_added]++; }
+    g_last_step_qpc = now.QuadPart; g_last_added = added;
     uint8_t keep[180];
     if (added) memcpy(keep, (void *)(uintptr_t)rb, sizeof keep);
     uint64_t tc = g_timer_comp;
@@ -152,4 +156,7 @@ void hfr_picture(void) {
 
 void hfr_report(FILE *out) {
     if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times, match timer frames given back %lld\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled, (long long)g_timer);
+    if (g_setting == 120 && g_upd_n[0] && g_upd_n[1])
+        fprintf(out, "hfr: time from one battle step to the next: after a console update %.2f ms (%lld), after an added update %.2f ms (%lld)\n",
+                (double)g_upd_ticks[0] * 1000.0 / (double)g_qpf / (double)g_upd_n[0], (long long)g_upd_n[0], (double)g_upd_ticks[1] * 1000.0 / (double)g_qpf / (double)g_upd_n[1], (long long)g_upd_n[1]);
 }

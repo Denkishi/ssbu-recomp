@@ -247,6 +247,7 @@ static CRITICAL_SECTION g_job_lock;
 static Job *g_job_head, *g_job_tail;
 static HANDLE g_job_event, g_ready_event;
 static DWORD g_render_tid;
+DWORD nvn_render_tid(void) { return g_render_tid; }      /* boot.c SSBU_PROF mode h */
 static HWND g_hwnd;
 static HDC g_dc;
 static __declspec(thread) HANDLE t_done;

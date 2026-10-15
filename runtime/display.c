@@ -245,6 +245,11 @@ static void frame_queued(void) {
     LONG64 n = InterlockedIncrement64(&g_frames);
     second_frames++;
     LONG64 at = g_vsync_n + 1, iv = g_interval;
+    /* graphics.ini pacing = early: a frame queued between refresh n and n + 1 counts as shown at n (it goes to the window at
+     * once) when that keeps `interval` refreshes after the frame before; the caller waits only when it is ahead of the clock.
+     * A game that needs a little more than one refresh per frame then shows almost every refresh (its missed refreshes
+     * are made up by the game's own catch-up updates) instead of every second one. */
+    if (gfx_options()->pace_early) at = g_vsync_n;
     if (!iv) at = g_vsync_n;                                       /* interval 0: shown at once, nobody waits */
     else if (at < g_latch + iv) at = g_latch + iv;
     g_latch = at;
