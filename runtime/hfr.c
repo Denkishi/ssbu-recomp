@@ -36,7 +36,19 @@
 #define FN_SLOW_MAX 0x71014a2cd0ULL
 #define SLOW_TABLE_PTR 0x71052c2610ULL                 /* -> the slow request table; + 0x40 = its dirty flag */
 #define SLOW 0x71052c4184ULL                           /* the slow state: + 4 N of the cycle, + 6 update within the cycle */
-#define RNG_ROOT 0x71052c25b0ULL                       /* -> -> -> the 9 script random generators of app::sv_math::rand, 20 bytes each (fighter_sdk\fighter_host.c) */
+/* The update rate, [SEEN] 0x710523c004 (app::sv_information::get_delta_frame returns it; about 45 readers compute 60 / rate
+ * frames per update: the match timer, the battle's set-up and entrance sequencing, ...). Those run on every update, outside
+ * the slow divisor: at 120 updates per second they would run twice as fast (measured: the match timer at 1.8x real time).
+ * In a battle with doubled cycles it is set to 119: 60 / 119 = 0.504 frames per update, 0.84 % fast. Not 120: the code
+ * that tests rate / 60 >= 2 (the engine's own 2x replay speed: Brave::get_special_lw_param_frame, shiokarazu
+ * get_slow_rate, 0x71006b92c0) would take that branch. The main loop [SEEN 0x7103749b70..0x7103749bd8] counts updates
+ * per picture from the same value: acc -= rate, then one update per 60 that brings acc above 0, so rate / 60 updates
+ * per picture; hfr_picture adds rate - 60 to acc once per picture to keep that at one (the updates for refreshes the
+ * game missed, 0x710593a44c, are added by the game apart from this count and still are). */
+#define UPDATE_RATE 0x710523c004ULL
+#define UPDATE_ACC 0x710593a454ULL
+#define HFR_RATE 119
+#define RNG_ROOT 0x71052c25b0ULL                      /* -> -> -> the 9 script random generators of app::sv_math::rand, 20 bytes each (fighter_sdk\fighter_host.c) */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 
 static int g_setting;                                  /* 60 or 120 once hfr_init has run */
@@ -80,6 +92,7 @@ static void slow_step_hook(Ctx *c, void *user) {
     if (added) memcpy(keep, (void *)(uintptr_t)rb, sizeof keep);
     g_orig_step(c);
     InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
+    if (g_doubled_now) wr32(UPDATE_RATE, HFR_RATE);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
     if (added) { memcpy((void *)(uintptr_t)rb, keep, sizeof keep); g_added++; }
 }
 static void slow_max_hook(Ctx *c, void *user) {
@@ -105,6 +118,13 @@ void hfr_init(void) {
     if (!a || !b) { printf("hfr: frame_rate = 120 asked for, but a hook failed (step %d, request maximum %d): 60 is used\n", a, b); return; }
     g_setting = 120;
     printf("hfr: frame_rate = 120: battles at 120 Hz (the engine's slow-motion divisor doubled, logic 60 steps per second), menus at 60 Hz\n");
+}
+
+/* display.c display_clock_sample, once per picture (the game's frame end, before its next count of updates): one update per
+ * picture while the update rate is ours (see UPDATE_RATE). */
+void hfr_picture(void) {
+    if (g_setting != 120 || rd32(UPDATE_RATE) != HFR_RATE) return;
+    wr32(UPDATE_ACC, rd32(UPDATE_ACC) + (HFR_RATE - 60));
 }
 
 void hfr_report(FILE *out) {
