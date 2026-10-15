@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for wanting to help. This project is a static recompilation of *Super Smash Bros. Ultimate* 13.0.4 to
+Thanks for wanting to help. This project is a static recompilation of *Super Smash Bros. Ultimate* 13.0.4 / 13.0.5 to
 a native PC program: the tools that translate the game, the runtime that replaces the console, and the
 tooling that turns fighter code back into editable source. It is early, it moves fast, and there is a lot
 that one person cannot test alone.
@@ -78,7 +78,7 @@ is being rewritten.
 
 ## Building
 
-See [BUILDING.md](BUILDING.md). You need your own dump of version 13.0.4; the build takes about 45 minutes
+See [BUILDING.md](BUILDING.md). You need your own dump of version 13.0.4 or 13.0.5; the build takes about 45 minutes
 the first time and generates several gigabytes of files that git ignores.
 
 ## Reporting a problem

@@ -8,19 +8,40 @@ Usage:
     python recomp.py lift  <out.c> <root_addr>[,<root_addr>...]   lift roots and their callees
     python recomp.py cover                                         whole-binary coverage statistics
 """
+import os
 import struct
 import sys
 import collections
 
-ELF = r'..\binaries\13.0.4\main.elf'
+ELF = os.path.join(os.environ['RECOMP_BIN'], 'main.elf') if os.environ.get('RECOMP_BIN') else r'..\binaries\13.0.4\main.elf'   # RECOMP_BIN: scripts/setup.py
 BASE = 0x7100000000
 FILE_OFF = 0x1000
-TEXT_SIZE = 0x39c7e90
-RELA, RELASZ = 0x39c8070, 0x7ad0d8
-JMPREL, PLTRELSZ = 0x4175148, 0xc600
-SYMTAB, STRTAB = 0x4197610, 0x41c11f0
 
 IMG = open(ELF, 'rb').read()
+
+
+def _layout(img):
+    """main's layout, read from the converted dump itself (tools/extract/nso2elf.py): the size of the code (the first
+    PT_LOAD) and the relocation and symbol tables of the dynamic section that MOD0 points to. Read rather than written
+    down, so each game build gives its own. 13.0.4: code 0x39c7e90, RELA 0x39c8070 / 0x7ad0d8, JMPREL 0x4175148 / 0xc600,
+    SYMTAB 0x4197610, STRTAB 0x41c11f0 (the constants this replaces); 13.0.5: code 0x39c8440 and every table one page
+    (0x1000) later with the same size (docs/VERSIONS.md)."""
+    phoff, = struct.unpack_from('<Q', img, 0x20)
+    phnum, = struct.unpack_from('<H', img, 0x38)
+    text = next(struct.unpack_from('<Q', img, phoff + i * 56 + 32)[0] for i in range(phnum) if struct.unpack_from('<I', img, phoff + i * 56)[0] == 1)
+    mod0 = struct.unpack_from('<I', img, FILE_OFF + 4)[0]
+    assert img[FILE_OFF + mod0:FILE_OFF + mod0 + 4] == b'MOD0', 'main.elf: no MOD0 header'
+    dyn, tags = mod0 + struct.unpack_from('<i', img, FILE_OFF + mod0 + 4)[0], {}
+    while True:
+        tag, val = struct.unpack_from('<qQ', img, FILE_OFF + dyn)
+        dyn += 16
+        if tag == 0:
+            break
+        tags.setdefault(tag, val)
+    return text, tags[7], tags[8], tags[23], tags[2], tags[6], tags[5]
+
+
+TEXT_SIZE, RELA, RELASZ, JMPREL, PLTRELSZ, SYMTAB, STRTAB = _layout(IMG)
 
 
 # Instruction patch list (N3, plan\phases\N3_new_kind.md): DEFAULT OFF. A patch replaces one instruction word of the

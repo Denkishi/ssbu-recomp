@@ -9,10 +9,10 @@
 #include "runtime.h"
 #include "hostrt.h"
 
-#define NNINIT_STARTUP (GUEST_BASE + 0x2c55e0ULL)
-#define NN_MAIN (GUEST_BASE + 0x2c5620ULL)
-#define INIT_ARRAY (GUEST_BASE + 0x52a7be0ULL)
-#define INIT_ARRAY_SIZE 0x990ULL
+#define NNINIT_STARTUP GA(GUEST_BASE + 0x2c55e0ULL)
+#define NN_MAIN GA(GUEST_BASE + 0x2c5620ULL)
+#define INIT_ARRAY (GUEST_BASE + g_main.init_array)       /* from the dynamic section (hostrt.c); 13.0.4: 0x52a7be0 */
+#define INIT_ARRAY_SIZE g_main.init_arraysz                 /* 13.0.4: 0x990 */
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -337,7 +337,7 @@ int main(int argc, char **argv) {
             for (int i = 19; i < 29; i++) printf("  x%d %016llx%s", i, (unsigned long long)g_main_ctx->x[i], i % 3 == 0 ? "\n" : "");
             printf("\n");
             {   /* the global std::map at 0x710593c3c0 the main thread walks: header and first nodes */
-                uint64_t m = 0x710593c3c0ULL;
+                uint64_t m = GA(0x710593c3c0ULL);
                 printf("map header: [+0]=%llx [+8]=%llx [+10]=%llx  size=%llx\n", (unsigned long long)rd64(m),
                        (unsigned long long)rd64(m + 8), (unsigned long long)rd64(m + 16), (unsigned long long)rd64(m + 24));
                 uint64_t n = rd64(m + 8);

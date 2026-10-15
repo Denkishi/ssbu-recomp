@@ -54,7 +54,7 @@ for lp, types, calls in real:
 
 # ---- what is thrown: for each __cxa_throw call site find the typeinfo loaded into x1 (adrp/add or adrp/ldr before the call)
 relocs = {}
-for tbl, size in ((0x39c8070, 0x7ad0d8), (0x4175148, 0xc600)):
+for tbl, size in ((recomp.RELA, recomp.RELASZ), (recomp.JMPREL, recomp.PLTRELSZ)):
     for i in range(size // 24):
         off, info, addend = struct.unpack_from('<QQq', IMG, OFF + tbl + i * 24)
         if (info & 0xffffffff) == 0x403: relocs[off] = addend
@@ -71,7 +71,7 @@ def typeinfo_name(ti):
     return '?%x' % ti
 thrown = collections.Counter()
 throw_sites = []
-for a in range(BASE, BASE + 0x39c7e90, 4):
+for a in range(BASE, BASE + recomp.TEXT_SIZE, 4):
     t = bl_target(a)
     if t is None or env.plt_symbol(t) != '__cxa_throw': continue
     reg = {}

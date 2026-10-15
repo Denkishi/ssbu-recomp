@@ -331,11 +331,11 @@ static void st_future(void) {
 /* ---- __dynamic_cast on the game's own RTTI
  * Typeinfo objects and vtables are found in the relocated image: a typeinfo starts with one of the three imported
  * __cxxabiv1 table addresses; a vtable holds { offset-to-top, typeinfo } before its address point. */
-#define ST_DATA_START (GUEST_BASE + 0x4f16000ull)
-#define ST_DATA_END (GUEST_BASE + 0x52a8000ull)
+#define ST_DATA_START (GUEST_BASE + g_main.data_start)
+#define ST_DATA_END (GUEST_BASE + (g_main.file_image & ~0xfffull))
 static uint64_t st_find_vptr(uint64_t ti, int64_t offset_to_top) {
     for (uint64_t a = ST_DATA_START + 8; a < ST_DATA_END - 16; a += 8)
-        if (rd64(a) == ti && (int64_t)rd64(a - 8) == offset_to_top && rd64(a + 8) >= GUEST_BASE && rd64(a + 8) < GUEST_BASE + 0x39c8000ull) return a + 8;
+        if (rd64(a) == ti && (int64_t)rd64(a - 8) == offset_to_top && rd64(a + 8) >= GUEST_BASE && rd64(a + 8) < GUEST_BASE + g_main.ro_start) return a + 8;
     return 0;
 }
 static void st_dyncast(void) {
@@ -426,7 +426,7 @@ static void st_game_stream(Ctx *c) {
         size_t n = 0;
         memset(out, 0xee, sizeof out);
         uint64_t sp = c->x[31];
-        cxxrt_call(c, GUEST_BASE + 0x35b5c50ull, P64(out), values[i], 0);
+        cxxrt_call(c, GA(GUEST_BASE + 0x35b5c50ull), P64(out), values[i], 0);
         const char *s = cxx_string_data(P64(out), &n);
         CHECK(c->x[31] == sp && n == strlen(expect[i]) && !memcmp(s, expect[i], n), "ostringstream << %llu gave '%.*s'", (unsigned long long)values[i], (int)n, s);
         st_import(c, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED2Ev", P64(out), 0, 0, 0);
@@ -480,12 +480,12 @@ static void st_eh_tables(void) {
     ti_multi[3] = P64(g_ti_streambuf); ti_multi[4] = 2; ti_multi[5] = P64(ti_derived); ti_multi[6] = (0x10 << 8) | 2;
     EhPad pad;
     cxxrt_exception_init(b, P64(ti_derived), 0);
-    CHECK(eh_personality(c, 0x7103839b94ull, b, &pad) == EH_HANDLER && pad.selector == 1 && pad.landing_pad == 0x7103839de8ull && pad.adjusted == b, "derived class caught by a base-class handler");
+    CHECK(eh_personality(c, GA(0x7103839b94ull), b, &pad) == EH_HANDLER && pad.selector == 1 && pad.landing_pad == GA(0x7103839de8ull) && pad.adjusted == b, "derived class caught by a base-class handler");
     cxxrt_exception_init(b, P64(ti_multi), 0);
-    CHECK(eh_personality(c, 0x7103839b94ull, b, &pad) == EH_HANDLER && pad.adjusted == b + 0x10, "second base at +0x10: adjusted pointer %llx (object %llx)", (unsigned long long)pad.adjusted, (unsigned long long)b);
+    CHECK(eh_personality(c, GA(0x7103839b94ull), b, &pad) == EH_HANDLER && pad.adjusted == b + 0x10, "second base at +0x10: adjusted pointer %llx (object %llx)", (unsigned long long)pad.adjusted, (unsigned long long)b);
     cxxrt_exception_init(b, P64(g_ti_bad_alloc), 0);
-    CHECK(eh_personality(c, 0x7103839b94ull, b, &pad) == EH_CLEANUP && pad.selector == 0 && pad.landing_pad == 0x7103839de8ull, "an unrelated type only gets the clean-up of that pad");
-    CHECK(eh_personality(c, 0x710382b690ull, b, &pad) == EH_HANDLER && pad.landing_pad == 0x710382cb34ull && pad.function.start == 0x7103828300ull, "catch (...) in f_7103828300");
+    CHECK(eh_personality(c, GA(0x7103839b94ull), b, &pad) == EH_CLEANUP && pad.selector == 0 && pad.landing_pad == GA(0x7103839de8ull), "an unrelated type only gets the clean-up of that pad");
+    CHECK(eh_personality(c, GA(0x710382b690ull), b, &pad) == EH_HANDLER && pad.landing_pad == GA(0x710382cb34ull) && pad.function.start == GA(0x7103828300ull), "catch (...) in f_7103828300");
     exc_free(a); exc_free(b);
 }
 
@@ -501,7 +501,7 @@ static void st_eh_flow(void) {
     st_raise_calls = 0;
     ST_RAISES(st_import(c, "__cxa_throw", e, P64(g_ti_out_of_range), dtor, 0));
     CHECK(st_raise_calls == 1 && st_raise_reason == EH_RAISE_THROW && eh_in_flight(c) == e && st->uncaught == 1 && !strcmp(eh_type_name(e), "St12out_of_range"), "__cxa_throw puts the exception in flight and calls the unwinder");
-    CHECK(eh_personality(c, 0x710382b690ull, e, &pad) == EH_HANDLER, "handler found");
+    CHECK(eh_personality(c, GA(0x710382b690ull), e, &pad) == EH_HANDLER, "handler found");
     eh_enter_pad(c, &pad);
     CHECK(c->x[0] == e - 0x20 && c->x[1] == 1 && eh_in_flight(c) == 0, "pad entry: x0 = unwind header (object - 0x20), x1 = selector");
     CHECK(rd64(c->x[0]) == 0x434c4e47432b2b00ull, "exception class CLNGC++ in the unwind header");
@@ -511,17 +511,17 @@ static void st_eh_flow(void) {
     CHECK(st_import(c, "__cxa_begin_catch", hdr, 0, 0, 0) == e && exc_header(e)->handlers == 1 && st->uncaught == 0 && st->caught == e, "__cxa_begin_catch returns the object, handler count 1");
     ST_RAISES(st_import(c, "__cxa_rethrow", 0, 0, 0, 0));
     CHECK(exc_header(e)->handlers == -1 && eh_in_flight(c) == e && st->uncaught == 1, "__cxa_rethrow: handler count negated, in flight again");
-    eh_personality(c, 0x710382b690ull, e, &pad); eh_enter_pad(c, &pad);                 /* the clean-up of the catch block */
+    eh_personality(c, GA(0x710382b690ull), e, &pad); eh_enter_pad(c, &pad);                 /* the clean-up of the catch block */
     st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
     CHECK(st_eh_dtors == 0 && exc_header(e) && exc_header(e)->handlers == 0 && st->caught == 0, "__cxa_end_catch of a rethrown exception keeps it alive");
     ST_RAISES(st_import(c, "_Unwind_Resume", hdr, 0, 0, 0));
     CHECK(st_raise_reason == EH_RAISE_RESUME && eh_in_flight(c) == e, "_Unwind_Resume continues the propagation");
-    eh_personality(c, 0x710382b690ull, e, &pad); eh_enter_pad(c, &pad);                 /* the outer handler */
+    eh_personality(c, GA(0x710382b690ull), e, &pad); eh_enter_pad(c, &pad);                 /* the outer handler */
     st_import(c, "__cxa_begin_catch", hdr, 0, 0, 0);
     /* nested: a second exception thrown and caught while the first is being handled */
     uint64_t e2 = st_import(c, "__cxa_allocate_exception", 8, 0, 0, 0);
     ST_RAISES(st_import(c, "__cxa_throw", e2, P64(g_ti_bad_alloc), dtor, 0));
-    eh_personality(c, 0x710382b690ull, e2, &pad); eh_enter_pad(c, &pad);
+    eh_personality(c, GA(0x710382b690ull), e2, &pad); eh_enter_pad(c, &pad);
     st_import(c, "__cxa_begin_catch", e2 - 0x20, 0, 0, 0);
     CHECK(st->caught == e2 && exc_header(e2)->next == e, "caught exceptions stack");
     st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
@@ -535,8 +535,8 @@ static void st_eh_flow(void) {
     ST_RAISES(st_import(c, "_ZSt17rethrow_exceptionSt13exception_ptr", P64(&ep), 0, 0, 0));
     uint64_t dep = eh_in_flight(c);
     CHECK(dep && dep != e && exc_header(dep)->primary == e && exc_header(e)->refs == 2, "rethrow_exception: a dependent exception in flight");
-    CHECK(eh_personality(c, 0x7103839b94ull, dep, &pad) == EH_CLEANUP, "the dependent exception has the type of the original (out_of_range)");
-    eh_personality(c, 0x710382b690ull, dep, &pad); eh_enter_pad(c, &pad);
+    CHECK(eh_personality(c, GA(0x7103839b94ull), dep, &pad) == EH_CLEANUP, "the dependent exception has the type of the original (out_of_range)");
+    eh_personality(c, GA(0x710382b690ull), dep, &pad); eh_enter_pad(c, &pad);
     CHECK(st_import(c, "__cxa_begin_catch", dep - 0x20, 0, 0, 0) == e, "catching a dependent exception yields the original object");
     st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
     CHECK(!exc_header(dep) && st_eh_dtors == 1 && exc_header(e)->refs == 1, "end_catch frees the dependent exception only");
@@ -546,7 +546,7 @@ static void st_eh_flow(void) {
     ST_RAISES(st_import(c, "_ZNKSt3__120__vector_base_commonILb1EE20__throw_length_errorEv", 0, 0, 0, 0));
     uint64_t le = eh_in_flight(c);
     CHECK(le && !strcmp(eh_type_name(le), "St12length_error") && !strcmp((const char *)(uintptr_t)cxxrt_call(c, rd64(rd64(le) + 0x10), le, 0, 0), "vector"), "__throw_length_error throws std::length_error(vector)");
-    CHECK(eh_personality(c, 0x7103839b94ull, le, &pad) == EH_CLEANUP && eh_personality(c, 0x710382b690ull, le, &pad) == EH_HANDLER, "and the personality classifies it");
+    CHECK(eh_personality(c, GA(0x7103839b94ull), le, &pad) == EH_CLEANUP && eh_personality(c, GA(0x710382b690ull), le, &pad) == EH_HANDLER, "and the personality classifies it");
     eh_enter_pad(c, &pad);
     st_import(c, "__cxa_begin_catch", le - 0x20, 0, 0, 0);
     st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
@@ -555,7 +555,7 @@ static void st_eh_flow(void) {
     Ctx *c2 = st_ctx();
     ST_RAISES(st_import(c, "_ZNKSt3__121__basic_string_commonILb1EE20__throw_out_of_rangeEv", 0, 0, 0, 0));
     CHECK(eh_in_flight(c) && !eh_in_flight(c2), "throw state belongs to the Ctx (guest thread or fiber), not to the host thread");
-    eh_personality(c, 0x710382b690ull, eh_in_flight(c), &pad); eh_enter_pad(c, &pad);
+    eh_personality(c, GA(0x710382b690ull), eh_in_flight(c), &pad); eh_enter_pad(c, &pad);
     st_import(c, "__cxa_begin_catch", c->x[0], 0, 0, 0); st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
     eh_set_unwinder(installed);
 }
@@ -621,10 +621,10 @@ static void st_throwing_extract(Ctx *c) { cxxrt_throw_ios_failure(c, "selftest")
 static void st_main_unwind(Ctx *c) {
     static const char *const op = "_ZNSt3__113basic_istreamIcNS_11char_traitsIcEEErsERf";
     printf("unwinding through main (f_7103839a10: catch (std::ios_base::failure &))\n");
-    if (!eh_main_resume_entry(0x7103839de8ull)) { printf("  (this game DLL was lifted without resume entries: not tested)\n"); return; }
+    if (!eh_main_resume_entry(GA(0x7103839de8ull))) { printf("  (this game DLL was lifted without resume entries: not tested)\n"); return; }
     register_unwind_imports();
     float out = -1.0f;
-    uint64_t r = cxxrt_call(c, 0x7103839a10ull, P64("2.5"), P64(&out), 0);
+    uint64_t r = cxxrt_call(c, GA(0x7103839a10ull), P64("2.5"), P64(&out), 0);
     CHECK((uint8_t)r == 1 && out == 2.5f, "control: the conversion works when nothing throws (returned %d, value %g)", (int)(uint8_t)r, out);
     ImportDef swap = {op, st_throwing_extract}, back = {op, import_lookup(op)};
     register_imports(&swap, 1);
@@ -632,7 +632,7 @@ static void st_main_unwind(Ctx *c) {
     for (int i = 19; i <= 29; i++) c->x[i] = 0x1111000000000000ull + (uint64_t)i;
     for (int i = 8; i < 16; i++) c->v[i].d[0] = 0x2222000000000000ull + (uint64_t)i;
     out = -1.0f;
-    r = cxxrt_call(c, 0x7103839a10ull, P64("7.25"), P64(&out), 0);
+    r = cxxrt_call(c, GA(0x7103839a10ull), P64("7.25"), P64(&out), 0);
     register_imports(&back, 1);
     int regs_ok = c->x[31] == sp;
     for (int i = 19; i <= 29; i++) if (c->x[i] != 0x1111000000000000ull + (uint64_t)i) regs_ok = 0;
@@ -642,7 +642,7 @@ static void st_main_unwind(Ctx *c) {
     CHECK(regs_ok, "sp, x19..x29 and d8..d15 are what they were before the call");
     CHECK(!st->in_flight && !st->caught && st->uncaught == 0, "no exception left in flight or caught (the handler's __cxa_end_catch destroyed it)");
     out = -1.0f;
-    r = cxxrt_call(c, 0x7103839a10ull, P64("-0.125"), P64(&out), 0);
+    r = cxxrt_call(c, GA(0x7103839a10ull), P64("-0.125"), P64(&out), 0);
     CHECK((uint8_t)r == 1 && out == -0.125f, "the function works again afterwards (returned %d, value %g)", (int)(uint8_t)r, out);
 }
 
@@ -665,8 +665,8 @@ static DWORD WINAPI st_main(LPVOID arg) {
         Ctx *c = st_ctx();
         g_main_stack_base = c->x[31] - (4 << 20) + 0x1000; g_main_stack_size = 4 << 20;
         printf("booting the game far enough to have its allocator (nninitStartup + static constructors)\n");
-        call_guest(c, GUEST_BASE + 0x2c55e0ULL);
-        for (uint64_t i = 0; i < 0x990 / 8; i++) { uint64_t fn = rd64(GUEST_BASE + 0x52a7be0ULL + i * 8); if (fn) call_guest(c, fn); }
+        call_guest(c, GA(GUEST_BASE + 0x2c55e0ULL));
+        for (uint64_t i = 0; i < g_main.init_arraysz / 8; i++) { uint64_t fn = rd64(GUEST_BASE + g_main.init_array + i * 8); if (fn) call_guest(c, fn); }
         printf("std::string, error messages, wide strings on the game heap\n"); st_with_game_heap(c);
 #ifdef ST_GAME_STREAM_TEST
         st_game_stream(c);

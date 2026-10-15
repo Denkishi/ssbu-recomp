@@ -6,7 +6,7 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-elf = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, '..', 'binaries', '13.0.4', 'main.elf')
+elf = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get('RECOMP_BIN') or os.path.join(HERE, '..', 'binaries', '13.0.4'), 'main.elf')
 out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, 'imports_all.txt')
 sys.path.insert(0, HERE)
 import recomp                                  # noqa: E402  (same constants and image as the lifter)

@@ -3894,7 +3894,7 @@ static void prog_set_shaders_(Ctx *c) {
         dump_stage_all(p->serial, i, control, data);
         /* V1 session 6: a program made by FUN_71000382a0 (13.0.4; the caller's return address lies in it) comes from a variation
          * of a "BNSH" container; that function keeps its third argument, the variation's program inside the file, in x20 */
-        if (g_rb == &rb_vk && i == 0 && c->x[30] - 0x71000382a0ull < 2884) { LONG64 tb = pf_now(); nvn_vk_container_seen(control, c->x[20]); nvn_setsh_part[1] += pf_now() - tb; }
+        if (g_rb == &rb_vk && i == 0 && c->x[30] - GA(0x71000382a0ull) < 2884) { LONG64 tb = pf_now(); nvn_vk_container_seen(control, c->x[20]); nvn_setsh_part[1] += pf_now() - tb; }
         {   static int diag = -1; static LONG nd;      /* SSBU_SHADER_SRC_LOG=<n>: where the first n heap-held stages come from (guest return addresses, the memory around the control section) */
             if (diag < 0) diag = getenv("SSBU_SHADER_SRC_LOG") ? atoi(getenv("SSBU_SHADER_SRC_LOG")) : 0;
             if (diag && (control >> 28) != 0x710 && InterlockedIncrement(&nd) <= diag) {

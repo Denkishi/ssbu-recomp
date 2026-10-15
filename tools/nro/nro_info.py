@@ -11,7 +11,7 @@ import os, struct, sys, json, collections
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.normpath(os.path.join(HERE, '..', '..', 'binaries', '13.0.4'))
+BIN = os.environ.get('RECOMP_BIN') or os.path.normpath(os.path.join(HERE, '..', '..', 'binaries', '13.0.4'))   # RECOMP_BIN: scripts/setup.py
 
 DT = {1: 'NEEDED', 2: 'PLTRELSZ', 3: 'PLTGOT', 4: 'HASH', 5: 'STRTAB', 6: 'SYMTAB', 7: 'RELA', 8: 'RELASZ',
       9: 'RELAENT', 10: 'STRSZ', 11: 'SYMENT', 12: 'INIT', 13: 'FINI', 14: 'SONAME', 20: 'PLTREL', 23: 'JMPREL',

@@ -91,13 +91,13 @@ void debug_mode_frame(long long frame) {
     LONG64 n = InterlockedIncrement64(&g_end_fight_frames);
     if (n == 1) {
         g_end_first_frame = frame;
-        uint64_t sel = 0x71053097c0ull + 0x20ull * (rd32(0x7105309968ull) < 3 ? rd32(0x7105309968ull) : 0);
+        uint64_t sel = GA(0x71053097c0ull) + 0x20ull * (rd32(GA(0x7105309968ull)) < 3 ? rd32(GA(0x7105309968ull)) : 0);
         uint64_t r0 = fighter_info_record(0), r1 = fighter_info_record(1);
         printf("debug match: fight %d on (the game's ready-go) at presented frame %lld: p1 kind %d (%s), p2 kind %d (%s) type %d cpu power %d | stage id 0x%x (match block + 0x420), chosen ui_stage %llx form %d (0 normal, 1 battlefield, 2 omega) flags %x/%x (%s) | rule: stock %d, item appear %d; stocks in the fighters' records %d / %d\n", g_dm_fight, frame,
-               (int)(int8_t)rd8(0x71052c4738ull), g_dm_name[0], (int)(int8_t)rd8(0x71052c4738ull + 0x260), g_dm_name[1], rd8(0x71052c4730ull + 0x260 + 0xa), rd8(0x71052c4730ull + 0x260 + 0x79),
-               rd32(0x71052c41b0ull + 0x420), (unsigned long long)rd64(sel), rd32(sel + 8), rd32(sel + 0xc), rd8(0x7105309985ull), g_dm.stage,
-               rd8(0x71052c41b0ull + 0x4c), rd32(0x71052c41b0ull + 0x54), r0 ? (int)rd32(r0 + 0xd8) : -1, r1 ? (int)rd32(r1 + 0xd8) : -1);
-        hex_lines("debug match:   stage block", 0x71052c41b0ull + 0x420, 0x30);
+               (int)(int8_t)rd8(GA(0x71052c4738ull)), g_dm_name[0], (int)(int8_t)rd8(GA(0x71052c4738ull) + 0x260), g_dm_name[1], rd8(GA(0x71052c4730ull) + 0x260 + 0xa), rd8(GA(0x71052c4730ull) + 0x260 + 0x79),
+               rd32(GA(0x71052c41b0ull) + 0x420), (unsigned long long)rd64(sel), rd32(sel + 8), rd32(sel + 0xc), rd8(GA(0x7105309985ull)), g_dm.stage,
+               rd8(GA(0x71052c41b0ull) + 0x4c), rd32(GA(0x71052c41b0ull) + 0x54), r0 ? (int)rd32(r0 + 0xd8) : -1, r1 ? (int)rd32(r1 + 0xd8) : -1);
+        hex_lines("debug match:   stage block", GA(0x71052c41b0ull) + 0x420, 0x30);
         fflush(stdout);
     }
     if (g_end_limit && n >= g_end_limit) InterlockedExchange64(&g_end_fired, frame);
@@ -201,9 +201,9 @@ static void watch_set(const uint64_t *addrs, int n) {
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);
 
 /* ---- the match set-up (from the game's own binary; see tests\DEBUG_MODE.md) */
-#define MELEE_INFO   0x71052c41b0ull                 /* the game's global match block (rule at +0, players at +0x588, 0x260 each) */
+#define MELEE_INFO   GA(0x71052c41b0ull)                 /* the game's global match block (rule at +0, players at +0x588, 0x260 each) */
 #define MI_PLAYER(i) (MELEE_INFO + 0x588 + 0x260ull * (uint64_t)(i))
-#define FN_ENTRY_SETUP 0x7100653240ull               /* (FighterEntry *, init parameter *, flags *): copies 0x70 bytes to entry + 0x70 */
+#define FN_ENTRY_SETUP GA(0x7100653240ull)               /* (FighterEntry *, init parameter *, flags *): copies 0x70 bytes to entry + 0x70 */
 static ImportFn g_orig_entry_setup;
 static void research_entry_setup(Ctx *c, void *user) {
     (void)user;
@@ -221,7 +221,7 @@ static void research_entry_setup(Ctx *c, void *user) {
  * State: +0x78 player type (0 human, 1 CPU, 2 amiibo, 3 none), +0x88 the ui_chara id (0xc1 << 56 | hash40("ui_chara_<name>")),
  * +0x90 colour, +0x224 CPU level. Record: +0 ui_chara id, +8 fighter kind, +0xa type, +0x19 colour, +0x79 CPU level.
  * The choice is replaced in the STATE before the game's own function runs, so everything it derives is the game's. */
-#define FN_PLAYER_RECORD 0x7101788260ull
+#define FN_PLAYER_RECORD GA(0x7101788260ull)
 static uint64_t hash40(const char *s) {
     uint32_t crc = 0xffffffffu; size_t n = strlen(s);
     for (size_t i = 0; i < n; i++) { crc ^= (uint8_t)s[i]; for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1))); }
@@ -247,9 +247,9 @@ static void match_player_hook(Ctx *c, void *user) {
         /* the stage choice: the game reads it right after the player records, in the same function (0x7102311a24..): three
          * entries of 0x20 bytes at 0x71053097c0, the current one's index at 0x7105309968: +0 ui_stage id (0x69 << 56 | hash40),
          * +8 form (0 normal, 1 battlefield, 2 omega), +0xc a flag word, +0x10 a second id. The rule header (match block + 0..) is filled already. */
-        uint32_t cur = rd32(0x7105309968ull); uint64_t sel = 0x71053097c0ull + 0x20ull * (cur < 3 ? cur : 0);
+        uint32_t cur = rd32(GA(0x7105309968ull)); uint64_t sel = GA(0x71053097c0ull) + 0x20ull * (cur < 3 ? cur : 0);
         printf("debug match: stage choice of the screens: entry %u: ui_stage %llx form %u flag %x second id %llx; byte 7105309985 = %u; rule: stock %u item appear %u\n", cur,
-               (unsigned long long)rd64(sel), rd32(sel + 8), rd32(sel + 0xc), (unsigned long long)rd64(sel + 0x10), rd8(0x7105309985ull), rd8(MELEE_INFO + 0x4c), rd32(MELEE_INFO + 0x54));
+               (unsigned long long)rd64(sel), rd32(sel + 8), rd32(sel + 0xc), (unsigned long long)rd64(sel + 0x10), rd8(GA(0x7105309985ull)), rd8(MELEE_INFO + 0x4c), rd32(MELEE_INFO + 0x54));
         if (g_dm.stage[0]) {
             const char *sn = g_dm.stage; char nm[80];
             if (!strcmp(sn, "fd") || !strcmp(sn, "final_destination")) sn = "end"; else if (!strcmp(sn, "battlefield")) sn = "battle_field";
@@ -257,7 +257,7 @@ static void match_player_hook(Ctx *c, void *user) {
             wr64(sel, 0x6900000000000000ull | hash40(nm));
         }
         if (g_dm_form >= 0) wr32(sel + 8, (uint32_t)g_dm_form);
-        if (g_dm_hazards >= 0) wr8(0x7105309985ull, (uint8_t)g_dm_hazards);
+        if (g_dm_hazards >= 0) wr8(GA(0x7105309985ull), (uint8_t)g_dm_hazards);
         if (g_dm.items >= 0) wr32(MELEE_INFO + 0x54, g_dm.items ? 2u : 0u);
     }
     g_orig_player_record(c);

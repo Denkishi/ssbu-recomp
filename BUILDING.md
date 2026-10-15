@@ -35,9 +35,10 @@ with bin\clang.exe>` or `LLVM_ROOT`, default `C:\llvm-9.0.0`. The Vulkan SDK is 
 
 ## What you dump from your own console
 
-The port handles **Super Smash Bros. Ultimate 13.0.4** (base game with the 13.0.4 update applied) and nothing else; step
-`convert` refuses another build. From your own copy of the game, with the homebrew dumping tools you prefer (for example
-nxdumptool, running on a console you own), produce a folder:
+The port handles **Super Smash Bros. Ultimate 13.0.4 and 13.0.5** (base game with the 13.0.4 or 13.0.5 update applied) and
+nothing else; step `convert` tells them apart and refuses another build ([docs/VERSIONS.md](docs/VERSIONS.md)). From
+your own copy of the game, with the homebrew dumping tools you prefer (for example nxdumptool, running on a console you
+own), produce a folder:
 
 ```
 <dump>/exefs/      the whole ExeFS: main, sdk, rtld, subsdk0, main.npdm   (with the update applied)
@@ -63,7 +64,7 @@ format is documented in `tools/lifter/sdklift.py` and `tools/audit/lift_select.p
 |---|---|
 | `deps` | checks every tool above and the dump; runs a test compile and link |
 | `stage` | lays the sources out in `build/work` (the tools expect their old single-folder layout) |
-| `convert` | `main` and `sdk` (NSO) to `build/binaries/13.0.4/*.elf`; checks the build and the segment hashes |
+| `convert` | `main` and `sdk` (NSO) to `build/binaries/<13.0.4 or 13.0.5>/*.elf`; checks the build and the segment hashes |
 | `modules` | extracts the game's script modules (NRO) from `data.arc`, writes their address map and registry |
 | `tables` | generates every header and table the runtime needs (imports, SDK data, self-test vectors, exception-table tests) |
 | `lift` | lifts the main executable (`recomp_eh.py`) |
@@ -132,7 +133,7 @@ Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
   `vswhere.exe` at `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\` and calls the batch file by its absolute path;
   a harmless "vswhere" notice from `vcvars64.bat` in `build/logs/link.log` can be ignored when the DLL is produced.
 - `missing input: ...main.npdm`: the ExeFS dump lacks `main.npdm`; dump the whole ExeFS.
-- `sdk is not the expected build`: not 13.0.4 with the update applied.
+- `main is not a build this port knows` / `sdk is not a build this port knows`: not 13.0.4 or 13.0.5 with the update applied.
 - `the list of SDK functions to lift was not found`: `tools/lifter/sdklift_roots.txt` is missing from your clone.
 - A compiler job that fails after a power loss or while the PC is under load: run the same command again; only what
   changed is rebuilt. Closing a running game first matters: a running exe holds its DLLs open and the link fails.

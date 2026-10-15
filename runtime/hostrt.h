@@ -34,4 +34,17 @@ uint64_t guest_function_of(uint64_t host_rip);
 void print_import_summary(FILE *out);
 void trace_printf(const char *fmt, ...);
 
+/* Game builds (hostrt.c, docs/VERSIONS.md). 13.0.4 is the reference: every game address written in the runtime is a
+ * 13.0.4 address, and GA() gives the address of the same thing in the build that runs (identity on 13.0.4). The layout
+ * of main (segments, relocation and symbol tables, init array) is read from main.elf at load, not written down. */
+enum { GAME_13_0_4, GAME_13_0_5 };
+extern int g_game_build;
+typedef struct {
+    uint64_t text_size, ro_start, data_start, file_image;         /* offsets from GUEST_BASE; file_image = bytes stored in the ELF */
+    uint64_t rela, relasz, jmprel, pltrelsz, symtab, strtab, init_array, init_arraysz;   /* from the dynamic section */
+} MainLayout;
+extern MainLayout g_main;
+uint64_t ga(uint64_t addr_13_0_4);
+#define GA(a) ga(a)
+
 #endif

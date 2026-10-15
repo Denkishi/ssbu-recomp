@@ -1160,7 +1160,7 @@ static long long g_fh_poll_hist[4]; static unsigned long g_fh_poll_tid;
 static long long g_fh_drop_calls, g_fh_drop_frames, g_fh_frame_ends;
 static uint64_t fh_fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; while (n--) { h ^= *b++; h *= 0x100000001b3ull; } return h; }
 static uint64_t fh_rng_base(void) {
-    uint64_t p = rd64(0x71052c25b0ull);
+    uint64_t p = rd64(GA(0x71052c25b0ull));
     if (p) p = rd64(p);
     if (p) p = rd64(p);
     return p;
@@ -1272,8 +1272,8 @@ static void fight_hash_start(void) {
     if (h && h[0] && h[0] != '0') g_fh_out = strcmp(h, "1") == 0 ? stdout : fopen(h, "w");
     int id = hook_install_name("_ZN7lua2cpp16L2CFighterCommon31sys_line_system_control_fighterEv", fh_hook, NULL, &g_fh_orig);
     printf("[fight] SSBU_FIGHT_HASH %s, SSBU_DETERMINISTIC %d (off mask %d); hook on the fighters' frame line: %s\n", g_fh_out ? "on" : "off", g_fh_det, g_fh_detoff, id ? "installed or waiting for lua2cpp_common" : hook_error());
-    if (g_fh_det) printf("[fight] SSBU_DETERMINISTIC: hook on the frame end 710386fc30 (dropped refreshes -> extra logic frames): %s\n",
-                         hook_install(0x710386fc30ull, fh_frame_end, NULL, &g_fh_orig_frame_end) ? "installed" : hook_error());
+    if (g_fh_det) printf("[fight] SSBU_DETERMINISTIC: hook on the frame end %llx (dropped refreshes -> extra logic frames): %s\n", (unsigned long long)GA(0x710386fc30ull),
+                         hook_install(GA(0x710386fc30ull), fh_frame_end, NULL, &g_fh_orig_frame_end) ? "installed" : hook_error());
     atexit(fh_exit);
 }
 static void fd_exit(void) { printf("[debug] %lld commands executed, %lld frames skipped because a differential recording was open\n", g_fd_done, g_fd_waited); fflush(stdout); }

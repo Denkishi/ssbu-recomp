@@ -28,8 +28,8 @@ typedef uint8_t Str;                                     /* pointer to a guest s
  * the game and allocates/frees through f_710392dce0(align, size) / f_710392e590(ptr) directly,
  * so a buffer created here can be freed there and vice versa. The stored capacity is the
  * allocation size (libc++ keeps "size | 1"), rounded up to 16 as the inlined code does. */
-#define GAME_MEMALIGN 0x710392dce0ULL
-#define GAME_FREE 0x710392e590ULL
+#define GAME_MEMALIGN GA(0x710392dce0ULL)
+#define GAME_FREE GA(0x710392e590ULL)
 static __declspec(thread) Ctx *t_ctx;                     /* context of the string op in progress */
 static char *sbuf_alloc(size_t alloc) {
     Ctx *c = t_ctx;

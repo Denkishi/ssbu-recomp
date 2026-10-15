@@ -2,18 +2,114 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
 
 #define FILE_OFF 0x1000ULL
-#define FILE_IMAGE 0x52a8570ULL
-#define IMAGE_SIZE 0x7500000ULL
-#define GUEST_RO_END 0x4f16000ULL        /* start of the data segment (third PT_LOAD of main.elf): text and read-only data end here */
-#define RELA 0x39c8070ULL
-#define RELASZ 0x7ad0d8ULL
-#define JMPREL 0x4175148ULL
-#define PLTRELSZ 0xc600ULL
+#define IMAGE_SIZE 0x7500000ULL          /* the whole image with bss: 13.0.4 and 13.0.5 both end below it */
+
+/* ---------------------------------------------------------------- game builds (docs/VERSIONS.md)
+ * The layout of main is read from main.elf (load_layout): its PT_LOAD segments (nso2elf.py writes text, read-only data,
+ * data with bss) and the dynamic section MOD0 points to. 13.0.4: text 0x0..0x39c7e90, read-only data from 0x39c8000, data
+ * from 0x4f16000, 0x52a8570 bytes in the file; RELA 0x39c8070 / 0x7ad0d8, JMPREL 0x4175148 / 0xc600, SYMTAB 0x4197610,
+ * INIT_ARRAY 0x52a7be0 / 0x990 (the constants this replaces). 13.0.5 (update v2031616): text 0x39c8440, everything after
+ * it one page (0x1000) later with the same sizes.
+ * GA(a): the running build's address of the 13.0.4 address a. Read-only data, data and bss moved as whole segments, so
+ * those addresses move by the page; code moved by different amounts in different places (13.0.5 changed a handful of
+ * functions), so a code address must be in g_code_13_0_5, where each entry was found and checked as docs/VERSIONS.md says
+ * (tools/port/verify_13_0_5.py repeats the check on a dump). A code address missing from it stops the program: calling the
+ * wrong function silently would be worse. */
+int g_game_build = -1;                               /* set by load_layout */
+MainLayout g_main;
+static const uint64_t g_code_13_0_5[][2] = {         /* 13.0.4 -> 13.0.5 offsets from GUEST_BASE, sorted by the first */
+    {0x0382a0, 0x0382a0},       /* FUN_71000382a0 (nvn_gl.c), 2,884 bytes in both */
+    {0x047d20, 0x047d20},       /* clock read return address (nnsdk.c, fixed seed) */
+    {0x138534, 0x138534},       /* clock read return address (nnsdk.c, fixed seed) */
+    {0x2c55e0, 0x2c55e0},       /* nninitStartup */
+    {0x2c5620, 0x2c5620},       /* nnMain */
+    {0x653240, 0x653240},       /* entry set-up (debug_mode.c) */
+    {0x147f330, 0x147f330},     /* path formatter (newmodule_host.c) */
+    {0x1519430, 0x1519430},     /* hook self-test function (hook_host.c) */
+    {0x1788260, 0x17880c0},     /* player record builder (debug_mode.c) */
+    {0x17df5f0, 0x17df5b0},     /* path sub-builder (newmodule_host.c) */
+    {0x17dfe50, 0x17dfe10},     /* path sub-builder 2 (newmodule_host.c) */
+    {0x1ea04d0, 0x1ea04d0},     /* formatter (newmodule_host.c) */
+    {0x22b67d4, 0x22b67d4},     /* worker return address (newmodule_host.c) */
+    {0x353e330, 0x353e8e0},     /* path -> file index (newmodule_host.c) */
+    {0x35444c0, 0x3544a70},     /* resource service inflate thread: start (loose_files.c) */
+    {0x35456d8, 0x3545c88},     /* and the end of its range (loose_files.c) */
+    {0x35b5c50, 0x35b6200},     /* ostringstream code (cxxrt_selftest.h) */
+    {0x366d1f0, 0x366d7a0},     /* clock read return address (nnsdk.c, fixed seed) */
+    {0x366d388, 0x366d938},     /* clock read return address (nnsdk.c, fixed seed) */
+    {0x36f2814, 0x36f2dc4},     /* call site (os_threads.c) */
+    {0x3828300, 0x38288b0},     /* function with catch (...) (cxxrt_selftest.h) */
+    {0x382b690, 0x382bc40},     /* call site in it */
+    {0x382cb34, 0x382d0e4},     /* its landing pad */
+    {0x3839a10, 0x3839fc0},     /* function with catch (std::ios_base::failure &) (cxxrt_selftest.h) */
+    {0x3839b94, 0x383a144},     /* call site in it */
+    {0x3839de8, 0x383a398},     /* its landing pad */
+    {0x38697e0, 0x3869d90},     /* EH main test function (nnsdk2.c) */
+    {0x386fc30, 0x38701e0},     /* graphics frame end (fighter_host.c, SSBU_DETERMINISTIC) */
+    {0x38fae10, 0x38fb3c0},     /* luaD_throw */
+    {0x38faf00, 0x38fb4b0},     /* luaD_rawrunprotected */
+    {0x392dce0, 0x392e290},     /* je_aligned_alloc (the game's memalign) */
+    {0x392e590, 0x392eb40},     /* free_default (the game's free) */
+    {0x39a3e70, 0x39a4420},     /* zstd: free stream (nvn_vk_store.c) */
+    {0x39a4040, 0x39a45f0},     /* zstd: decompress stream (nvn_vk_store.c) */
+};
+uint64_t ga(uint64_t a) {
+    if (g_game_build < 0) { printf("\nGA: game address %llx asked for before main.elf was read: stopping\n", (unsigned long long)a); report_and_exit(8); }
+    if (g_game_build == GAME_13_0_4 || a < GUEST_BASE || a >= GUEST_BASE + IMAGE_SIZE) return a;
+    uint64_t o = a - GUEST_BASE;
+    if (o >= 0x39c8000) return a + 0x1000;            /* 13.0.4's read-only data, data and bss: one page later */
+    int lo = 0, hi = (int)(sizeof g_code_13_0_5 / sizeof g_code_13_0_5[0]) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_code_13_0_5[mid][0] == o) return GUEST_BASE + g_code_13_0_5[mid][1];
+        if (g_code_13_0_5[mid][0] < o) lo = mid + 1; else hi = mid - 1;
+    }
+    printf("\nGA: the 13.0.4 code address %llx has no 13.0.5 counterpart in hostrt.c (g_code_13_0_5): stopping\n", (unsigned long long)a);
+    report_and_exit(8);
+    return a;
+}
+/* main.elf's program headers (before the image is read) and the build */
+static void load_layout(FILE *f, const char *elf) {
+    uint8_t eh[64], ph[56];
+    uint64_t load[3][3] = {{0}};                        /* vaddr, filesz, memsz of the PT_LOADs in order */
+    int n = 0;
+    if (fread(eh, 1, sizeof eh, f) != sizeof eh || memcmp(eh, "\x7f" "ELF", 4)) { fprintf(stderr, "%s is not an ELF file\n", elf); exit(1); }
+    uint64_t phoff; uint16_t phnum;
+    memcpy(&phoff, eh + 0x20, 8); memcpy(&phnum, eh + 0x38, 2);
+    for (int i = 0; i < phnum; i++) {
+        uint32_t type;
+        fseek(f, (long)(phoff + (uint64_t)i * 56), SEEK_SET);
+        if (fread(ph, 1, sizeof ph, f) != sizeof ph) break;
+        memcpy(&type, ph, 4);
+        if (type == 1 && n < 3) { memcpy(&load[n][0], ph + 16, 8); memcpy(&load[n][1], ph + 32, 8); memcpy(&load[n][2], ph + 40, 8); n++; }
+    }
+    if (n != 3) { fprintf(stderr, "%s: %d PT_LOAD segments, 3 expected (convert the dump with tools/extract/nso2elf.py)\n", elf, n); exit(1); }
+    g_main.text_size = load[0][1]; g_main.ro_start = load[1][0]; g_main.data_start = load[2][0]; g_main.file_image = load[2][0] + load[2][1];
+    if (g_main.text_size == 0x39c7e90) g_game_build = GAME_13_0_4;
+    else if (g_main.text_size == 0x39c8440) g_game_build = GAME_13_0_5;
+    else { fprintf(stderr, "%s: code size %#llx is not a build this runtime knows (13.0.4: 0x39c7e90, 13.0.5: 0x39c8440)\n", elf, (unsigned long long)g_main.text_size); exit(1); }
+    if (load[2][0] + load[2][2] > IMAGE_SIZE) { fprintf(stderr, "%s: the image (%#llx bytes with bss) does not fit IMAGE_SIZE\n", elf, (unsigned long long)(load[2][0] + load[2][2])); exit(1); }
+}
+/* the dynamic section, from the image in memory: MOD0 at text + 4 gives its offset */
+static void load_dynamic(void) {
+    uint64_t mod0 = rd32(GUEST_BASE + 4), d = mod0 + (uint64_t)(int64_t)(int32_t)rd32(GUEST_BASE + mod0 + 4);
+    for (int i = 0; i < 4096; i++, d += 16) {
+        int64_t tag = (int64_t)rd64(GUEST_BASE + d); uint64_t v = rd64(GUEST_BASE + d + 8);
+        if (tag == 0) break;
+        if (tag == 7) g_main.rela = v; else if (tag == 8) g_main.relasz = v; else if (tag == 23) g_main.jmprel = v; else if (tag == 2) g_main.pltrelsz = v;
+        else if (tag == 6) g_main.symtab = v; else if (tag == 5) g_main.strtab = v; else if (tag == 25) g_main.init_array = v; else if (tag == 27) g_main.init_arraysz = v;
+    }
+    printf("main: build %s, text %#llx, data at %#llx, RELA %#llx / %#llx, JMPREL %#llx / %#llx, SYMTAB %#llx, INIT_ARRAY %#llx / %#llx\n",
+           g_game_build == GAME_13_0_5 ? "13.0.5" : "13.0.4", (unsigned long long)g_main.text_size, (unsigned long long)g_main.data_start,
+           (unsigned long long)g_main.rela, (unsigned long long)g_main.relasz, (unsigned long long)g_main.jmprel, (unsigned long long)g_main.pltrelsz,
+           (unsigned long long)g_main.symtab, (unsigned long long)g_main.init_array, (unsigned long long)g_main.init_arraysz);
+}
 
 static ImportFn *g_handlers;
 static unsigned long long *g_import_calls;
@@ -508,12 +604,14 @@ void runtime_init(const char *elf, const char *trace_path) {
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
     FILE *f = fopen(elf, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", elf); exit(1); }
+    load_layout(f, elf);
     fseek(f, (long)FILE_OFF, SEEK_SET);
-    if (fread(mem, 1, FILE_IMAGE, f) != FILE_IMAGE) { fprintf(stderr, "short read on image\n"); exit(1); }
+    if (fread(mem, 1, g_main.file_image, f) != g_main.file_image) { fprintf(stderr, "short read on image\n"); exit(1); }
     fclose(f);
+    load_dynamic();
 
     unsigned long long rel = 0, sym_int = 0, sym_ext = 0, sym_weak = 0, other = 0;
-    const uint64_t tables[2][2] = {{RELA, RELASZ}, {JMPREL, PLTRELSZ}};
+    const uint64_t tables[2][2] = {{g_main.rela, g_main.relasz}, {g_main.jmprel, g_main.pltrelsz}};
     for (int t = 0; t < 2; t++) {
         for (uint64_t i = 0; i < tables[t][1] / 24; i++) {
             uint64_t e = GUEST_BASE + tables[t][0] + i * 24;
@@ -527,7 +625,7 @@ void runtime_init(const char *elf, const char *trace_path) {
                 /* An undefined WEAK symbol is null unless a module defines it. main has 14 (__rel_dyn/plt_start/end, nu::VirtualAllocHook,
                  * nu::VirtualFreeHook, 8 glslc*; .dynsym of main at 0x4197610, recomp.py) and neither sdk nor subsdk0 exports any of them
                  * (dynsym of both read 2026-10-08): the game's `if (hook)` tests are false, as on the console. */
-                else if ((rd8(GUEST_BASE + 0x4197610ULL + (uint64_t)sym * 24 + 4) >> 4) == 2 && !(g_import_addr && g_import_addr[sym])) { s = 0; sym_weak++; }
+                else if ((rd8(GUEST_BASE + g_main.symtab + (uint64_t)sym * 24 + 4) >> 4) == 2 && !(g_import_addr && g_import_addr[sym])) { s = 0; sym_weak++; }
                 else { s = g_import_addr && g_import_addr[sym] ? g_import_addr[sym] : IMPORT_BASE + (uint64_t)sym * IMPORT_SLOT; sym_ext++; }
                 wr64(GUEST_BASE + off, s + (type == 0x101 ? (uint64_t)addend : 0));
             } else other++;
@@ -542,8 +640,8 @@ void runtime_init(const char *elf, const char *trace_path) {
      * wild write into code or constants faults instead of corrupting silently. SSBU_NO_PROTECT=1 leaves the old mapping. */
     if (!getenv("SSBU_NO_PROTECT")) {
         DWORD oldp;
-        if (!VirtualProtect((void *)GUEST_BASE, GUEST_RO_END, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
-        printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + GUEST_RO_END);
+        if (!VirtualProtect((void *)GUEST_BASE, g_main.data_start, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
+        printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + g_main.data_start);
     }
 }
 

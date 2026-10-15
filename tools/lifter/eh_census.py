@@ -6,7 +6,7 @@ With 'dump' writes eh_tables.bin for the host runtime (see nncxxrt.c):
 import struct, sys
 import recomp
 IMG, OFF, BASE = recomp.IMG, recomp.FILE_OFF, recomp.BASE
-TEXT_END = 0x39c7e90
+TEXT_END = recomp.TEXT_SIZE
 
 def u32(o): return struct.unpack_from('<I', IMG, OFF + o)[0]
 def s32(o): return struct.unpack_from('<i', IMG, OFF + o)[0]
@@ -77,7 +77,7 @@ def enc_ptr(o, enc):
 RELOC = {}
 def load_relocs():
     sym, strt = recomp.SYMTAB, recomp.STRTAB
-    for tbl, size in ((0x39c8070, 0x7ad0d8), (0x4175148, 0xc600)):
+    for tbl, size in ((recomp.RELA, recomp.RELASZ), (recomp.JMPREL, recomp.PLTRELSZ)):
         for i in range(size // 24):
             off, info, addend = struct.unpack_from('<QQq', IMG, OFF + tbl + i * 24)
             t = info & 0xffffffff

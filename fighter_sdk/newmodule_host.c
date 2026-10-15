@@ -36,8 +36,8 @@
 
 #define NM_MAX 8
 #define NM_VT_SLOTS 96
-#define NM_WORKER_RET 0x71022b67d4ULL
-#define NM_FORMATTER 0x7101ea04d0ULL
+#define NM_WORKER_RET GA(0x71022b67d4ULL)
+#define NM_FORMATTER GA(0x7101ea04d0ULL)
 
 typedef struct NewMod {
     SsbuRegFighter f;
@@ -278,7 +278,7 @@ static uint64_t nm_hash40(const char *s) {
 }
 /* the archive's own file lookup (as the worker does it inline at 0x71022b68cc..): file path index, or -1 */
 static int64_t nm_arc_file_index(uint64_t hash) {
-    uint64_t fsinfo = rd64(0x7105331f20ULL);
+    uint64_t fsinfo = rd64(GA(0x7105331f20ULL));
     if (!fsinfo) return -2;
     uint64_t holder = rd64(fsinfo + 0x78); if (!holder) return -2;
     uint64_t tab = rd64(holder); if (!tab) return -2;
@@ -392,7 +392,8 @@ static void nm_h_fmt(Ctx *c, void *user) {
 /*   0x71017dfe50 (buffer, kind, file type, x3, x4): a second sub-builder of it;
  *   0x710353e330 (out, path string in x1): the path builder's last step, "path string -> file index" (entry 3:
  *   the string is looked at BEFORE the call). */
-static const uint64_t g_nm_path_fn[] = { 0x710147f330ULL, 0x71017df5f0ULL, 0x71017dfe50ULL, 0x710353e330ULL };
+static const uint64_t g_nm_path_fn[] = {      /* 13.0.4 addresses: GA() where they are used */
+    0x710147f330ULL, 0x71017df5f0ULL, 0x71017dfe50ULL, 0x710353e330ULL };
 #define NM_PATH_PRE 3
 static ImportFn g_nm_o_path[sizeof g_nm_path_fn / sizeof g_nm_path_fn[0]];
 static void nm_h_pathfmt(Ctx *c, void *user) {
@@ -421,7 +422,7 @@ static void nm_start(void) {
     int b = hook_install_name("_ZN3lib8L2CAgent20sv_set_function_hashEPvN3phx6Hash40E", nm_h_fnhash, NULL, &g_nm_o_fnhash);
     int d = hook_install_name("_ZN7lua2cpp12L2CAgentBase18sv_set_status_funcERKN3lib8L2CValueES4_Pv", nm_h_status, NULL, &g_nm_o_status);
     int e = 0;
-    for (int i = 0; i < (int)(sizeof g_nm_path_fn / sizeof g_nm_path_fn[0]); i++) e += !!hook_install(g_nm_path_fn[i], nm_h_pathfmt, (void *)(intptr_t)i, &g_nm_o_path[i]);
+    for (int i = 0; i < (int)(sizeof g_nm_path_fn / sizeof g_nm_path_fn[0]); i++) e += !!hook_install(GA(g_nm_path_fn[i]), nm_h_pathfmt, (void *)(intptr_t)i, &g_nm_o_path[i]);
     nm_log("[registry] runtime hooks: path formatter 0x%llx %s, sv_set_function_hash %s, sv_set_status_func %s, %d of %d other path builders", (unsigned long long)NM_FORMATTER,
            a ? "installed" : "FAILED", b ? "installed" : "FAILED", d ? "installed" : "FAILED", e, (int)(sizeof g_nm_path_fn / sizeof g_nm_path_fn[0]));
     atexit(nm_report);

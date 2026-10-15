@@ -787,8 +787,8 @@ static const ImportDef fill_imports[] = {
  * SSBU_MISC_SELFTEST=1: run the game's own luaD_rawrunprotected (0x71038faf00) on a blank
  * lua_State with host callbacks that return normally, throw through the game's luaD_throw
  * (0x71038fae10), and throw from inside a nested protected call; then exit. */
-#define LUAD_RAWRUNPROTECTED 0x71038faf00ull
-#define LUAD_THROW 0x71038fae10ull
+#define LUAD_RAWRUNPROTECTED GA(0x71038faf00ull)
+#define LUAD_THROW GA(0x71038fae10ull)
 static int g_selftest_mode;
 static void selftest_callback(Ctx *c) {                   /* Pfunc: (lua_State *L, void *ud) */
     uint64_t L = A0;
@@ -860,8 +860,8 @@ int close5_lead_selftest(Ctx *c) {
     if (!getenv("SSBU_NO_PROTECT")) {
         n += 3;
         if (!IsBadWritePtr((void *)(uintptr_t)0x7100000000ull, 1)) { bad++; printf("  close5 lead: the first text page is writable\n"); }
-        if (!IsBadWritePtr((void *)(uintptr_t)(0x7104f16000ull - 1), 1)) { bad++; printf("  close5 lead: the last read-only data byte is writable\n"); }
-        if (IsBadWritePtr((void *)(uintptr_t)0x7104f16000ull, 1) || IsBadReadPtr((void *)(uintptr_t)0x7100000000ull, 16)) { bad++; printf("  close5 lead: data segment not writable or text not readable\n"); }
+        if (!IsBadWritePtr((void *)(uintptr_t)((GUEST_BASE + g_main.data_start) - 1), 1)) { bad++; printf("  close5 lead: the last read-only data byte is writable\n"); }
+        if (IsBadWritePtr((void *)(uintptr_t)(GUEST_BASE + g_main.data_start), 1) || IsBadReadPtr((void *)(uintptr_t)0x7100000000ull, 16)) { bad++; printf("  close5 lead: data segment not writable or text not readable\n"); }
     }
     printf("  close5 lead (pctl bool answers, image protection): %d cases, %d failed\n", n, bad);
     return bad;

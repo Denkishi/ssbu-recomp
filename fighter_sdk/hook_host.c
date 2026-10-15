@@ -537,7 +537,7 @@ static int hk_check(const char *what, int ok) { printf("hook selftest: %-64s %s\
 
 /* main: f_7101519430 is `x0 = ((x1 & 0xfe) != 28)`: no memory, no calls (gen_eh_o2\c_01c2.c) */
 static void hook_selftest_main(Ctx *c) {
-    const uint64_t A = 0x7101519430ull;
+    const uint64_t A = GA(0x7101519430ull);
     ImportFn f = function_at(A);
     Ctx saved = *c; int bad = 0;
     hook_census("main", fn_table, fn_table_count);

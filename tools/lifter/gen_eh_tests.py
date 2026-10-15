@@ -22,7 +22,7 @@ def sleb(o):
             if b & 0x40: r -= 1 << s
             return r, o
 RELOC = {}
-for tbl, size in ((0x39c8070, 0x7ad0d8), (0x4175148, 0xc600)):
+for tbl, size in ((recomp.RELA, recomp.RELASZ), (recomp.JMPREL, recomp.PLTRELSZ)):
     for i in range(size // 24):
         off, info, addend = struct.unpack_from('<QQq', IMG, OFF + tbl + i * 24)
         t = info & 0xffffffff

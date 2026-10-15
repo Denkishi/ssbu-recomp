@@ -100,7 +100,7 @@ void os_signal_event(uint64_t key);                   /* os_threads.c */
 #define FLAG_EOS 4
 #define MAX_TRACKS 8
 #define SLOT_BYTES 64
-#define GAME_FREE 0x710392e590ULL                     /* the game's free, as in libcxx.c */
+#define GAME_FREE GA(0x710392e590ULL)                     /* the game's free, as in libcxx.c */
 #define TOKEN_MAGIC 0x4d4f564945544f4bULL             /* "MOVIETOK" */
 
 /* ---------------------------------------------------------------- small helpers */
@@ -1011,7 +1011,7 @@ static void dec_SendInputBufferForDecode(Ctx *c) {    /* (int index, int offset,
         /* SSBU_MOVIE_TEST_RESYNC=<flag>,<n>: at the n-th video sample raise the game's own "re-synchronise movies" request
          * (byte 0x7107446040, set by its system-notification handler f_7103741700: 8 = operation mode changed, 4 / 2 = the
          * two halves of a focus change); the movie manager [game 0x71036e3984] then pauses, seeks and resumes the player. */
-        uint8_t *req = (uint8_t *)(uintptr_t)0x7107446040ULL;
+        uint8_t *req = (uint8_t *)(uintptr_t)GA(0x7107446040ULL);
         InterlockedOr8((char *)req, (char)g_test_resync_flag);
         printf("movie: TEST: resync request %d raised at video sample %d\n", g_test_resync_flag, g_test_resync_at);
     }

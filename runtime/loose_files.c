@@ -147,7 +147,7 @@ static void lf_serve(uint64_t service) {
 static void lf_inflate(Ctx *c, void *user) {
     (void)user;
     uint64_t lr = c->x[30], service = c->x[19], index = c->x[27];
-    int from_thread = lr >= 0x71035444c0ull && lr < 0x71035456d8ull;
+    int from_thread = lr >= GA(0x71035444c0ull) && lr < GA(0x71035456d8ull);
     if (from_thread && !g_lf_resolved) lf_serve(service);
     g_lf_orig_inflate(c);
     if (!from_thread || c->x[0] != 0) return;
@@ -201,8 +201,8 @@ static int loose_files_scan(void (*log)(const char *)) {
     return g_lf_count;
 }
 static int loose_files_install(int (*install)(uint64_t, HookFn, void *, HookOrig *), int quiet) {
-    int ok = install(0x71039a4040ull, lf_inflate, NULL, &g_lf_orig_inflate);
-    if (ok || !quiet) lf_logf("[loose] hook on the per-file decompress 0x71039a4040: %s", ok ? "installed" : "FAILED");
+    int ok = install(GA(0x71039a4040ull), lf_inflate, NULL, &g_lf_orig_inflate);
+    if (ok || !quiet) lf_logf("[loose] hook on the per-file decompress %#llx: %s", (unsigned long long)GA(0x71039a4040ull), ok ? "installed" : "FAILED");
     return ok;
 }
 static int loose_files_start(int (*install)(uint64_t, HookFn, void *, HookOrig *), void (*log)(const char *)) {

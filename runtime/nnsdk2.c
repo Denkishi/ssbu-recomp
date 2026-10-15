@@ -596,11 +596,11 @@ static void eh_main_test(void) {
     g_ehm_other[0] = P(g_ehm_table);                          /* bit 0 clear: not trivially copyable -> the manager is called */
     memset(g_ehm_self, 0, sizeof g_ehm_self);
     g_exit_report_hook = eh_main_test_report;
-    printf("EH main test: calling the game function 0x71038697e0 (target %llx, source %llx, manager = import placeholder %llx of %s)\n",
-           (unsigned long long)P(g_ehm_self), (unsigned long long)P(g_ehm_other), (unsigned long long)g_ehm_table[0], thrower);
+    printf("EH main test: calling the game function %#llx (target %llx, source %llx, manager = import placeholder %llx of %s)\n",
+           (unsigned long long)GA(0x71038697e0ULL), (unsigned long long)P(g_ehm_self), (unsigned long long)P(g_ehm_other), (unsigned long long)g_ehm_table[0], thrower);
     fflush(stdout);
     c->x[0] = P(g_ehm_self); c->x[1] = P(g_ehm_other); c->x[30] = 0;
-    call_guest(c, 0x71038697e0ULL);
+    call_guest(c, GA(0x71038697e0ULL));
     printf("EH main test: FAILED: the function returned (no exception left it); target word 0 = %llx\n", (unsigned long long)g_ehm_self[0]);
     fflush(stdout);
     ExitProcess(97);

@@ -1,6 +1,6 @@
 # ssbu-recomp
 
-A **static recompilation** of *Super Smash Bros. Ultimate* (version 13.0.4) from the Nintendo Switch to a
+A **static recompilation** of *Super Smash Bros. Ultimate* (version 13.0.4 or 13.0.5) from the Nintendo Switch to a
 native Windows x64 program, with its own runtime, a Vulkan renderer, and tools to turn the fighters' script
 code back into readable, editable C++.
 
@@ -9,7 +9,7 @@ translated to C ahead of time and compiled for the PC; the console's system libr
 video, input and file system are re-implemented by this project's runtime.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own legally obtained copy of the game (13.0.4). Everything derived from it is generated on
+> You need your own legally obtained copy of the game (13.0.4 or 13.0.5). Everything derived from it is generated on
 > your PC, from your dump, and never leaves it. The only game-related text in the tree is names: a list of
 > system-library function names chosen for translation, and function names used by the tools.
 
@@ -123,7 +123,7 @@ rules) is being converted with a second, general decompiler.
 
 ## Requirements
 
-To run: Windows 10/11 x64, a GPU with a Vulkan 1.3 driver, your own dump of the game (version 13.0.4).
+To run: Windows 10/11 x64, a GPU with a Vulkan 1.3 driver, your own dump of the game (version 13.0.4 or 13.0.5; [docs/VERSIONS.md](docs/VERSIONS.md)).
 
 To build: Python 3.10+ (numpy, lz4, zstandard, Pillow, unicorn), LLVM/clang 9.0.0, MSVC Build Tools with a Windows SDK,
 SDL3 (VC development package), Khronos Vulkan-Headers, glslang (Windows release), a yuzu-family source checkout for the

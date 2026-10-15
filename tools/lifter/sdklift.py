@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, 'ro_study'))
 import recomp_nro as R
 
-SDK = os.path.join(HERE, '..', 'binaries', '13.0.4', 'sdk.elf')
+SDK = os.path.join(os.environ.get('RECOMP_BIN') or os.path.join(HERE, '..', 'binaries', '13.0.4'), 'sdk.elf')   # RECOMP_BIN: scripts/setup.py
 SDK_BASE = 0x7500000000
 d = open(SDK, 'rb').read()
 FILE_OFF = 0x1000

@@ -308,7 +308,7 @@ static void os_YieldThread(Ctx *c) { (void)c; SwitchToThread(); }
 static void movie_preroll_diag(Ctx *c) {
     static int on = -1, n;
     if (on < 0) on = getenv("SSBU_MOVIE_LOG") != NULL;
-    if (!on || c->import_from != 0x71036f2814ULL || (n++ % 25)) return;
+    if (!on || c->import_from != GA(0x71036f2814ULL) || (n++ % 25)) return;
     uint64_t p = c->x[21], vr = rd64(p + 0x58) ? rd64(rd64(p + 0x58)) : 0, ar = rd64(p + 0x68) ? rd64(rd64(p + 0x68)) : 0;
     printf("movie: pre-roll sleep %d (loop count %u of %u): video frames queued %lld", n, (unsigned)c->x[24], (unsigned)c->x[25], vr ? (long long)rd64(vr + 0xb0) : -1LL);
     if (ar) printf("; audio: filled %lld, accumulate %u, pool %d buffers of %d bytes (flush at %d), free %lld, pending outputs %lld, +0x40 %d", (long long)rd64(ar + 0x110), rd8(ar + 0x50), (int)rd32(ar + 0x44), (int)rd32(ar + 0x48), (int)rd32(ar + 0x4c),
