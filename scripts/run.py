@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--seconds', type=int, default=0, help='stop after this many seconds (0 = play until you quit)')
     ap.add_argument('--seq', help='input sequence file (tests/seq_*.txt): lines starting with # are comments')
     ap.add_argument('--exe', default='ssbu_native.exe', help='exe name inside build/work; a copy of ssbu_native.exe is made if missing')
+    ap.add_argument('--refresh', action='store_true', help='copy ssbu_native.exe over --exe again when the copy is older than it')
     ap.add_argument('--seed', help='SSBU_FIXED_SEED value (deterministic random numbers)')
     ap.add_argument('--log', help='write the game output to this file instead of the console')
     ap.add_argument('--env', action='append', default=[], help='NAME=VALUE, may be repeated')
@@ -37,8 +38,17 @@ def main():
         state = json.load(f)
     work = os.path.join(a.build, 'work')
     exe = os.path.join(work, a.exe)
+    native = os.path.join(work, 'ssbu_native.exe')
     if not os.path.exists(exe):
-        shutil.copy2(os.path.join(work, 'ssbu_native.exe'), exe)
+        shutil.copy2(native, exe)
+    elif exe != native and os.path.getmtime(exe) < os.path.getmtime(native):
+        # a copy made before the last link runs the old runtime; an exe linked on purpose with other sources
+        # (RECOMP_EXE) is older too, so it is only replaced when asked
+        if a.refresh:
+            shutil.copy2(native, exe)
+            print('%s was older than ssbu_native.exe: copied again' % a.exe)
+        else:
+            print('note: %s is older than ssbu_native.exe and may run an older runtime (--refresh copies it again)' % a.exe)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('RECOMP_', 'SSBU_'))}
     env['SSBU_ROMFS'] = state['dump']['romfs']
     env['SSBU_USERDATA'] = os.path.abspath(a.userdata)
