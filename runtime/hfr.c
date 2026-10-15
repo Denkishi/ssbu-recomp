@@ -34,12 +34,14 @@
 #define FN_SLOW_STEP 0x710135ca00ULL
 #define FN_SLOW_MAX 0x71014a2cd0ULL
 #define SLOW_TABLE_PTR 0x71052c2610ULL                 /* -> the slow request table; + 0x40 = its dirty flag */
+#define SLOW 0x71052c4184ULL                           /* the slow state: + 4 N of the cycle, + 6 update within the cycle */
+#define RNG_ROOT 0x71052c25b0ULL                       /* -> -> -> the 9 script random generators of app::sv_math::rand, 20 bytes each (fighter_sdk\fighter_host.c) */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 
 static int g_setting;                                  /* 60 or 120 once hfr_init has run */
 static ImportFn g_orig_step, g_orig_max;
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
-static LONG64 g_qpf, g_steps, g_battles, g_doubled;
+static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added;
 
 int hfr_setting(void) { return g_setting == 120 ? 120 : 60; }
 static int battle_running(LONG64 now) { return g_step_qpc && now - g_step_qpc < g_qpf / 4; }
@@ -62,7 +64,19 @@ static void slow_step_hook(Ctx *c, void *user) {
     }
     InterlockedExchange64(&g_step_qpc, now.QuadPart);
     g_steps++;
+    /* The updates this mode adds are the odd ones of a cycle of 2N (the even ones are the console's updates of a cycle of
+     * N). Effects draw from the script random generators on every update, so the added ones would move the generators
+     * that the game logic also draws from, and the fight would take another course than at 60 Hz. An added update gets
+     * the generators back as they were before it: the logic sees the same random numbers as at 60 Hz. */
+    unsigned n = rd8(SLOW + 4), next = rd8(SLOW + 6) + 1u;
+    uint64_t rb = rd64(RNG_ROOT);
+    if (rb) rb = rd64(rb);
+    if (rb) rb = rd64(rb);
+    int added = n > 1 && next < n && (next & 1) && rb;
+    uint8_t keep[180];
+    if (added) memcpy(keep, (void *)(uintptr_t)rb, sizeof keep);
     g_orig_step(c);
+    if (added) { memcpy((void *)(uintptr_t)rb, keep, sizeof keep); g_added++; }
 }
 static void slow_max_hook(Ctx *c, void *user) {
     (void)user;
@@ -90,5 +104,5 @@ void hfr_init(void) {
 }
 
 void hfr_report(FILE *out) {
-    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates, slow divisor doubled %lld times\n", (long long)g_battles, (long long)g_steps, (long long)g_doubled);
+    if (g_setting == 120) fprintf(out, "hfr: %lld battles, %lld battle updates (%lld of them added between two of the console's), slow divisor doubled %lld times\n", (long long)g_battles, (long long)g_steps, (long long)g_added, (long long)g_doubled);
 }
