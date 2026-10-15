@@ -2470,7 +2470,7 @@ static void vk_present2(void *arg, int progress) {
             const char *dir = getenv("SSBU_SHOT_DIR");
             snprintf(path, sizeof path, "%s%sbattle_%d.bmp", dir ? dir : "", dir ? "/" : "", (int)g_battle_frames);
             save_bmp_vk(path, vt);
-            printf("nvn_vk: picture of battle frame %d saved at frame %lld: %s\n", (int)g_battle_frames, (long long)frame, path);
+            { int hfr_shot_phase(void); printf("nvn_vk: picture of battle frame %d saved at frame %lld: %s (hfr phase %d)\n", (int)g_battle_frames, (long long)frame, path, hfr_shot_phase()); }
             if (--bcount <= 0) bshot = -1;
         }
     }
