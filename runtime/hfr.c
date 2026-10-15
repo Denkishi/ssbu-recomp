@@ -102,6 +102,12 @@ static void slow_step_hook(Ctx *c, void *user) {
         memcpy((void *)(uintptr_t)rb, keep, sizeof keep);
         g_added++;
         uint64_t h = rd64(TIMER_HOLDER), t = h ? rd64(h) : 0;
+        {   /* TEST ONLY, SSBU_HFR_LOG=1: the slow state and the match timer every 600 added updates */
+            static int log = -1;
+            if (log < 0) log = getenv("SSBU_HFR_LOG") && atoi(getenv("SSBU_HFR_LOG")) != 0;
+            if (log && g_added % 600 == 1) printf("hfr-log: added %lld: N %u phase %u asked %u, rate %u, timer holder %llx -> %llx frames %d, catch-up %u\n", (long long)g_added,
+                                                  rd8(SLOW + 4), rd8(SLOW + 6), rd8(SLOW + 5), rd32(UPDATE_RATE), (unsigned long long)h, (unsigned long long)t, t ? (int)rd32(t + 0x3d4) : -1, rd32(CATCH_UP));
+        }
         if (t && !rd32(CATCH_UP) && (int32_t)rd32(t + 0x3d4) >= 0) { wr32(t + 0x3d4, rd32(t + 0x3d4) + 1); g_timer++; }
     }
 }
