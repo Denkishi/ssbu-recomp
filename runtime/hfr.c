@@ -65,6 +65,8 @@ static volatile LONG g_doubled_now;                    /* the current cycle runs
 static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added, g_timer;
 
 int hfr_setting(void) { return g_setting == 120 ? 120 : 60; }
+/* TEST ONLY (SSBU_SHOT_BATTLE lines): the update within the slow cycle as the render thread sees it, -1 at 60 Hz. */
+int hfr_shot_phase(void) { return g_setting == 120 ? (int)rd8(SLOW + 6) : -1; }
 static int battle_running(LONG64 now) { return g_step_qpc && now - g_step_qpc < g_qpf / 4; }
 /* Refreshes per second of the clock now: 120 in a battle with frame_rate = 120, else 60. Any thread. */
 int hfr_rate(void) {
