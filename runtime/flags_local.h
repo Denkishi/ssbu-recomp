@@ -22,6 +22,12 @@ static inline uint32_t adds32f(FlagsL *f, uint32_t a, uint32_t b, uint32_t cin) 
 static inline uint64_t logic64f(FlagsL *f, uint64_t r) { f->N = (uint32_t)(r >> 63); f->Z = r == 0; f->C = 0; f->V = 0; return r; }
 static inline uint32_t logic32f(FlagsL *f, uint32_t r) { f->N = r >> 31; f->Z = r == 0; f->C = 0; f->V = 0; return r; }
 static inline void set_nzcvf(FlagsL *f, int v) { f->N = (v >> 3) & 1; f->Z = (v >> 2) & 1; f->C = (v >> 1) & 1; f->V = v & 1; }
+static inline void fcmpf(FlagsL *f, double a, double b) {
+    if (a != a || b != b) set_nzcvf(f, 3);
+    else if (a == b) set_nzcvf(f, 6);
+    else if (a < b) set_nzcvf(f, 8);
+    else set_nzcvf(f, 2);
+}
 static inline int condf(const FlagsL *f, int cc) {
     int r;
     switch (cc >> 1) {
