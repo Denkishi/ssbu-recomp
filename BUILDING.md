@@ -123,7 +123,8 @@ shader preparation (on a normal run it works for about 15 minutes of play and wr
 Options are environment variables, set with `--env NAME=VALUE` (full list: comments at the top of the runtime sources):
 `SSBU_RENDERER=vk|gl`, `SSBU_SHOW=1` (show the window of a test exe), `SSBU_STRICT=1|report|path` (list the host
 functions that are not the real behaviour), `SSBU_TRACE`, `SSBU_PAD_BACKEND=xinput`, `SSBU_FIXED_SEED=<n>`.
-Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
+Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`. Add-on content (DLC): `config/addon_content.ini`,
+the list of your console's add-on contents ([docs/DLC.md](docs/DLC.md)); without it there is none, as before.
 
 ## Troubleshooting
 
