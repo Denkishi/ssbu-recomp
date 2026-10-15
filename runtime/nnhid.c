@@ -163,11 +163,13 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
         seq_begin(0);
     }
-    {   /* frame_rate = 120 (hfr.c): the game polls twice per step of game time; the sequence counts steps, so it moves on every
-         * other poll and a held key stays down for both: the same sequence drives the same game at 60 and at 120 */
+    {   /* frame_rate = 120 (hfr.c): in a battle the game polls twice per step of game time; the sequence counts steps, so it
+         * moves on every other poll and a held key stays down for both: the same sequence drives the same game at 60 and at
+         * 120. Not with SSBU_DETERMINISTIC, whose fight counting (fight_seq_ticks) already counts steps. */
         int hfr_rate(void);
-        static int odd;
-        if (hfr_rate() == 120 && (odd ^= 1)) return;
+        static int odd, det = -1;
+        if (det < 0) det = getenv("SSBU_DETERMINISTIC") && atoi(getenv("SSBU_DETERMINISTIC")) != 0;
+        if (!det && hfr_rate() == 120 && (odd ^= 1)) return;
     }
     g_seq_polls++;
     {   /* SSBU_SEQ_LOG=<n>: the draw count every n polls, to find the ranges for @draws */
