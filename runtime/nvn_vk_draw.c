@@ -272,7 +272,9 @@ static void cmd_begin(void) {
     garbage_collect();
 }
 /* Ends the command buffer being recorded and gives it to the queue. Returns its number (the last one when nothing was recorded). */
+static void acopy_flush(void);
 static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
+    acopy_flush();                                 /* the ring holds every range the recorded commands read */
     if (!R.recording) { if (!wait && !signal) return R.serial; cmd_begin(); }
     pass_end();
     Slot *s = &R.slot[R.cur];
@@ -293,10 +295,119 @@ static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSL
 /* ---------------------------------------------------------------- stream ring */
 #define RING_ALIGN 256
 static void cb_ring_wrap(void);
+/* Ring reuse (performance): the ring used to be drained at every wrap (cmd_wait_all: the render thread stood until the GPU
+ * had finished everything, once every ~27 frames in a fight, 1-3 ms each time). Now the ring is in RING_NCH chunks; for each,
+ * the generation (R.gen) of the last write into it and, once that generation has ended, the last submission that can name
+ * that data (gen_bump: data of a generation is only named by commands recorded in that generation, i.e. by the command buffer
+ * open when it ends or by earlier ones). The first write into a chunk in a new lap waits only for that submission (normally
+ * finished long ago). A chunk that still holds a dispatch's mask word not yet read (g_cdisp), or data of the current
+ * generation, takes the old way (drain + cb_ring_wrap). SSBU_VK_RINGWAIT=1: the old drain at every wrap. */
+#define RING_NCH 16
+typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
+static CDisp g_cdisp[2048];
+static int g_ncdisp;
+static uint32_t g_rch_gen[RING_NCH];
+static uint64_t g_rch_end[RING_NCH], g_rch_lap[RING_NCH], g_ring_lap;
+static LONG64 g_rch_waits, g_rch_wait_tk, g_rch_drains;
+static int g_ringwait = -1;
+static void gen_bump(void) {
+    uint64_t last = R.serial + (R.recording ? 1u : 0u);
+    for (int c = 0; c < RING_NCH; c++) if (g_rch_gen[c] == R.gen) g_rch_end[c] = last;
+    R.gen++;
+}
+/* Copies into the ring on helper threads (performance). Measured in a fight: 9-10 MB per frame of vertex, index and
+ * uniform data copied from guest memory into the ring, about 30 % of the render thread's time (memcpy). A range taken from
+ * guest memory (ring_put) of at least ACOPY_MIN bytes now only gets its place in the ring on the render thread; the bytes
+ * are copied by SSBU_VK_COPY_THREADS helper threads (default 2; 0 = on the render thread, as before). The render thread
+ * helps and waits for every queued copy (acopy_flush) before a command buffer goes to the queue and before it writes guest
+ * memory itself (copy-back of compute results, buffer updates and copies in the command stream, texel reads into guest
+ * memory): what the GPU reads is guest memory as it was between the game's submit and those writes, as before. */
+#define ACOPY_MIN 4096
+#define ACOPY_N 8192
+static struct { uint8_t *dst; const uint8_t *src; size_t n; } g_acq[ACOPY_N];
+static volatile LONG64 g_acq_n, g_acq_take, g_acq_done;      /* queued, claimed, finished (only ever grow) */
+static SRWLOCK g_acq_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_acq_cv = CONDITION_VARIABLE_INIT;
+static int g_acq_threads = -1;
+static LONG64 g_acq_jobs, g_acq_bytes, g_acq_wait_tk;
+static int acopy_one(void) {                       /* claims and does one queued copy; 0 when none is left */
+    for (;;) {
+        LONG64 t = g_acq_take;
+        if (t >= g_acq_n) return 0;
+        if (InterlockedCompareExchange64(&g_acq_take, t + 1, t) != t) continue;
+        memcpy(g_acq[t % ACOPY_N].dst, g_acq[t % ACOPY_N].src, g_acq[t % ACOPY_N].n);
+        InterlockedIncrement64(&g_acq_done);
+        return 1;
+    }
+}
+static DWORD WINAPI acopy_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        if (acopy_one()) continue;
+        AcquireSRWLockExclusive(&g_acq_lock);
+        while (g_acq_take >= g_acq_n) SleepConditionVariableSRW(&g_acq_cv, &g_acq_lock, INFINITE, 0);
+        ReleaseSRWLockExclusive(&g_acq_lock);
+    }
+}
+static void acopy_flush(void) {                    /* render thread: every queued copy has been done when this returns */
+    if (g_acq_done == g_acq_n) return;
+    LONG64 t0 = tk();
+    while (acopy_one()) {}
+    while (g_acq_done < g_acq_n) YieldProcessor();
+    g_acq_wait_tk += tk() - t0;
+}
+static void acopy(uint8_t *dst, const uint8_t *src, size_t n) {
+    if (g_acq_threads < 0) {
+        const char *e = getenv("SSBU_VK_COPY_THREADS");
+        g_acq_threads = e && e[0] ? atoi(e) : 2;
+        if (g_acq_threads > 8) g_acq_threads = 8;
+        for (int i = 0; i < g_acq_threads; i++) { HANDLE h = CreateThread(NULL, 0, acopy_main, NULL, 0, NULL); if (h) { SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL); CloseHandle(h); } }
+        printf("nvn_vk: ring copies of %d bytes and more on %d helper thread(s) (SSBU_VK_COPY_THREADS)\n", ACOPY_MIN, g_acq_threads);
+    }
+    if (g_acq_threads <= 0 || n < ACOPY_MIN) { memcpy(dst, src, n); return; }
+    if (g_acq_n - g_acq_done >= ACOPY_N) acopy_flush();
+    LONG64 i = g_acq_n;
+    g_acq[i % ACOPY_N].dst = dst; g_acq[i % ACOPY_N].src = src; g_acq[i % ACOPY_N].n = n;
+    AcquireSRWLockExclusive(&g_acq_lock);
+    InterlockedExchange64(&g_acq_n, i + 1);
+    ReleaseSRWLockExclusive(&g_acq_lock);
+    WakeConditionVariable(&g_acq_cv);
+    g_acq_jobs++; g_acq_bytes += (LONG64)n;
+}
+static LONG64 g_sb[9], g_sb_stale, g_genb[6];       /* "nvn_vk_stream:" line every 300 frames: bytes into the ring by kind (c2, code, ubo, ssbo, vbuf, ibuf, compute, texture), ranges copied again although the same range was copied in an earlier generation, generation changes by reason */
+static int g_scat = 7;
 static uint64_t ring_raw(const void *p, uint64_t n) {
+    g_sb[g_scat] += (LONG64)n; g_scat = 7;
     R.ring_pos = (R.ring_pos + RING_ALIGN - 1) & ~(uint64_t)(RING_ALIGN - 1);
     if (n > R.ring_size / 4) vkd_fail("a range of %llu bytes does not fit the stream ring (%llu MB)", (unsigned long long)n, (unsigned long long)(R.ring_size >> 20));
-    if (R.ring_pos + n > R.ring_size) { cmd_wait_all(); cb_ring_wrap(); R.ring_pos = 0; R.gen++; R.ring_wraps++; }     /* everything that reads the ring has finished */
+    if (g_ringwait < 0) { const char *e = getenv("SSBU_VK_RINGWAIT"); g_ringwait = e && atoi(e) != 0; }
+    if (R.ring_pos + n > R.ring_size) {
+        g_genb[0]++;
+        if (g_ringwait) { cmd_wait_all(); cb_ring_wrap(); }      /* everything that reads the ring has finished */
+        R.ring_pos = 0; gen_bump(); R.ring_wraps++; g_ring_lap++;
+    }
+    if (!g_ringwait) {
+        uint64_t ch = R.ring_size / RING_NCH;
+        for (uint64_t c = R.ring_pos / ch; c <= (R.ring_pos + (n ? n : 1) - 1) / ch && c < RING_NCH; c++) {
+            if (g_rch_lap[c] != g_ring_lap) {          /* first write into this chunk in this lap: what named its old data must have run */
+                int drain = g_rch_gen[c] == R.gen;
+                for (int i = 0; i < g_ncdisp && !drain; i++) if (g_cdisp[i].wm_off / ch == c) drain = 1;
+                if (drain) { cmd_wait_all(); cb_ring_wrap(); g_rch_drains++; }
+                else {
+                    uint64_t need = g_rch_end[c];
+                    if (need > R.serial) cmd_submit(NULL, NULL);
+                    if (R.done < need) {
+                        LONG64 t0 = tk();
+                        for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= need) slot_wait(&R.slot[i]);
+                        if (R.done < need) R.done = need;
+                        g_rch_waits++; g_rch_wait_tk += tk() - t0;
+                    }
+                }
+                g_rch_lap[c] = g_ring_lap;
+            }
+            g_rch_gen[c] = R.gen;
+        }
+    }
     uint64_t off = R.ring_pos;
     if (p) memcpy((uint8_t *)R.ring_mem.map + off, p, (size_t)n);
     R.ring_pos += n;
@@ -307,9 +418,10 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
         if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) return R.acache[i].off;
-        if (R.acache[i].gen != R.gen) { h = i; break; }
+        if (R.acache[i].gen != R.gen) { if (R.acache[i].addr == addr && R.acache[i].size == size) g_sb_stale += (LONG64)size; h = i; break; }
     }
-    uint64_t off = ring_raw(P(addr), size);
+    uint64_t off = ring_raw(NULL, size);
+    acopy((uint8_t *)R.ring_mem.map + off, P(addr), (size_t)size);
     h &= 8191;
     R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen;
     return off;
@@ -1344,10 +1456,10 @@ static void set_dynamic_state3(int samples) {
  * in a CB forces the copy-back at once (cb_sync: submit, wait; counted). */
 typedef struct { uint64_t addr, size, cap, busy; VkBuffer buf; VMem mem; int state, dirty; uint8_t *snap; uint64_t snap_cap; } CB;     /* state: 0 free, 1 live in this batch, 2 pending (batch submitted); snap: guest memory as it was when the CB was filled */
 static int g_cb_merge = -1;                        /* SSBU_VK_CBMERGE=0: the whole range is copied back as before session 5 */
-typedef struct { uint64_t wm_off; uint32_t written; int16_t cb[16]; } CDisp;
 static CB g_cb[256];
-static CDisp g_cdisp[2048];
-static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
+static int g_cb_live, g_cb_pending, g_cb_cached = -1;
+static int16_t g_cb_live_idx[256];                 /* the CBs with state 1, in index order (cb_inside / cb_overlap walk only these) */
+static int g_cb_nlive;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 static void cb_masks(void) {                       /* every recorded dispatch has run: which buffers did each one write? */
     for (int i = 0; i < g_ncdisp; i++) {
@@ -1363,6 +1475,7 @@ static uint32_t g_cb_epoch;
  * that buffer is not given out again before that submission has finished. */
 static void cb_land(int midbatch) {                /* the GPU has finished everything that wrote a CB */
     LONG64 t0 = tk();
+    acopy_flush();                                 /* guest memory is written below: queued copies from it first */
     cb_masks();
     for (int i = 0; i < 256; i++) {
         CB *c = &g_cb[i];
@@ -1389,11 +1502,11 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
         c->state = c->dirty = 0;
         c->busy = midbatch ? R.serial + 1 : 0;
     }
-    g_cb_live = g_cb_pending = 0;
+    g_cb_live = g_cb_pending = 0; g_cb_nlive = 0;
     nvn_front_ccmp_landed();                       /* SSBU_COMPUTE_CMP: what the dispatches wrote is in guest memory now */
     g_cb_epoch++;
     g_tm[1] += tk() - t0;
-    R.gen++;                                       /* guest memory changed: ranges are streamed again */
+    gen_bump(); g_genb[1]++;                       /* guest memory changed: ranges are streamed again */
 }
 static void cb_ring_wrap(void) { if (g_cb_pending) cb_land(0); else cb_masks(); }      /* after cmd_wait_all: the mask words in the ring are about to be reused */
 static void cb_poll(void) {                        /* pending CBs whose submission has finished are copied back; never waits */
@@ -1418,15 +1531,15 @@ static void cb_sync(void) {                        /* guest memory must hold wha
 static void cb_batch_end(void) {
     if (!g_cb_live) return;
     g_cb_serial = cmd_submit(NULL, NULL);
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1) g_cb[i].state = 2;
-    g_cb_pending = g_cb_live; g_cb_live = 0;
+    for (int j = 0; j < g_cb_nlive; j++) g_cb[g_cb_live_idx[j]].state = 2;
+    g_cb_pending = g_cb_live; g_cb_live = 0; g_cb_nlive = 0;
 }
 static CB *cb_inside(uint64_t addr, uint64_t size) {
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr >= g_cb[i].addr && addr + size <= g_cb[i].addr + g_cb[i].size) return &g_cb[i];
+    for (int j = 0; j < g_cb_nlive; j++) { CB *c = &g_cb[g_cb_live_idx[j]]; if (addr >= c->addr && addr + size <= c->addr + c->size) return c; }
     return NULL;
 }
 static int cb_overlap(uint64_t addr, uint64_t size) {
-    for (int i = 0; i < 256; i++) if (g_cb[i].state == 1 && addr < g_cb[i].addr + g_cb[i].size && g_cb[i].addr < addr + size) return 1;
+    for (int j = 0; j < g_cb_nlive; j++) { CB *c = &g_cb[g_cb_live_idx[j]]; if (addr < c->addr + c->size && c->addr < addr + size) return 1; }
     return 0;
 }
 static CB *cb_new(uint64_t addr, uint64_t size) {
@@ -1461,6 +1574,9 @@ static CB *cb_new(uint64_t addr, uint64_t size) {
         R.cb_made++;
     }
     c->addr = addr; c->size = size; c->state = 1; c->dirty = 0;
+    {   int16_t ci = (int16_t)(c - g_cb); int j = g_cb_nlive++;
+        while (j > 0 && g_cb_live_idx[j - 1] > ci) { g_cb_live_idx[j] = g_cb_live_idx[j - 1]; j--; }
+        g_cb_live_idx[j] = ci; }
     if (g_cb_merge < 0) g_cb_merge = !(getenv("SSBU_VK_CBMERGE") && !atoi(getenv("SSBU_VK_CBMERGE")));
     if (g_cb_merge) {                              /* the snapshot the copy-back is compared with (cb_land) */
         if (c->snap_cap < size) { free(c->snap); c->snap_cap = (size + 4095) & ~(uint64_t)4095; c->snap = malloc((size_t)c->snap_cap); }
@@ -1478,10 +1594,11 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
     b->zero = 0; b->size = size;
     if (g_cb_live) {
         CB *c = cb_inside(addr, size);
-        if (c && (addr - c->addr) % align == 0) { b->buf = c->buf; b->off = addr - c->addr; return 1; }
+        if (c && (addr - c->addr) % align == 0) { b->buf = c->buf; b->off = addr - c->addr; g_scat = 7; return 1; }
         if (cb_overlap(addr, size)) cb_sync();
     }
     b->off = ring_put(addr, size); b->buf = R.ring;      /* in this order: a ring wrap submits */
+    g_scat = 7;
     return 0;
 }
 static void compute_pipe_make(VStage *v);
@@ -1553,9 +1670,9 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = ring_raw(R.c2[5], sizeof R.c2[5]); b->size = sizeof R.c2[5]; }
+            if (n == 2) { g_scat = 6; b->off = ring_raw(R.c2[5], sizeof R.c2[5]); b->size = sizeof R.c2[5]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code + st->ctl[4]), b->size); }
-            else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b);
+            else if (n >= 3 && R.ubo[5][n - 3].addr && R.ubo[5][n - 3].size) { g_scat = 6; buf_ref(R.ubo[5][n - 3].addr, R.ubo[5][n - 3].size, al, b); }
             else b->zero = 1;                      /* c0 outside the storage descriptors, or nothing bound: zeros (OpenGL: nothing bound) */
         }
         for (unsigned k = 0; k < 16; k++) {
@@ -1564,7 +1681,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
             Range r = R.ssbo[5][k];
             b->zero = !(r.addr && r.size); b->buf = R.ring;
             if (b->zero) continue;
-            if (!(v->ssbo_w >> k & 1)) { buf_ref(r.addr, r.size, al, b); continue; }
+            if (!(v->ssbo_w >> k & 1)) { g_scat = 6; buf_ref(r.addr, r.size, al, b); continue; }
             CB *c = g_cb_live ? cb_inside(r.addr, r.size) : NULL;
             if (c && (r.addr - c->addr) % al) c = NULL;
             if (!c) { if (g_cb_live && cb_overlap(r.addr, r.size)) cb_sync(); c = cb_new(r.addr, r.size); }
@@ -1654,16 +1771,16 @@ static int draw_prepare(unsigned prim) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = ring_raw(R.c2[s], sizeof R.c2[s]); b->size = sizeof R.c2[s]; }
-            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
-            else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
+            if (n == 2) { g_scat = 0; b->off = ring_raw(R.c2[s], sizeof R.c2[s]); b->size = sizeof R.c2[s]; }
+            else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; g_scat = 1; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
+            else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) { g_scat = 2; buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b); }
             else b->zero = 1;
         }
         for (unsigned k = 0; k < 16; k++) {
             if (!(v->ssbos >> k & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = !(R.ssbo[s][k].addr && R.ssbo[s][k].size); b->buf = R.ring;
-            if (!b->zero) buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b);
+            if (!b->zero) { g_scat = 3; buf_ref(R.ssbo[s][k].addr, R.ssbo[s][k].size, sal, b); }
         }
     }
     /* vertex streams: only the ones an attribute names (a stale binding of another mesh is not read, and is not copied) */
@@ -1676,7 +1793,7 @@ static int draw_prepare(unsigned prim) {
         BufRef b;
         voff[i] = ~0ull; vbufs[i] = R.ring;
         if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
-        from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b);
+        g_scat = 4; from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b);
         voff[i] = b.off; vbufs[i] = b.buf;
     }
     R.cb_draws += from_cb;
@@ -2128,9 +2245,9 @@ static void exec(const Cmd *m, int depth) {
     case OP_IMAGESTRIDE: R.image_stride = (int64_t)a[0]; break;
     case OP_BARRIER: if (a[0] & 0x10) nvn_front_barrier_texmem(); break;      /* ordering bits: every draw is recorded in order; feedback is handled at the draw */
     case OP_DISPATCH: { LONG64 t0 = tk(); compute_dispatch((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); g_tm[2] += tk() - t0; break; }
-    case OP_COPY_BUF_BUF: cb_sync(); if (a[0] && a[1]) memmove(P(a[1]), P(a[0]), (size_t)a[2]); R.gen++; break;      /* guest memory is read / written: what compute wrote must be there (as OpenGL's compute_flush) */
-    case OP_UPDATE_UBO: cb_sync(); if (a[0]) memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); R.gen++; break;
-    case OP_CLEAR_BUF: cb_sync(); if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); } R.gen++; break;
+    case OP_COPY_BUF_BUF: cb_sync(); acopy_flush(); if (a[0] && a[1]) memmove(P(a[1]), P(a[0]), (size_t)a[2]); gen_bump(); g_genb[2]++; break;      /* guest memory is read / written: what compute wrote must be there (as OpenGL's compute_flush) */
+    case OP_UPDATE_UBO: cb_sync(); acopy_flush(); if (a[0]) memcpy((uint8_t *)P(a[0]) + a[2], blob, (size_t)a[3]); gen_bump(); g_genb[3]++; break;
+    case OP_CLEAR_BUF: cb_sync(); acopy_flush(); if (a[0]) { uint32_t v = (uint32_t)a[2]; for (uint64_t i = 0; i + 4 <= a[1]; i += 4) memcpy((uint8_t *)P(a[0]) + i, &v, 4); } gen_bump(); g_genb[4]++; break;
     case OP_CLEARCOLOR: {
         unsigned i = (unsigned)a[0] & 7, mask = (unsigned)a[2] & 15;
         if (!R.have_targets || R.render_off || (int)i >= R.ncol || !R.col[i].tex) break;
@@ -2190,7 +2307,7 @@ static void exec(const Cmd *m, int depth) {
         if (count <= 0 || !a[3]) { R.frame_skipped++; nvn_front_count(1, 1); break; }
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
         BufRef ib;
-        buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
+        g_scat = 5; buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
@@ -2204,9 +2321,9 @@ static void exec(const Cmd *m, int depth) {
         int r[6];
         if (!t || t->dead || !a[3]) break;
         memcpy(&v, blob, sizeof v); memcpy(r, blob + 24, 24);
-        cb_sync();
+        cb_sync(); acopy_flush();
         read_region(t, &v, r, P(a[3]), R.row_stride, R.image_stride);
-        R.gen++;                                   /* guest memory changed: ranges are streamed again */
+        gen_bump(); g_genb[5]++;                   /* guest memory changed: ranges are streamed again */
         break;
     }
     case OP_COPY_TEX_TEX: {
@@ -2285,10 +2402,11 @@ static void vk_submit(void *arg) {
     cb_sync();                                     /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
     LONG64 t1 = tk();
     nvn_front_batch_begin();
-    R.gen++;                                       /* guest memory may have changed since the last batch */
+    gen_bump();                                    /* guest memory may have changed since the last batch */
     if (g_scan_on) { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }      /* session 4: what this batch will need goes to the workers before it is replayed */
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     cb_batch_end();
+    acopy_flush();                                 /* nothing queued outlives the batch (later jobs may write guest memory) */
     g_tm[7] += t1 - t0; g_tm[3] += tk() - t1;
     nvn_front_count(3, 1);
 }
@@ -2592,6 +2710,11 @@ swap: ;
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+        {   static LONG64 sl[9], stl, gl[6], cbl;
+            printf("nvn_vk_stream: frames %lld..%lld KB/frame: c2 %.0f code %.0f ubo %.0f ssbo %.0f vbuf %.0f ibuf %.0f compute %.0f texture %.0f | stale-gen misses %.0f KB | gen bumps/frame: wrap %.2f cb_land %.2f copybuf %.2f update_ubo %.2f clearbuf %.2f copytexbuf %.2f | cb copy-back KB/frame %.0f | ring: chunk waits %lld (%.1f ms), drains %lld | helper copies %lld (%.0f MB), render thread waited %.1f ms\n",
+                   (long long)frame - 300, (long long)frame, (g_sb[0] - sl[0]) / 307200.0, (g_sb[1] - sl[1]) / 307200.0, (g_sb[2] - sl[2]) / 307200.0, (g_sb[3] - sl[3]) / 307200.0, (g_sb[4] - sl[4]) / 307200.0, (g_sb[5] - sl[5]) / 307200.0, (g_sb[6] - sl[6]) / 307200.0, (g_sb[7] - sl[7]) / 307200.0,
+                   (g_sb_stale - stl) / 307200.0, (g_genb[0] - gl[0]) / 300.0, (g_genb[1] - gl[1]) / 300.0, (g_genb[2] - gl[2]) / 300.0, (g_genb[3] - gl[3]) / 300.0, (g_genb[4] - gl[4]) / 300.0, (g_genb[5] - gl[5]) / 300.0, (R.cb_bytes - cbl) / 307200.0, (long long)g_rch_waits, (double)g_rch_wait_tk * 1000.0 / (double)fq.QuadPart, (long long)g_rch_drains, (long long)g_acq_jobs, (double)g_acq_bytes / 1048576.0, (double)g_acq_wait_tk * 1000.0 / (double)fq.QuadPart);
+            memcpy(sl, g_sb, sizeof sl); stl = g_sb_stale; memcpy(gl, g_genb, sizeof gl); cbl = R.cb_bytes; }
         if (frame % 3000 == 0) m4_report();
         memcpy(last, g_tm, sizeof last); last_sets = R.sets; last_flush = R.flushes; last_reused = R.sets_reused; last_disp = R.dispatches;
     }
