@@ -51,13 +51,14 @@
 /* The match timer [SEEN]: *(*0x710532e7a0) + 0x3d4 = the remaining frames, decremented by 1 per update in the battle scene's
  * state 0x7103303d60, which skips the decrement on the game's catch-up updates (0x710593a44c != 0) and frees the timer
  * when the count goes below 0 (0x710532e7a0 = 0). It does not read the update rate. An added update gives its frame back. */
-#define TIMER_HOLDER 0x710532e7a0ULL
+#define FN_TIMER_INIT 0x710157c8f0ULL                   /* the battle rule component's vtable 0x710506fbf0 slot 0x120: remaining frames (+0x3d4) from the rule's time */
 #define CATCH_UP 0x710593a44cULL
 #define RNG_ROOT 0x71052c25b0ULL                      /* -> -> -> the 9 script random generators of app::sv_math::rand, 20 bytes each (fighter_sdk\fighter_host.c) */
 int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportFn *orig);      /* fighter_sdk\hook_host.c (in nnro.c) */
 
 static int g_setting;                                  /* 60 or 120 once hfr_init has run */
-static ImportFn g_orig_step, g_orig_max;
+static ImportFn g_orig_step, g_orig_max, g_orig_timer_init;
+static volatile uint64_t g_timer_comp;                  /* the rule component, from its init */
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
 static volatile LONG g_doubled_now;                    /* the current cycle runs with the doubled divisor */
 static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added, g_timer;
@@ -95,13 +96,19 @@ static void slow_step_hook(Ctx *c, void *user) {
     int added = n > 1 && next < n && (next & 1) && rb;
     uint8_t keep[180];
     if (added) memcpy(keep, (void *)(uintptr_t)rb, sizeof keep);
+    uint64_t tc = g_timer_comp;
+    int before = tc ? (int)rd32(tc + 0x3d4) : -1;
     g_orig_step(c);
+    {   static int log = -1, shown;
+        if (log < 0) log = getenv("SSBU_HFR_LOG") && atoi(getenv("SSBU_HFR_LOG")) != 0;
+        if (log && tc && shown < 40 && g_steps > 600) { shown++; printf("hfr-log: update %lld phase-next %u added %d: timer %d -> %d (catch-up %u)\n", (long long)g_steps, next, added, before, (int)rd32(tc + 0x3d4), rd32(CATCH_UP)); }
+    }
     InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
     if (g_doubled_now) wr32(UPDATE_RATE, HFR_RATE);   /* the battle's managers: 60 / rate frames per update (set-up writes 60 here again) */
     if (added) {
         memcpy((void *)(uintptr_t)rb, keep, sizeof keep);
         g_added++;
-        uint64_t h = rd64(TIMER_HOLDER), t = h ? rd64(h) : 0;
+        uint64_t h = 0, t = g_timer_comp;
         {   /* TEST ONLY, SSBU_HFR_LOG=1: the slow state and the match timer every 600 added updates */
             static int log = -1;
             if (log < 0) log = getenv("SSBU_HFR_LOG") && atoi(getenv("SSBU_HFR_LOG")) != 0;
@@ -123,6 +130,8 @@ static void slow_max_hook(Ctx *c, void *user) {
     g_doubled++;
 }
 
+static void timer_init_hook(Ctx *c, void *user) { (void)user; g_timer_comp = c->x[0]; g_orig_timer_init(c); }
+
 /* boot.c, after the static constructors, before nnMain. */
 void hfr_init(void) {
     LARGE_INTEGER f;
@@ -132,6 +141,7 @@ void hfr_init(void) {
     if (gfx_options()->frame_rate != 120) return;
     int a = hook_install(FN_SLOW_STEP, slow_step_hook, NULL, &g_orig_step), b = a ? hook_install(FN_SLOW_MAX, slow_max_hook, NULL, &g_orig_max) : 0;
     if (!a || !b) { printf("hfr: frame_rate = 120 asked for, but a hook failed (step %d, request maximum %d): 60 is used\n", a, b); return; }
+    hook_install(FN_TIMER_INIT, timer_init_hook, NULL, &g_orig_timer_init);
     g_setting = 120;
     printf("hfr: frame_rate = 120: battles at 120 Hz (the engine's slow-motion divisor doubled, logic 60 steps per second), menus at 60 Hz\n");
 }
