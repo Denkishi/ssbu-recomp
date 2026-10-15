@@ -1,4 +1,4 @@
-/* Host display: a real window, 60 Hz pacing and the guest's vsync event.
+/* Host display: a real window, 60 Hz pacing (120 Hz in battles with frame_rate = 120, hfr.c) and the guest's vsync event.
  * The window's contents are drawn by nvn_gl.c, whose render thread owns the OpenGL context. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +17,7 @@
 
 void os_init_event(uint64_t key, int autoclear);      /* os_threads.c */
 void os_signal_event(uint64_t key);
+int hfr_rate(void);                                   /* hfr.c: 60, or 120 during a battle with frame_rate = 120: refreshes per second of the clock below */
 
 static HWND g_hwnd;
 static volatile LONG g_ready;
@@ -126,18 +127,21 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     return 0;
 }
 
-/* Signals the guest's vsync event 60 times per second. */
+/* Signals the guest's vsync event 60 times per second (hfr_rate(): 120 during a battle in the 120 Hz mode). */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
     (void)arg;
+    LONGLONG hz = hfr_rate();
     LARGE_INTEGER next;
     QueryPerformanceCounter(&next);
     if (!old_pacing()) {
         LARGE_INTEGER t0 = next, now;
-        LONG64 n = 0;
+        LONG64 n = 0, n0 = 0;                  /* refresh n0 happened at t0; the clock's rate changes there (hfr.c) */
         HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         for (;;) {
-            LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
+            LONGLONG want = hfr_rate();
+            if (want != hz) { t0.QuadPart += (n - n0) * g_freq.QuadPart / hz; n0 = n; hz = want; }      /* re-anchor at the last refresh */
+            LONGLONG target = t0.QuadPart + (n - n0 + 1) * g_freq.QuadPart / hz;       /* no accumulated rounding */
             QueryPerformanceCounter(&now);
             LONGLONG left = target - now.QuadPart;
             if (left > 0) {
@@ -146,7 +150,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep((DWORD)(left * 1000 / g_freq.QuadPart)); }
                 for (QueryPerformanceCounter(&now); now.QuadPart < target; QueryPerformanceCounter(&now)) YieldProcessor();
             }
-            LONG64 passed = (now.QuadPart - t0.QuadPart) * 60 / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
+            LONG64 passed = n0 + (now.QuadPart - t0.QuadPart) * hz / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
@@ -159,7 +163,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         }
     }
     for (;;) {
-        next.QuadPart += g_freq.QuadPart / 60;
+        next.QuadPart += g_freq.QuadPart / hfr_rate();
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         LONGLONG ms = (next.QuadPart - now.QuadPart) * 1000 / g_freq.QuadPart;
@@ -226,7 +230,7 @@ static void clock_stat(LONG64 n, LARGE_INTEGER now) {
     if (!g_clockstat || n % 600) return;
     LONG64 sig = g_vsync_signals, late = g_vsync_late;
     if (t_last.QuadPart) printf("clock: frames %lld-%lld real %.3f s, vsync signals %lld (%.2f Hz), game steps %lld = %.2f s of match time, refreshes counted between presents 0:%lld 1:%lld 2:%lld 3+:%lld, slept through by the vsync thread %lld%c", (long long)(n - 600), (long long)n,
-        (double)(now.QuadPart - t_last.QuadPart) / (double)g_freq.QuadPart, (long long)(sig - sig_last), (double)(sig - sig_last) * (double)g_freq.QuadPart / (double)(now.QuadPart - t_last.QuadPart), (long long)(g_cs_steps - steps_last), (double)(g_cs_steps - steps_last) / 60.0,
+        (double)(now.QuadPart - t_last.QuadPart) / (double)g_freq.QuadPart, (long long)(sig - sig_last), (double)(sig - sig_last) * (double)g_freq.QuadPart / (double)(now.QuadPart - t_last.QuadPart), (long long)(g_cs_steps - steps_last), (double)(g_cs_steps - steps_last) / (double)hfr_rate(),
         (long long)(g_cs_hist[0] - h_last[0]), (long long)(g_cs_hist[1] - h_last[1]), (long long)(g_cs_hist[2] - h_last[2]), (long long)(g_cs_hist[3] - h_last[3]), (long long)(late - late_last), 10);
     t_last = now; sig_last = sig; late_last = late; steps_last = g_cs_steps; memcpy(h_last, g_cs_hist, sizeof h_last);
 }
@@ -276,7 +280,7 @@ int display_wait_refresh(void) {
         QueryPerformanceCounter(&a);
         while (g_vsync_n < g_latch) {
             if (g_speed > 0) {
-                LONGLONG step = (LONGLONG)((double)g_freq.QuadPart / (60.0 * g_speed));
+                LONGLONG step = (LONGLONG)((double)g_freq.QuadPart / ((double)hfr_rate() * g_speed));
                 if (!due) due = a.QuadPart;
                 due += step;
                 QueryPerformanceCounter(&now);
@@ -332,12 +336,12 @@ void display_pace(void) {
     LONG64 n = InterlockedIncrement64(&g_frames);
     second_frames++;
     clock_stat(n, now);
-    next.QuadPart += g_freq.QuadPart * g_interval / 60;
+    next.QuadPart += g_freq.QuadPart * g_interval / hfr_rate();
     /* P3: wait until `next` exactly. Sleep(ms) cut the wait to whole milliseconds and, at the default 15.6 ms timer period,
      * could overshoot by a frame; a frame that came late was then followed by frames shown early (up to 100 ms of debt).
      * Now: a high-resolution waitable timer up to 0.5 ms before the deadline, then a spin; a late frame may be made up for
      * by at most one refresh interval, as a display that missed a refresh shows the next frame at the next one. */
-    LONGLONG left = next.QuadPart - now.QuadPart, frame_ticks = g_freq.QuadPart * (g_interval ? g_interval : 1) / 60;
+    LONGLONG left = next.QuadPart - now.QuadPart, frame_ticks = g_freq.QuadPart * (g_interval ? g_interval : 1) / hfr_rate();
     if (!g_interval) next = now;
     else if (left > 0) {
         static HANDLE timer;
@@ -365,6 +369,7 @@ void display_pace(void) {
 void display_report(FILE *out) {
     fprintf(out, "\ndisplay: %lld frames presented\n", (long long)g_frames);
     fprintf(out, "display: %s; %lld vsync signals, %lld refreshes slept through by the vsync thread\n", old_pacing() ? "old pacing (SSBU_OLD_PACING=1: two clocks)" : "one refresh clock", (long long)g_vsync_signals, (long long)g_vsync_late);
+    { void hfr_report(FILE *out); hfr_report(out); }
     nvn_gl_report(out);
 }
 

@@ -73,7 +73,14 @@ static const char *const k_default_ini =
 "; frame_time_overlay = off | on\r\n"
 ";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\r\n"
 ";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\r\n"
-"frame_time_overlay = off\r\n";
+"frame_time_overlay = off\r\n"
+"\r\n"
+"; frame_rate = 60 | 120\r\n"
+";   60: the console's. 120: battles at 120 frames per second, every second one the engine's own picture between two\r\n"
+";   of its 60 steps (the sub-frame drawing of its slow motion, as at training mode's 1/2 speed); the game logic keeps\r\n"
+";   its 60 steps per second. Menus stay at 60. Needs a display of 120 Hz or more to be seen, and a CPU that draws a\r\n"
+";   fight in under 8.3 ms per frame (else the game shows what it can and keeps its speed). Details: runtime\\hfr.c.\r\n"
+"frame_rate = 60\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -109,7 +116,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->frame_rate = 60;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -138,18 +145,20 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
         else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
+        else if (!_stricmp(key, "frame_rate")) o->frame_rate = atoi(val) == 120 ? 120 : 60;
         else unknown++;
     }
     if (f) fclose(f);
+    { const char *e = getenv("SSBU_FRAME_RATE"); if (e && e[0]) o->frame_rate = atoi(e) == 120 ? 120 : 60; }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
     }
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[3] = {"windowed", "borderless", "fullscreen"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s%s\n", o->path,
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s frame_rate=%d%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
-           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
+           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->frame_rate, unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
