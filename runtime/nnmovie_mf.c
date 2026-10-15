@@ -110,11 +110,13 @@ static uint64_t g_alloc_fn, g_free_fn, g_alloc_user;  /* movie::SetAllocator */
 static volatile LONG g_mf_started;
 static __declspec(thread) int t_com_init;
 
+static void vorbis_store_register(void);
 static void com_init(void) {
     if (!t_com_init) { CoInitializeEx(NULL, COINIT_MULTITHREADED); t_com_init = 1; }
     if (!g_mf_started && InterlockedCompareExchange(&g_mf_started, 1, 0) == 0) {
         HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
         printf("movie: MFStartup %08lx\n", hr);
+        vorbis_store_register();
     }
 }
 
@@ -357,6 +359,50 @@ typedef struct {
 typedef struct { uint64_t magic; IMFSample *s; int64_t ts; uint64_t gen; } Token;   /* gen = Ext::gen when it was read */
 
 static const GUID GUID_Vorbis = {0x8D2FD10B, 0x5841, 0x4a6b, {0x89, 0x05, 0x58, 0x8F, 0xEC, 0x1A, 0xDE, 0xD9}};
+
+/* The Vorbis decoder of Web Media Extensions (FFmpegAudioDecoder) is, in some versions of the package (1.2.42 on Windows
+ * 10, 2026-10-14), registered to run out of process through an app service. Media Foundation then counts it as an
+ * UNTRUSTED Store decoder: MFTEnumEx lists it only with MFT_ENUM_FLAG_UNTRUSTED_STOREMFT, which the source reader never
+ * passes, so the reader has no path from Vorbis to PCM (c00d5212), the movie's audio track stays unselected, and the
+ * opening movie shows a black screen and never ends. When no trusted Vorbis decoder exists, a process-local registration
+ * (MFTRegisterLocal) of a class factory that activates the Store decoder makes it visible to the reader. Measured with a
+ * VP9 + 2 x Vorbis WebM: both audio tracks decode, the PCM matches ffmpeg's decode (mean absolute difference 0.1 per
+ * 16-bit sample). Not used: IMFSourceReaderEx::AddTransformForStream with this decoder (it crashed inside MFPlat). */
+static HRESULT STDMETHODCALLTYPE vf_QueryInterface(IClassFactory *This, REFIID riid, void **ppv) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IClassFactory)) { *ppv = This; return S_OK; }
+    *ppv = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE vf_AddRef(IClassFactory *This) { (void)This; return 2; }       /* a static object */
+static ULONG STDMETHODCALLTYPE vf_Release(IClassFactory *This) { (void)This; return 1; }
+static HRESULT STDMETHODCALLTYPE vf_CreateInstance(IClassFactory *This, IUnknown *outer, REFIID riid, void **ppv) {
+    (void)This;
+    if (outer) return CLASS_E_NOAGGREGATION;
+    MFT_REGISTER_TYPE_INFO in = {MFMediaType_Audio, GUID_Vorbis};
+    IMFActivate **acts = NULL; UINT32 n = 0;
+    HRESULT hr = MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_UNTRUSTED_STOREMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in, NULL, &acts, &n);
+    if (SUCCEEDED(hr)) hr = n ? IMFActivate_ActivateObject(acts[0], riid, ppv) : MF_E_TOPO_CODEC_NOT_FOUND;
+    for (UINT32 i = 0; i < n; i++) IMFActivate_Release(acts[i]);
+    CoTaskMemFree(acts);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE vf_LockServer(IClassFactory *This, BOOL lock) { (void)This; (void)lock; return S_OK; }
+static IClassFactoryVtbl vf_vtbl = {vf_QueryInterface, vf_AddRef, vf_Release, vf_CreateInstance, vf_LockServer};
+static IClassFactory vf_factory = {&vf_vtbl};
+static UINT32 vorbis_count(UINT32 flags) {
+    MFT_REGISTER_TYPE_INFO in = {MFMediaType_Audio, GUID_Vorbis};
+    IMFActivate **acts = NULL; UINT32 n = 0;
+    MFTEnumEx(MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER | flags, &in, NULL, &acts, &n);
+    for (UINT32 i = 0; i < n; i++) IMFActivate_Release(acts[i]);
+    CoTaskMemFree(acts);
+    return n;
+}
+static void vorbis_store_register(void) {
+    if (vorbis_count(MFT_ENUM_FLAG_LOCALMFT)) return;                 /* a trusted decoder: the reader finds it by itself */
+    if (!vorbis_count(MFT_ENUM_FLAG_UNTRUSTED_STOREMFT)) { printf("movie: no Vorbis decoder on this PC (Web Media Extensions): movies with Vorbis sound will not play\n"); return; }
+    MFT_REGISTER_TYPE_INFO in = {MFMediaType_Audio, GUID_Vorbis}, out = {MFMediaType_Audio, MFAudioFormat_Float};
+    HRESULT hr = MFTRegisterLocal(&vf_factory, &MFT_CATEGORY_AUDIO_DECODER, L"FFmpegAudioDecoder (Store, process-local)", 0, 1, &in, 1, &out);
+    printf("movie: the Vorbis decoder is an untrusted Store decoder on this PC; registered for this process: %08lx\n", hr);
+}
 static int is_mf_fourcc_guid(const GUID *g) {         /* {xxxxxxxx-0000-0010-8000-00AA00389B71} */
     static const unsigned char tail[8] = {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
     return g->Data2 == 0 && g->Data3 == 0x10 && memcmp(g->Data4, tail, 8) == 0;
