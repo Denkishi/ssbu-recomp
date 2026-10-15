@@ -1,7 +1,7 @@
 # Add-on content (DLC)
 
 The game asks the system which add-on contents are installed and unlocks what they stand for. The runtime answered
-"none". It now answers from `config/addon_content.ini`, a list you copy from your own console. Without the file
+"none". It now answers from `build/config/addon_content.ini`, a list you copy from your own console. Without the file
 nothing changes.
 
 ## What the game does (measured on 13.0.5; addresses for 13.0.4 from the function list)
@@ -48,11 +48,15 @@ Indices 21 and up are the other add-on contents (Mii fighter costumes and the li
 
 ## Using it
 
-`config/addon_content.ini` beside `controllers.ini` (`SSBU_AOC_CONFIG=<file>` names another file; with `SSBU_CONFIG`
-set, the one beside the file it names): one title id per line, as your console lists the game's add-on contents (a
-dumping tool on the console, nxdumptool for example, shows them with their ids). Text after a space is a note; `;` or
-`#` starts a comment. Index = title id - `01006A800016F000`. Lines that are not an add-on content id of this game are
-reported and ignored.
+**Where the file goes:** `addon_content.ini` in the `config` folder next to the exe's folder, where `controllers.ini`
+and `graphics.ini` are. For a build made with `setup.py` that is `build/config/addon_content.ini` (the exe is in
+`build/work`), not a `config` folder at the top of the repository. `SSBU_AOC_CONFIG=<file>` names another file; with
+`SSBU_CONFIG` set, the one beside the file it names.
+
+**What goes in it:** one title id per line, as your console lists the game's add-on contents (a dumping tool on the
+console, nxdumptool for example, shows them with their ids). Text after a space is a note, so a line like
+`01006A800016F002 = true` works too; `;` or `#` starts a comment. Index = title id - `01006A800016F000`. Lines that
+are not an add-on content id of this game (a `[section]` line, for example) are reported in the log and ignored.
 
 ```
 ; add-on contents installed on my console
@@ -60,7 +64,12 @@ reported and ignored.
 01006A800016F00A Pyra / Mythra
 ```
 
-The log says what was read: `nn::aoc: 2 add-on content(s) from ...: 2 10`, or `nn::aoc: no ...: no add-on content`.
+The log says what was read: `nn::aoc: 2 add-on content(s) from ...: 2 10`, or `nn::aoc: no ...: no add-on content`
+(with the path it looked for). A log with no `nn::aoc` line comes from an exe built without this change.
+
+**Adding this change to a build you already have:** running `setup.py` again as before does not rebuild the exe,
+because it skips the steps it finished (the new sources are copied, but `link` is skipped). Add `--redo link` to the
+command you built with: `python scripts/setup.py --dump <your dump> <the same tool options> --redo link`.
 
 List only what your own console has. The runtime cannot check it: like the game data itself, the list is yours to
 take from your console.
