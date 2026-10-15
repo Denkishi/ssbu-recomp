@@ -48,9 +48,11 @@ static const char *const k_default_ini =
 "console_mode = docked\r\n"
 "\r\n"
 "; resolution_scale = 1.0\r\n"
-";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's 1920x1080. 0.75 = 1440x810,\r\n"
+";   Internal resolution scale, 0.25 to 4.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's 1920x1080. 0.75 = 1440x810,\r\n"
 ";   0.5 = 960x540: the main switch for a weak GPU. The whole picture is drawn smaller, the 2D interface too (it gets\r\n"
-";   softer), and is scaled to the window size. Details and limits: plan\\phases\\O1_options.md.\r\n"
+";   softer), and is scaled to the window size. Above 1.0 it is drawn larger: 1.5 = 2880x1620, 2.0 = 3840x2160 (a 4K\r\n"
+";   screen pixel for pixel); more than twice the window is supersampling, reduced to the window in 2:1 steps (sharper\r\n"
+";   edges, less shimmer; GPU time and memory grow with the square). Details and limits: plan\\phases\\O1_options.md.\r\n"
 "resolution_scale = 1.0\r\n"
 "\r\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
@@ -160,7 +162,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->frame_rate, unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 4.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 4.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
     return TRUE;
 }
