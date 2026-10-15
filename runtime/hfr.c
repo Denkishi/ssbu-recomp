@@ -42,6 +42,7 @@ int hook_install(uint64_t addr, void (*repl)(Ctx *, void *), void *user, ImportF
 static int g_setting;                                  /* 60 or 120 once hfr_init has run */
 static ImportFn g_orig_step, g_orig_max;
 static volatile LONG64 g_step_qpc;                     /* QueryPerformanceCounter at the last battle step */
+static volatile LONG g_doubled_now;                    /* the current cycle runs with the doubled divisor */
 static LONG64 g_qpf, g_steps, g_battles, g_doubled, g_added;
 
 int hfr_setting(void) { return g_setting == 120 ? 120 : 60; }
@@ -51,7 +52,7 @@ int hfr_rate(void) {
     if (g_setting != 120) return 60;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return battle_running(now.QuadPart) ? 120 : 60;
+    return battle_running(now.QuadPart) && g_doubled_now ? 120 : 60;      /* 120 only once the cycles are doubled: before, every update is a console update */
 }
 
 static void slow_step_hook(Ctx *c, void *user) {
@@ -78,6 +79,7 @@ static void slow_step_hook(Ctx *c, void *user) {
     uint8_t keep[180];
     if (added) memcpy(keep, (void *)(uintptr_t)rb, sizeof keep);
     g_orig_step(c);
+    InterlockedExchange(&g_doubled_now, rd8(SLOW + 4) >= 2);
     if (added) { memcpy((void *)(uintptr_t)rb, keep, sizeof keep); g_added++; }
 }
 static void slow_max_hook(Ctx *c, void *user) {
