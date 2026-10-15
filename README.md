@@ -127,7 +127,8 @@ To run: Windows 10/11 x64, a GPU with a Vulkan 1.3 driver, your own dump of the 
 
 To build: Python 3.10+ (numpy, lz4, zstandard, Pillow, unicorn), LLVM/clang 9.0.0, MSVC Build Tools with a Windows SDK,
 SDL3 (VC development package), Khronos Vulkan-Headers, glslang (Windows release), a yuzu-family source checkout for the
-self-test reference data, and your dump. Exact versions, links and the one command: [BUILDING.md](BUILDING.md).
+self-test reference data, libopus as a DLL (for the music; without it the game runs silent), and your dump. Exact
+versions, links and the one command: [BUILDING.md](BUILDING.md).
 
 ## Repository layout
 

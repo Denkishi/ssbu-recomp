@@ -22,6 +22,8 @@ Nothing of the game is stored in the repository: every step below derives its fi
 Other commands:  --status (what is done)   --steps (list)   --only <step>   --run (print the command that starts the game)
 Environment variables named RECOMP_* / SSBU_* are removed from the children's environment; tool locations come from the
 options below, from LLVM_ROOT / SDL3_ROOT / VULKAN_HEADERS / GLSLANG_ROOT / SUYU_ROOT, or from <repo>/deps/<name>.
+libopus (the music) is optional: --opus, OPUS_DLL or <repo>/deps/opus; without it the build ends with a warning and the
+game's Opus streams are silent.
 """
 import argparse
 import json
@@ -176,6 +178,27 @@ def step_deps(cx):
     if not vs:
         raise Fail('Visual Studio / Build Tools with "MSVC v14x x64/x86 build tools" not found (needed for the glslang shim)')
     say('  MSVC (glslang shim): %s' % vs)
+
+    # libopus: nnaudio.c loads it at run time to decode the game's Opus streams (the music among them). Optional: without it
+    # the game runs and those streams are silent, which is easy to miss, so the deps step says so.
+    def opus_in(p):
+        if p and os.path.isfile(p):
+            return os.path.abspath(p)
+        for rel in ('opus.dll', 'libopus-0.dll', os.path.join('bin', 'opus.dll'), os.path.join('bin', 'libopus-0.dll'),
+                    os.path.join('Release', 'opus.dll'), os.path.join('build', 'Release', 'opus.dll')):
+            if p and os.path.isfile(os.path.join(p, rel)):
+                return os.path.abspath(os.path.join(p, rel))
+        return None
+    opus = next((f for f in map(opus_in, [a.opus, os.environ.get('OPUS_DLL'), os.path.join(deps, 'opus')]) if f), None)
+    msys = next((p for p in (r'C:\msys64\ucrt64\bin\libopus-0.dll', r'C:\msys64\mingw64\bin\libopus-0.dll', r'C:\msys64\clang64\bin\libopus-0.dll')
+                 if os.path.isfile(p)), None)
+    if opus:
+        cx.tools['opus'] = opus
+        say('  libopus  %s (the link step copies it beside the exe)' % opus)
+    elif msys:
+        say('  libopus  %s (MSYS2: the runtime loads it from there)' % msys)
+    else:
+        say('  libopus  NOT FOUND: the game will run, but its music and other Opus sounds will be silent (--opus <opus.dll or its folder>, BUILDING.md)')
 
     # the dump
     dump = a.dump
@@ -345,7 +368,14 @@ def step_link(cx):
     for f in (EXE, 'SDL3.dll', 'ssbu_glslang.dll', 'ssbu_game_eh_o1.dll'):
         if not os.path.exists(os.path.join(cx.work, f)):
             raise Fail('%s was not produced' % f)
-    say('  %s %.1f MB, SDL3.dll, ssbu_glslang.dll, ssbu_game_eh_o1.dll beside it' % (EXE, os.path.getsize(exe) / 1048576.0))
+    opus = cx.tools.get('opus')
+    if opus:                                            # under a name nnaudio.c looks for (opus.dll or libopus-0.dll)
+        name = os.path.basename(opus) if os.path.basename(opus).lower() in ('opus.dll', 'libopus-0.dll') else 'opus.dll'
+        shutil.copy2(opus, os.path.join(cx.work, name))
+    say('  %s %.1f MB, SDL3.dll, ssbu_glslang.dll, ssbu_game_eh_o1.dll%s beside it' % (EXE, os.path.getsize(exe) / 1048576.0,
+                                                                                         ', ' + name if opus else ''))
+    if not opus:
+        say('  WARNING: no libopus: music and the other Opus sounds will be silent (deps step above; BUILDING.md)')
 
 
 def game_env(cx, **extra):
@@ -411,6 +441,7 @@ def main():
     ap.add_argument('--vulkan-headers', help='Khronos Vulkan-Headers folder (include\\vulkan\\)')
     ap.add_argument('--glslang', help='glslang windows-x86_64 release folder (include\\, lib\\)')
     ap.add_argument('--suyu', help='source checkout of a yuzu-family emulator (only src\\core\\hle\\service\\mii is read)')
+    ap.add_argument('--opus', help='libopus DLL (opus.dll or libopus-0.dll) or the folder holding it: the music (optional, BUILDING.md)')
     ap.add_argument('--sdk-roots', help='another list of SDK functions to lift (default: tools/lifter/sdklift_roots.txt)')
     ap.add_argument('--modules', help='script modules to build: all (default) or a comma list, e.g. lua2cpp_common,lua2cpp_mario')
     ap.add_argument('--redo', help='repeat this step')
