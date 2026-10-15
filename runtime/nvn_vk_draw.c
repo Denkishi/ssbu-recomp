@@ -1857,7 +1857,7 @@ static void copy_buf_tex(const Cmd *m) {
     int r[6];
     if (!t || t->dead || !m->a[0]) return;
     memcpy(&v, BLOB(m), sizeof v); memcpy(r, BLOB(m) + 24, 24);
-    write_region(t, &v, r, P(m->a[0]), R.row_stride, R.image_stride);
+    write_region(t, &v, r, P(m->a[0]), (int64_t)m->a[5], (int64_t)m->a[6]);     /* the strides of its own command buffer (nvn_gl.c cmd_copy_buf_tex) */
 }
 static void vk_write_texels(void *arg) {
     WriteJob *j = arg;
@@ -2149,14 +2149,14 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_COPY_BUF_TEX: cb_sync(); copy_buf_tex(m); break;
-    case OP_COPY_TEX_BUF: {                        /* a0 texture, a3 buffer address; blob: view, region (as nvn_gl.c) */
+    case OP_COPY_TEX_BUF: {                        /* a0 texture, a3 buffer address, a5 / a6 the strides of its command buffer; blob: view, region (as nvn_gl.c) */
         Tex *t = P(a[0]);
         View v;
         int r[6];
         if (!t || t->dead || !a[3]) break;
         memcpy(&v, blob, sizeof v); memcpy(r, blob + 24, 24);
         cb_sync();
-        read_region(t, &v, r, P(a[3]), R.row_stride, R.image_stride);
+        read_region(t, &v, r, P(a[3]), (int64_t)a[5], (int64_t)a[6]);
         R.gen++;                                   /* guest memory changed: ranges are streamed again */
         break;
     }

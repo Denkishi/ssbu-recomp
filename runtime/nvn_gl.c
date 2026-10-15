@@ -3085,7 +3085,7 @@ static void exec(const Cmd *m, int depth) {
         g_st.draws++; g_frame_draws++; count_dummy_samples();
         break;
     }
-    case OP_COPY_BUF_TEX: {                    /* a0 buffer address, a1 texture, a4 flags, a5 row stride; blob: view, region */
+    case OP_COPY_BUF_TEX: {                    /* a0 buffer address, a1 texture, a4 flags, a5 / a6 row / image stride of its command buffer; blob: view, region */
         Tex *t = P(a[1]);
         View v;
         Fmt f;
@@ -3107,11 +3107,11 @@ static void exec(const Cmd *m, int depth) {
                 seen[nseen].fmt = t->b.format; seen[nseen].w = t->b.width; seen[nseen++].h = t->b.height;
                 printf("nvn_gl: CopyBufferToTexture into %dx%dx%d format 0x%x target %d levels %d flags 0x%x swizzle %d%d%d%d: region %d,%d,%d %dx%dx%d level %d layer %d, row stride %lld, %zu of %zu source bytes non-zero\n",
                        t->b.width, t->b.height, t->b.depth, t->b.format, t->b.target, t->b.levels, t->b.flags, t->b.swz[0], t->b.swz[1], t->b.swz[2], t->b.swz[3],
-                       r[0], r[1], r[2], r[3], r[4], r[5], level, layer, (long long)S.row_stride, nz, bytes);
+                       r[0], r[1], r[2], r[3], r[4], r[5], level, layer, (long long)a[5], nz, bytes);
             }
         }
-        if (S.row_stride && f.kind != 4) glPixelStorei(GL_UNPACK_ROW_LENGTH_, (GLint)(S.row_stride / f.bpb));      /* nvnCommandBufferSetCopyRowStride */
-        if (S.image_stride && S.row_stride && f.kind != 4) glPixelStorei(0x806E /* UNPACK_IMAGE_HEIGHT */, (GLint)(S.image_stride / S.row_stride));   /* SetCopyImageStride */
+        if (a[5] && f.kind != 4) glPixelStorei(GL_UNPACK_ROW_LENGTH_, (GLint)((int64_t)a[5] / f.bpb));      /* nvnCommandBufferSetCopyRowStride */
+        if (a[6] && a[5] && f.kind != 4) glPixelStorei(0x806E /* UNPACK_IMAGE_HEIGHT */, (GLint)((int64_t)a[6] / (int64_t)a[5]));   /* SetCopyImageStride */
         if (t->b.target != 2 && t->b.target != 4 && t->b.target != 9 && t->b.target != 8) layer = 0;
         else if (t->b.target != 2) layer += r[2];
         tex_put(t, &f, level, layer, r[0], r[1], r[2], r[3], r[4], r[5] > 0 ? r[5] : 1, P(a[0]));
@@ -3139,7 +3139,7 @@ static void exec(const Cmd *m, int depth) {
         blit_tex(s, NULL, sr, d, NULL, dr, 0);
         break;
     }
-    case OP_COPY_TEX_BUF: {                    /* a0 texture, a3 buffer address; blob: view, region */
+    case OP_COPY_TEX_BUF: {                    /* a0 texture, a3 buffer address, a5 / a6 row / image stride of its command buffer; blob: view, region */
         Tex *t = P(a[0]);
         View v;
         Fmt f;
@@ -3152,8 +3152,8 @@ static void exec(const Cmd *m, int depth) {
         size_t bytes = ((size_t)(r[3] + f.bw - 1) / f.bw) * ((size_t)(r[4] + f.bh - 1) / f.bh) * f.bpb * (size_t)d;
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         compute_flush();
-        if (S.row_stride && f.kind != 4) { glPixelStorei(0x0D02 /* PACK_ROW_LENGTH */, (GLint)(S.row_stride / f.bpb)); bytes = (size_t)S.row_stride * (size_t)r[4] * (size_t)d; }
-        if (S.image_stride && S.row_stride && f.kind != 4) { glPixelStorei(0x806C /* PACK_IMAGE_HEIGHT */, (GLint)(S.image_stride / S.row_stride)); bytes = (size_t)S.image_stride * (size_t)d; }
+        if (a[5] && f.kind != 4) { glPixelStorei(0x0D02 /* PACK_ROW_LENGTH */, (GLint)((int64_t)a[5] / f.bpb)); bytes = (size_t)a[5] * (size_t)r[4] * (size_t)d; }
+        if (a[6] && a[5] && f.kind != 4) { glPixelStorei(0x806C /* PACK_IMAGE_HEIGHT */, (GLint)((int64_t)a[6] / (int64_t)a[5])); bytes = (size_t)a[6] * (size_t)d; }
         if (f.kind == 4) glGetCompressedTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, (GLsizei)bytes, P(a[3]));
         else glGetTextureSubImage(t->o.gl, level, r[0], r[1], z, r[3], r[4], d, f.format, f.type, (GLsizei)bytes, P(a[3]));
         glPixelStorei(0x0D02, 0); glPixelStorei(0x806C, 0);
@@ -4310,7 +4310,11 @@ static void cmd_copy_buf_tex(Ctx *c) {                  /* (cmdbuf, buffer, text
     uint64_t view = A3, region = A4;
     Tex *t = hobj(A2, K_TEX);
     Cmd *m = rec(c, OP_COPY_BUF_TEX, 48);
-    m->a[1] = (uint64_t)(uintptr_t)t; m->a[5] = 0;
+    CmdBuf *cb = cb_get(A0);
+    /* the copy takes the strides this command buffer has now (SetCopyRowStride / SetCopyImageStride), as NVN does: at
+     * replay the running stride state may come from another command buffer's copies (a 320x320 upload read with the
+     * 832-texel rows of a stage preview read past its buffer: the crash after a random stage choice) */
+    m->a[1] = (uint64_t)(uintptr_t)t; m->a[5] = (uint64_t)cb->row_stride; m->a[6] = (uint64_t)cb->image_stride;
     memset(BLOB(m), 0, 48);
     if (view) memcpy(BLOB(m), P(view), sizeof(View));
     if (region) memcpy(BLOB(m) + 24, P(region), 24);
@@ -4330,7 +4334,8 @@ static void cmd_copy_tex_buf(Ctx *c) {                  /* (cmdbuf, texture, vie
     uint64_t view = A2, region = A3;
     Tex *t = hobj(A1, K_TEX);
     Cmd *m = rec(c, OP_COPY_TEX_BUF, 48);
-    m->a[0] = (uint64_t)(uintptr_t)t; m->a[3] = c->x[4];
+    CmdBuf *cb = cb_get(A0);
+    m->a[0] = (uint64_t)(uintptr_t)t; m->a[3] = c->x[4]; m->a[5] = (uint64_t)cb->row_stride; m->a[6] = (uint64_t)cb->image_stride;   /* as cmd_copy_buf_tex */
     memset(BLOB(m), 0, 48);
     if (view) memcpy(BLOB(m), P(view), sizeof(View));
     if (region) memcpy(BLOB(m) + 24, P(region), 24);
