@@ -1871,14 +1871,22 @@ static uint64_t cont_find(uint64_t control, uint64_t *size, uint64_t *neg_lo, LO
     unsigned nstep = 0;
     *neg_lo = 0;
     if ((control >> 28) == 0x710) return 0;        /* inside the game's own image (0x7100000000 + 256 MB): a program built into the exe, no container; the image is thousands of small regions for VirtualQuery (40 ms a search, measured) */
+    LONG64 vq_tk = 0, vq_max = 0; int nreg = 0;      /* "nvn_vk_cfind:" lines (first 60): a search that took more than twice its budget, and where the time went */
+    #define CF_DIAG(why) do { LONG64 tt_ = tk() - t0; static LONG nl_; if (tt_ > 2 * budget && budget && InterlockedIncrement(&nl_) <= 60) { LARGE_INTEGER f_; QueryPerformanceFrequency(&f_); printf("nvn_vk_cfind: %s after %.1f ms: %u steps, %d regions, VirtualQuery %.1f ms (longest %.1f ms), control %llx%c", why, tt_ * 1000.0 / f_.QuadPart, nstep, nreg, vq_tk * 1000.0 / f_.QuadPart, vq_max * 1000.0 / f_.QuadPart, (unsigned long long)control, 10); } } while (0)
     for (int regions = 0; a >= stop && regions < 256; regions++) {
         MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery((const void *)(uintptr_t)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) break;
+        LONG64 tq = tk();
+        int okq = VirtualQuery((const void *)(uintptr_t)a, &mi, sizeof mi) != 0;
+        tq = tk() - tq; vq_tk += tq; if (tq > vq_max) vq_max = tq; nreg++;
+        if (!okq || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) break;
         uint64_t lo = (uint64_t)(uintptr_t)mi.BaseAddress;
         if (lo < stop) lo = stop;
-        if (budget && tk() - t0 > budget) { InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
+        if (budget && tk() - t0 > budget) { CF_DIAG("given up (region)"); InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
         for (; a >= lo; a -= step) {
-            if (budget && (++nstep & 255) == 0 && tk() - t0 > budget) { InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
+            /* every 8 steps (was 256): a step reads a page of its own, and on a PC short of memory that page may have been
+             * trimmed (a read from the page file): 256 such steps were 0.1-1.1 s on the game's main thread in fight frames
+             * (nvn_setsh lines of run "resident split32 run1", SSBU_VK_PREP=0) */
+            if (budget && (++nstep & 7) == 0 && tk() - t0 > budget) { CF_DIAG("given up (step)"); InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
             if (g32(a) == 0x48534E42u && (g32(a + 0xC) & 0xffff) == 0xFEFFu) {
                 uint64_t sz = g32(a + 0x1C);
                 if (sz < 0x60 || control >= a + sz) { *neg_lo = a + (sz < step ? step : sz); return 0; }
@@ -1887,6 +1895,7 @@ static uint64_t cont_find(uint64_t control, uint64_t *size, uint64_t *neg_lo, LO
             }
         }
     }
+    CF_DIAG("ended");
     *neg_lo = a + step;
     return 0;
 }
@@ -1900,13 +1909,18 @@ typedef struct { uint64_t lo, hi; long long frame; } NegIv;
 static NegIv g_negiv[16];
 static int g_negiv_i;
 static LONG64 g_cs_neg_hit, g_cs_neg_ext, g_cs_search;
-static int cont_range_empty(uint64_t above, uint64_t control) {      /* 1: readable and no header at a step in (above, control] */
+static int cont_range_empty(uint64_t above, uint64_t control, LONG64 budget) {      /* 1: readable and no header at a step in (above, control]; -1: gave up at the time budget (ticks, 0 = none) */
     uint64_t step = g_cscan_step, a = control & ~(step - 1);
+    LONG64 t0 = tk();
+    unsigned nstep = 0;
     while (a > above) {
         MEMORY_BASIC_INFORMATION mi;
         if (!VirtualQuery((const void *)(uintptr_t)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
         uint64_t lo = (uint64_t)(uintptr_t)mi.BaseAddress;
-        for (; a > above && a >= lo; a -= step) if (g32(a) == 0x48534E42u) return 0;
+        for (; a > above && a >= lo; a -= step) {
+            if (budget && (++nstep & 7) == 0 && tk() - t0 > budget) return -1;
+            if (g32(a) == 0x48534E42u) return 0;
+        }
     }
     return 1;
 }
@@ -2067,7 +2081,17 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
     }
     LeaveCriticalSection(&g_sh_lock);
     LONG64 t0 = tk();
-    if (ext >= 0 && cont_range_empty(ext_hi, control)) {      /* nothing new between the proved interval and this address: the same failure */
+    /* the budget: 10 ms; 20 ms for a pool outside a fight (loading). SSBU_VK_CSCAN_BUDGET=<ms> (0 = none, as before session 8) */
+    static int bms = -1; static LONG64 fqq;
+    if (bms < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fqq = f.QuadPart; bms = getenv("SSBU_VK_CSCAN_BUDGET") ? atoi(getenv("SSBU_VK_CSCAN_BUDGET")) : 10; }
+    LONG64 budget = (LONG64)bms * (from_pool && !fight_recent() ? 2 : 1) * fqq / 1000;
+    int empty = ext >= 0 ? cont_range_empty(ext_hi, control, budget) : 0;
+    if (empty < 0) {                               /* the budget ran out in the steps above the interval: given up, as cont_find does */
+        InterlockedIncrement64(&g_cs_gaveup);
+        nvn_setsh_part[2] += tk() - t0; InterlockedAdd64(&g_cs_tk, tk() - t0);
+        return;
+    }
+    if (empty) {                                   /* nothing new between the proved interval and this address: the same failure */
         EnterCriticalSection(&g_sh_lock);
         if (g_negiv[ext].hi == ext_hi) g_negiv[ext].hi = control;
         g_cs_neg_ext++;
@@ -2076,11 +2100,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
         return;
     }
     uint64_t size = 0, neg_lo = 0, base = 0;
-    {   /* the budget: 10 ms; 20 ms for a pool outside a fight (loading). SSBU_VK_CSCAN_BUDGET=<ms> (0 = none, as before session 8) */
-        static int bms = -1; static LONG64 fqq;
-        if (bms < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fqq = f.QuadPart; bms = getenv("SSBU_VK_CSCAN_BUDGET") ? atoi(getenv("SSBU_VK_CSCAN_BUDGET")) : 10; }
-        base = cont_find(control, &size, &neg_lo, (LONG64)bms * (from_pool && !fight_recent() ? 2 : 1) * fqq / 1000);
-    }
+    base = cont_find(control, &size, &neg_lo, budget);
     InterlockedIncrement64(&g_cs_search);
     nvn_setsh_part[2] += tk() - t0;
     if (g_cscan_log && (control >> 28) != 0x710) {

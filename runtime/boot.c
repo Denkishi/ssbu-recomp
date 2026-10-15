@@ -127,6 +127,67 @@ static Ctx *g_main_ctx;
 
 static const char *g_elf;
 
+/* Resident code (performance, host only). The lifted game DLL is 580 MB of code; the OS maps its pages in from the file
+ * at their first use. On a PC whose memory is mostly taken by other programs the file cache does not keep them, so every
+ * first call of a function in a fight read its page from the disk (measured: build folder on a hard disk, 16 GB of
+ * memory with 2 GB available during the fight: page-ins of 6-25 MB/s from that disk, the main thread off the CPU for
+ * 4.8 s of a 45 s fight, 50-100 frames over 33 ms). Now, at start-up, a background thread reads the whole image once
+ * (one large prefetch, then one touch per page) so it is in this process's working set, and the working set gets a
+ * hard minimum so the memory manager does not trim those pages (or the game's heap) again. Modules loaded later
+ * (nn::ro: lua2cpp_*.dll) are made resident the same way (resident_module). Nothing the game computes changes.
+ * SSBU_RESIDENT=0: off. SSBU_WS_MIN_MB=<n>: the hard working-set minimum (default 4608; 0 = no minimum). */
+static int g_resident = -1;
+static int resident_on(void) { if (g_resident < 0) { const char *e = getenv("SSBU_RESIDENT"); g_resident = !(e && e[0] == '0'); } return g_resident; }
+static DWORD WINAPI resident_thread(LPVOID arg) {
+    HMODULE m = (HMODULE)arg;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)m;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const uint8_t *)m + dos->e_lfanew);
+    uint8_t *base = (uint8_t *)m, *end = base + nt->OptionalHeader.SizeOfImage;
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    typedef struct { void *va; SIZE_T n; } Range;
+    typedef BOOL (WINAPI *PrefetchFn)(HANDLE, ULONG_PTR, Range *, ULONG);
+    PrefetchFn prefetch = (PrefetchFn)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "PrefetchVirtualMemory");
+    if (prefetch) { Range r = {base, (SIZE_T)(end - base)}; prefetch(GetCurrentProcess(), 1, &r, 0); }
+    uint64_t pages = 0, sum = 0;
+    for (uint8_t *p = base; p < end;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(p, &mi, sizeof mi)) break;
+        uint8_t *rend = (uint8_t *)mi.BaseAddress + mi.RegionSize;
+        if (rend > end) rend = end;
+        DWORD pr = mi.Protect & 0xff;
+        if (mi.State == MEM_COMMIT && !(mi.Protect & PAGE_GUARD) && pr != PAGE_NOACCESS && pr != 0)
+            for (uint8_t *q = p; q < rend; q += 4096) { sum += *(volatile uint8_t *)q; pages++; }
+        p = rend;
+    }
+    QueryPerformanceCounter(&t1);
+    char name[MAX_PATH] = "";
+    GetModuleFileNameA(m, name, sizeof name);
+    printf("resident: %s: %llu pages (%llu MB) read in %.2f s%s\n", strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name, (unsigned long long)pages, (unsigned long long)(pages >> 8),
+           (double)(t1.QuadPart - t0.QuadPart) / (double)f.QuadPart, sum == 1 ? " " : "");
+    return 0;
+}
+void resident_module(void *module) {
+    if (!module || !resident_on()) return;
+    HANDLE h = CreateThread(NULL, 0, resident_thread, module, 0, NULL);
+    if (h) CloseHandle(h);
+}
+static void resident_start(void) {
+    if (!resident_on()) { printf("resident: off (SSBU_RESIDENT=0)\n"); return; }
+    const char *e = getenv("SSBU_WS_MIN_MB");
+    SIZE_T mb = e && e[0] ? (SIZE_T)atoll(e) : 4608;
+    for (; mb >= 512; mb /= 2) {
+        SIZE_T lo = mb << 20, hi = lo + ((SIZE_T)1 << 30);
+        if (SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) { printf("resident: hard working-set minimum %llu MB\n", (unsigned long long)mb); break; }
+        printf("resident: a working-set minimum of %llu MB was refused (error %lu)\n", (unsigned long long)mb, GetLastError());
+    }
+    HMODULE dll = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&fn_table[0], &dll);
+    resident_module(dll);
+    resident_module(GetModuleHandleA(NULL));
+}
+
 /* Debug aid: SSBU_PROF=<start s>,<duration s> samples the main guest thread's host stack every ~2 ms in that
  * window, unwinds it to guest functions and prints every (caller -> callee) pair seen with its sample count. */
 #define PROF_MAX 8192
@@ -368,6 +429,7 @@ int main(int argc, char **argv) {
         import_set_address(sdk_data[i].name, copy);
     }
     cxxrt_install_data();
+    resident_start();
     runtime_init(g_elf, getenv("SSBU_TRACE") ? getenv("SSBU_TRACE") : "boot_trace.txt");
     register_imports(base_imports, (int)(sizeof base_imports / sizeof base_imports[0]));
     register_sdk_imports();
