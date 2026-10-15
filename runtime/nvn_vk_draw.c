@@ -181,7 +181,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 }
 
 /* ---------------------------------------------------------------- command buffers in flight */
-#define NSLOT 8
+#define NSLOT 32                                   /* command buffers in flight (SSBU_VK_SPLIT submits several per batch) */
 typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; } Slot;
 typedef struct VTex VTex;
 static struct {
@@ -2254,7 +2254,14 @@ static void exec(const Cmd *m, int depth) {
     default: { static char msg[OP_COUNT][64]; snprintf(msg[m->op % OP_COUNT], 64, "nvnCommandBuffer%s", nvn_front_op_name(m->op)); nvn_vk_missing(msg[m->op % OP_COUNT]); break; }
     }
 }
+/* SSBU_VK_SPLIT=<n>: a batch's command buffer is handed to the queue every n draws, between two render passes, so the GPU
+ * starts on the frame while the rest is still being translated (before, it began only at the batch's end: replay and GPU
+ * time added up, and the game waits for that fence at the start of its next frame). Queue order keeps the game's fences
+ * and the compute copy-back (cb_batch_end submits last) as they were. 0 / unset: one command buffer per batch, as before. */
+static int g_split = -1;
+static LONG64 g_split_mark, g_split_n;
 static void replay(uint64_t handle, int depth) {
+    if (g_split < 0) { const char *e = getenv("SSBU_VK_SPLIT"); g_split = e ? atoi(e) : 0; }
     size_t len = 0;
     uint8_t *data = nvn_front_list(handle, &len);
     if (!data) { static int n; if (n++ < 10) printf("nvn_vk: command handle %llx is unknown or expired\n", (unsigned long long)handle); return; }
@@ -2263,6 +2270,8 @@ static void replay(uint64_t handle, int depth) {
         if (m->size < sizeof(Cmd)) break;
         exec(m, depth);
         off += m->size;
+        if (R.frame_draws < g_split_mark) g_split_mark = 0;      /* frame_draws restarts at each present */
+        if (g_split > 0 && R.recording && !R.in_pass && R.frame_draws - g_split_mark >= g_split) { cmd_submit(NULL, NULL); g_split_mark = R.frame_draws; g_split_n++; }
     }
 }
 
