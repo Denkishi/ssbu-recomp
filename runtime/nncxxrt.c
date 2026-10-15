@@ -258,25 +258,54 @@ void cxxrt_exception_init(uint64_t obj, uint64_t type, uint64_t dtor) {
 }
 const char *eh_type_name(uint64_t exception) { ExcHeader *h = exc_header(exception); return h ? cxxrt_type_name(h->type) : "?"; }
 
-/* ---- per-context state: each guest thread and each guest fiber has its own Ctx */
+/* ---- per-context state: each guest thread and each guest fiber has its own Ctx
+ * Open addressing; a slot is never emptied again, so a lookup can stop at the first empty one. A context that ended
+ * (eh_state_forget: os_threads.c, when a fiber is finalized or a thread finishes) leaves EH_GONE, which lookups step over
+ * and inserts reuse. Before that, slots were never given back: every fiber the game ever ran that used exceptions kept
+ * one (a fiber gets a new Ctx each time it is initialized), and once all were taken the insert loop below spun for ever
+ * (2026-10-15: a freeze in a fight after 66 minutes of play, one fiber at 100 % CPU in eh_state, every other thread waiting). */
 typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; } EhState;
 #define EH_STATES 4096
+#define EH_GONE ((Ctx *)(uintptr_t)1)
 static EhState g_eh_state[EH_STATES];
 static SRWLOCK g_eh_state_lock = SRWLOCK_INIT;
 static EhState *eh_state(Ctx *c) {
-    unsigned h = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES;
-    for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {       /* entries are never removed */
+    unsigned h0 = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES, h = h0;
+    for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {
         Ctx *seen = g_eh_state[h].c;
         if (seen == c) return &g_eh_state[h];
         if (!seen) break;
     }
     AcquireSRWLockExclusive(&g_eh_state_lock);
-    for (;; h = (h + 1) % EH_STATES) {
-        if (g_eh_state[h].c == c) break;
-        if (!g_eh_state[h].c) { g_eh_state[h].c = c; break; }
+    EhState *slot = NULL;
+    h = h0;
+    for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {
+        Ctx *seen = g_eh_state[h].c;
+        if (seen == c) { ReleaseSRWLockExclusive(&g_eh_state_lock); return &g_eh_state[h]; }
+        if (seen == EH_GONE && !slot) slot = &g_eh_state[h];
+        if (!seen) { if (!slot) slot = &g_eh_state[h]; break; }
+    }
+    if (!slot) {
+        ReleaseSRWLockExclusive(&g_eh_state_lock);
+        printf("\nC++ RUNTIME: more than %d guest threads and fibers alive that use exceptions (nncxxrt.c EH_STATES)\n", EH_STATES);
+        report_and_exit(3);
+        return &g_eh_state[0];                         /* not reached */
+    }
+    slot->in_flight = slot->caught = 0; slot->uncaught = 0;
+    MemoryBarrier();
+    slot->c = c;
+    ReleaseSRWLockExclusive(&g_eh_state_lock);
+    return slot;
+}
+void eh_state_forget(Ctx *c) {
+    unsigned h = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES;
+    AcquireSRWLockExclusive(&g_eh_state_lock);
+    for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {
+        Ctx *seen = g_eh_state[h].c;
+        if (seen == c) { g_eh_state[h].c = EH_GONE; break; }
+        if (!seen) break;
     }
     ReleaseSRWLockExclusive(&g_eh_state_lock);
-    return &g_eh_state[h];
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
 

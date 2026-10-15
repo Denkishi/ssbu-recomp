@@ -19,6 +19,8 @@
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define TICK_HZ 19200000ULL
 
+void eh_state_forget(Ctx *c);                 /* nncxxrt.c: drop the C++ throw state of a context that ended */
+
 typedef struct Obj {
     uint64_t key;
     struct Obj *next;
@@ -31,6 +33,7 @@ typedef struct Obj {
     uint64_t fn, arg, stack, stack_size, name;
     int priority, finished;
     void *fiber;                             /* fibers */
+    Ctx *fiber_ctx;                          /* fibers: the context fiber_main made for it (its exception state is dropped at finalize) */
     uint64_t tp;                             /* fibers: thread block (tpidr) of the host thread that runs the fiber now */
     int ideal_core, core_set;                /* threads: nn::os ideal core and affinity mask as the game set them */
     uint64_t core_mask;
@@ -227,6 +230,7 @@ static DWORD WINAPI thread_main(LPVOID arg) {
                  o->name ? (const char *)(uintptr_t)o->name : "?");
     call_guest(c, o->fn);
     tls_run_destructors(c);
+    eh_state_forget(c);                               /* nncxxrt.c: the throw state of this context is not needed any more */
     trace_printf("--- thread %llx finished\n", (unsigned long long)o->key);
     EnterCriticalSection(&o->cs);
     o->finished = 1;
@@ -265,7 +269,10 @@ static void oslog(const char *fmt, ...) {
     if (g_oslog_n + n < (LONG)sizeof g_oslog - 1) { memcpy(g_oslog + g_oslog_n, line, (size_t)n); g_oslog_n += n; }
     g_oslog_lock = 0;
 }
+static volatile LONG g_fib_init_n, g_fib_ctx_n, g_fib_final_n, g_fib_forgot_n;   /* fibers: initialized, run (got a Ctx), finalized, Ctx dropped */
 void os_thread_report(FILE *out) {
+    fprintf(out, "nn::os fibers of this run: %ld initialized, %ld run, %ld finalized; %ld contexts given back to the C++ runtime\n",
+            g_fib_init_n, g_fib_ctx_n, g_fib_final_n, g_fib_forgot_n);
     if (!g_oslog_n) return;
     fprintf(out, "nn::os threads of this run (priority 0 highest .. 31 lowest; cores 0..2 exist on the console):\n%.*s", (int)g_oslog_n, g_oslog);
 }
@@ -536,6 +543,8 @@ static void CALLBACK fiber_main(void *arg) {
     Obj *o = arg;
     Ctx *c = new_ctx(o->stack + o->stack_size);
     VirtualFree((void *)(uintptr_t)c->tpidr, 0, MEM_RELEASE);   /* a fiber has no thread block of its own: it uses the one of the thread running it */
+    o->fiber_ctx = c;
+    InterlockedIncrement(&g_fib_ctx_n);
     for (;;) {
         c->tpidr = o->tp;
         c->x[0] = o->arg;
@@ -549,8 +558,10 @@ static void CALLBACK fiber_main(void *arg) {
 }
 static void fib_init(Ctx *c) {                        /* (FiberType*, fn, arg, stack, stackSize, flags) */
     Obj *o = obj(A0);
+    if (o->fiber_ctx) { eh_state_forget(o->fiber_ctx); o->fiber_ctx = NULL; InterlockedIncrement(&g_fib_forgot_n); }   /* initialized again without a finalize */
     o->fn = A1; o->arg = A2; o->stack = A3; o->stack_size = A4;
     o->fiber = CreateFiberEx(1 << 20, (SIZE_T)256 << 20, 0, fiber_main, o);
+    InterlockedIncrement(&g_fib_init_n);
     RET(0);
 }
 static void fib_switch(Ctx *c) {
@@ -563,7 +574,12 @@ static void fib_switch(Ctx *c) {
     hitch_cur_ctx(c);
 }
 static void fib_current(Ctx *c) { RET(t_fiber); }
-static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber) { DeleteFiber(o->fiber); o->fiber = NULL; } }
+static void fib_finalize(Ctx *c) {
+    Obj *o = obj(A0);
+    if (o->fiber) { DeleteFiber(o->fiber); o->fiber = NULL; }
+    if (o->fiber_ctx) { eh_state_forget(o->fiber_ctx); o->fiber_ctx = NULL; InterlockedIncrement(&g_fib_forgot_n); }   /* its slot in nncxxrt.c can be used again */
+    InterlockedIncrement(&g_fib_final_n);
+}
 
 /* ---------------------------------------------------------------- misc */
 static void os_ConvertToTick(Ctx *c) { RET((uint64_t)((double)(int64_t)A0 * (double)TICK_HZ / 1e9)); }

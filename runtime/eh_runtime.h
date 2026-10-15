@@ -79,6 +79,7 @@ int eh_personality(Ctx *c, uint64_t call_pc, uint64_t exception, EhPad *out);
 
 /* ---- throw state of a context */
 uint64_t eh_in_flight(Ctx *c);       /* thrown object pointer of the exception being propagated, or 0 */
+void eh_state_forget(Ctx *c);        /* the context ended (a fiber finalized, a thread finished): its throw state is dropped */
 const char *eh_type_name(uint64_t exception);        /* mangled type name, e.g. "St12out_of_range" */
 /* Commit to a pad returned by eh_personality: sets x0 and x1, records the adjusted pointer for __cxa_begin_catch,
  * clears the in-flight state. The caller then restores the frame's registers and jumps to pad->landing_pad. */

@@ -557,6 +557,16 @@ static void st_eh_flow(void) {
     CHECK(eh_in_flight(c) && !eh_in_flight(c2), "throw state belongs to the Ctx (guest thread or fiber), not to the host thread");
     eh_personality(c, 0x710382b690ull, eh_in_flight(c), &pad); eh_enter_pad(c, &pad);
     st_import(c, "__cxa_begin_catch", c->x[0], 0, 0, 0); st_import(c, "__cxa_end_catch", 0, 0, 0, 0);
+    /* a context that ended gives its slot back (eh_state_forget, os_threads.c): many more contexts than EH_STATES, one
+     * after another, as a long session makes fibers; before that the one after the last free slot spun in eh_state */
+    {
+        enum { N = 3 * EH_STATES };
+        Ctx *many = _aligned_malloc((size_t)N * sizeof *many, 16);
+        int ok = many != NULL;
+        for (int i = 0; ok && i < N; i++) { ok = eh_in_flight(&many[i]) == 0; eh_state_forget(&many[i]); }
+        _aligned_free(many);
+        CHECK(ok && !eh_in_flight(c2), "%d contexts one after another, each given back when it ends: no slot runs out, the state of a live one stays", (int)N);
+    }
     eh_set_unwinder(installed);
 }
 
