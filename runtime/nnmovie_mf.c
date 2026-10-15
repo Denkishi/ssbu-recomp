@@ -64,7 +64,9 @@
  *
  * Environment: SSBU_MOVIE=0 keeps the failing placeholder (nnmovie.c); SSBU_MOVIE_SAVE=<file> saves what the game's
  * reader returned; SSBU_MOVIE_LOG=1 logs every decoder call; SSBU_MOVIE_TEST_RESYNC=<flag>,<n> makes the game
- * re-synchronise (pause, seek, resume) the movie at the n-th video sample, see dec_SendInputBufferForDecode. */
+ * re-synchronise (pause, seek, resume) the movie at the n-th video sample, see dec_SendInputBufferForDecode;
+ * SSBU_MOVIE_SAVE_H264=<file> saves the H.264 stream a final smash movie sends; SSBU_MOVIE_H264_TEST=<file> (test only)
+ * decodes such a file through the H.264 path the way the game drives it and exits, see h264_selftest. */
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -352,7 +354,31 @@ typedef struct {
     unsigned long long in_count, out_count, copied, dropped, flushes;
     int warned_small, warned_token;
     uint32_t last_error;                              /* DecoderImpl +0xd8 [subsdk 0x1fc80] */
+    uint64_t guest;                                   /* the game's 16-byte Decoder object (see dec_of) */
+    size_t slot;                                      /* bytes per input buffer: SLOT_BYTES for tokens, more for H.264 data */
+    /* H.264 elementary stream: the game reads the compressed stream itself (no Extractor) and writes NAL units into the
+     * input buffers [final smash movies, game 0x71036e568c / 0x71036f04c0]; Media Foundation's H.264 decoder transform
+     * decodes them here. Decoded frames wait in pend[] until an output buffer is free. */
+    int h264, csd_sent, plane_h, mft_provides, warned_h264;
+    IMFTransform *mft;
+    DWORD mft_out_size;
+    unsigned char *csd; size_t csd_len;               /* start code + SPS + start code + PPS, sent before the first unit */
+    struct { IMFSample *s; int64_t ts; uint32_t flags; } pend[MAX_OUT];
+    int pend_n;
+    int64_t last_ts;
+    int eos_in;                                       /* end of stream received: no input buffer is offered again until a flush */
+    int parked[MAX_IN], parked_n;                     /* input buffers held back while decoded frames wait (back-pressure) */
+    FILE *save;                                       /* SSBU_MOVIE_SAVE_H264=<file>: what the game sent, for offline tests */
 } Dec;
+
+/* Live decoders. The game can still call a Decoder through a pointer it holds after another thread destroyed it
+ * (seen 2026-10-15: the final smash movie's worker thread [game 0x71036f05bc] after MOVIE_STOP deleted the decoder);
+ * the 16-byte object is then freed game memory, so the implementation pointer read from it is not trusted: it must be
+ * a decoder of this list made for that very object. Destroyed decoders are unlisted, and their structure is kept so a
+ * call already running on another thread never touches freed host memory. */
+#define MAX_LIVE_DEC 64
+static SRWLOCK g_dec_live_lock = SRWLOCK_INIT;
+static void *g_dec_live[MAX_LIVE_DEC];
 
 typedef struct { uint64_t magic; IMFSample *s; int64_t ts; uint64_t gen; } Token;   /* gen = Ext::gen when it was read */
 
@@ -373,7 +399,20 @@ static void ext_lock(Ext *e) { EnterCriticalSection(&e->cs); }
 static void ext_unlock(Ext *e) { LeaveCriticalSection(&e->cs); }
 
 static Ext *ext_of(uint64_t guest) { return guest ? (Ext *)(uintptr_t)rd64(guest + 8) : NULL; }
-static Dec *dec_of(uint64_t guest) { return guest ? (Dec *)(uintptr_t)rd64(guest + 8) : NULL; }
+static Dec *dec_of(uint64_t guest) {
+    if (!guest) return NULL;
+    void *p = (void *)(uintptr_t)rd64(guest + 8);
+    Dec *d = NULL;
+    AcquireSRWLockShared(&g_dec_live_lock);
+    for (int i = 0; i < MAX_LIVE_DEC && p; i++) if (g_dec_live[i] == p) { d = (Dec *)p; break; }
+    ReleaseSRWLockShared(&g_dec_live_lock);
+    return d && d->guest == guest ? d : NULL;
+}
+static void dec_listed(Dec *d, int on) {
+    AcquireSRWLockExclusive(&g_dec_live_lock);
+    for (int i = 0; i < MAX_LIVE_DEC; i++) if (on ? !g_dec_live[i] : g_dec_live[i] == d) { g_dec_live[i] = on ? d : NULL; break; }
+    ReleaseSRWLockExclusive(&g_dec_live_lock);
+}
 
 static void release_pending(Ext *e) {                 /* the current sample is done with (Advance) */
     if (e->have_pending && !e->pend_consumed && e->pending) IMFSample_Release(e->pending);
@@ -771,23 +810,34 @@ static void dlog(Dec *d, const char *fmt, ...) {      /* SSBU_MOVIE_LOG: one lin
 }
 
 /* Frees every sample the decoder holds and empties all lists (caller holds the lock). */
+static int h264_pump(Dec *d);
 static void dec_release_all(Dec *d) {
     for (int i = 0; i < d->nout; i++) { if (d->out[i].s) IMFSample_Release(d->out[i].s); memset(&d->out[i], 0, sizeof d->out[i]); }
     for (int i = 0; i < d->nin; i++) {
         if (d->in_state[i] == IN_DECODING && d->in_data[i].s) IMFSample_Release(d->in_data[i].s);
-        Token t;                                      /* a sample read into the buffer but not sent yet */
-        memcpy(&t, d->mem + (size_t)i * SLOT_BYTES, sizeof t);
-        if (t.magic == TOKEN_MAGIC && t.s) IMFSample_Release(t.s);
-        memset(d->mem + (size_t)i * SLOT_BYTES, 0, SLOT_BYTES);
+        if (!d->h264) {
+            Token t;                                  /* a sample read into the buffer but not sent yet */
+            memcpy(&t, d->mem + (size_t)i * d->slot, sizeof t);
+            if (t.magic == TOKEN_MAGIC && t.s) IMFSample_Release(t.s);
+            memset(d->mem + (size_t)i * d->slot, 0, d->slot);
+        }
         memset(&d->in_data[i], 0, sizeof d->in_data[i]);
         d->in_state[i] = IN_CODEC;
     }
     d->in_n = d->dec_n = d->out_n = 0;
+    if (d->h264) {                                    /* decoded but not handed out, and what the transform holds */
+        for (int i = 0; i < d->pend_n; i++) if (d->pend[i].s) IMFSample_Release(d->pend[i].s);
+        d->pend_n = 0;
+        if (d->mft) IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_COMMAND_FLUSH, 0);
+        d->csd_sent = 0;                              /* after a flush (a seek) the decoder needs the parameter sets again */
+        d->eos_in = 0; d->parked_n = 0;               /* Start offers every input buffer again */
+    }
 }
 
 /* The codec's own progress (caller holds the lock): every input waiting in decode moves to a free output buffer,
  * and its input buffer is offered again. Returns bit 0 = input indices were offered, bit 1 = frames became ready. */
 static int dec_pump(Dec *d) {
+    if (d->h264) return h264_pump(d);
     int ev = 0;
     while (d->dec_n > 0) {
         int o = -1;
@@ -808,17 +858,199 @@ static int dec_pump(Dec *d) {
 }
 static void dec_signal(Dec *d, int ev) { if (ev & 2) signal_event(d, 1); if (ev & 1) signal_event(d, 0); }
 
+/* ---------------------------------------------------------------- H.264 elementary streams (Media Foundation transform)
+ * Every call below runs with the decoder locked. h264_open picks the first synchronous H.264 decoder transform Windows
+ * registers (Microsoft's software decoder; asynchronous hardware transforms need an event loop and are left out). */
+static int h264_sps_dims(const uint8_t *sps, size_t len, int *width, int *height, double *fps);
+static int h264_set_output(Dec *d) {
+    IMFMediaType *t = NULL;
+    for (DWORD k = 0; SUCCEEDED(IMFTransform_GetOutputAvailableType(d->mft, 0, k, &t)); k++) {
+        GUID sub;
+        if (SUCCEEDED(IMFMediaType_GetGUID(t, &MF_MT_SUBTYPE, &sub)) && IsEqualGUID(&sub, &MFVideoFormat_NV12)) {
+            HRESULT hr = IMFTransform_SetOutputType(d->mft, 0, t, 0);
+            UINT64 fs = 0;
+            if (SUCCEEDED(hr) && SUCCEEDED(IMFMediaType_GetUINT64(t, &MF_MT_FRAME_SIZE, &fs))) {
+                int fw = (int)(fs >> 32), fh = (int)(fs & 0xffffffff);
+                d->plane_h = fh;                      /* the luma plane's rows: 1088 for a 1080-line picture */
+                if (d->w <= 0 || d->h <= 0) { d->w = fw; d->h = fh; }
+            }
+            IMFMediaType_Release(t);
+            MFT_OUTPUT_STREAM_INFO si;
+            if (SUCCEEDED(hr) && SUCCEEDED(IMFTransform_GetOutputStreamInfo(d->mft, 0, &si))) {
+                d->mft_provides = (si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+                d->mft_out_size = si.cbSize;
+            }
+            return SUCCEEDED(hr);
+        }
+        IMFMediaType_Release(t);
+    }
+    return 0;
+}
+static int h264_open(Dec *d) {
+    MFT_REGISTER_TYPE_INFO in = {MFMediaType_Video, MFVideoFormat_H264};
+    IMFActivate **act = NULL;
+    UINT32 n = 0;
+    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER, &in, NULL, &act, &n);
+    for (UINT32 i = 0; SUCCEEDED(hr) && i < n; i++) {
+        if (!d->mft && SUCCEEDED(IMFActivate_ActivateObject(act[i], &IID_IMFTransform, (void **)&d->mft))) {
+            WCHAR name[128] = L"?";
+            IMFActivate_GetString(act[i], &MFT_FRIENDLY_NAME_Attribute, name, 128, NULL);
+            printf("movie: H.264 decoder: %ls\n", name);
+        }
+        IMFActivate_Release(act[i]);
+    }
+    CoTaskMemFree(act);
+    if (!d->mft) { printf("movie: no H.264 decoder transform (MFTEnumEx %08lx, %u found)\n", hr, n); return 0; }
+    IMFMediaType *t = NULL;
+    hr = MFCreateMediaType(&t);
+    if (SUCCEEDED(hr)) {
+        IMFMediaType_SetGUID(t, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        IMFMediaType_SetGUID(t, &MF_MT_SUBTYPE, &MFVideoFormat_H264);
+        IMFMediaType_SetUINT32(t, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (d->w > 0 && d->h > 0) IMFMediaType_SetUINT64(t, &MF_MT_FRAME_SIZE, ((UINT64)(UINT32)d->w << 32) | (UINT32)d->h);
+        hr = IMFTransform_SetInputType(d->mft, 0, t, 0);
+        IMFMediaType_Release(t);
+    }
+    if (FAILED(hr) || !h264_set_output(d)) {
+        printf("movie: H.264 decoder refused the stream (input type %08lx)\n", hr);
+        IMFTransform_Release(d->mft); d->mft = NULL;
+        return 0;
+    }
+    IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    return 1;
+}
+/* Takes every frame the transform has ready into pend[]. */
+static void h264_collect(Dec *d) {
+    for (int guard = 0; guard < 4 * MAX_OUT; guard++) {
+        MFT_OUTPUT_DATA_BUFFER ob;
+        memset(&ob, 0, sizeof ob);
+        DWORD status = 0;
+        if (!d->mft_provides) {
+            IMFMediaBuffer *mb = NULL;
+            DWORD size = d->mft_out_size ? d->mft_out_size : (DWORD)((d->w + 32) * (d->plane_h > d->h ? d->plane_h : d->h) * 2);
+            if (FAILED(MFCreateMemoryBuffer(size, &mb))) return;
+            if (FAILED(MFCreateSample(&ob.pSample))) { IMFMediaBuffer_Release(mb); return; }
+            IMFSample_AddBuffer(ob.pSample, mb);
+            IMFMediaBuffer_Release(mb);
+        }
+        HRESULT hr = IMFTransform_ProcessOutput(d->mft, 0, 1, &ob, &status);
+        if (ob.pEvents) IMFCollection_Release(ob.pEvents);
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            if (!h264_set_output(d)) return;
+            continue;
+        }
+        if (FAILED(hr)) {
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            if (hr != MF_E_TRANSFORM_NEED_MORE_INPUT && !d->warned_h264) { d->warned_h264 = 1; printf("movie: H.264 decoder output failed: %08lx\n", hr); }
+            return;
+        }
+        LONGLONG t = 0;
+        IMFSample_GetSampleTime(ob.pSample, &t);
+        if (d->pend_n < MAX_OUT) {
+            d->pend[d->pend_n].s = ob.pSample; d->pend[d->pend_n].ts = t / 10; d->pend[d->pend_n].flags = 0;
+            d->pend_n++;
+        } else { IMFSample_Release(ob.pSample); d->dropped++; }
+    }
+}
+/* Back-pressure, as the WebM path has it (an input is decoded only into a free output buffer): an input buffer goes back
+ * to the game only while few decoded frames wait for an output buffer. Without it the game pushes a whole final smash
+ * movie in at once, the transform decodes it faster than the game shows it, and frames were thrown away (2026-10-15:
+ * about 70 of 196 shown, and the feed thread spun on end-of-stream buffers at 8-10 ms of CPU per frame). */
+#define H264_PEND_LIMIT 4
+/* Decoded frames into free output buffers, then held-back input buffers back to the game; returns 2 when frames became
+ * ready, | 1 when input buffers were offered. */
+static int h264_pump(Dec *d) {
+    int ev = 0;
+    while (d->pend_n > 0) {
+        int o = -1;
+        for (int i = 0; i < d->nout; i++) if (d->out[i].state == OUT_FREE) { o = i; break; }
+        if (o < 0) break;
+        d->out[o].s = d->pend[0].s; d->out[o].ts = d->pend[0].ts; d->out[o].flags = d->pend[0].flags;
+        d->out[o].state = OUT_READY;
+        d->out_list[d->out_n++] = o;
+        memmove(d->pend, d->pend + 1, (size_t)(d->pend_n - 1) * sizeof d->pend[0]);
+        d->pend_n--;
+        ev |= 2;
+    }
+    while (!d->eos_in && d->pend_n < H264_PEND_LIMIT && d->parked_n > 0) {
+        int i = d->parked[--d->parked_n];
+        d->in_state[i] = IN_OFFERED;
+        d->in_list[d->in_n++] = i;
+        ev |= 1;
+    }
+    return ev;
+}
+/* The game wrote `size` bytes of NAL units at `off` of input buffer i: decode them, give the buffer back. */
+static int h264_send(Dec *d, int i, int off, int size, int64_t ts, uint32_t flags) {
+    if (off < 0 || size < 0 || (size_t)off + (size_t)size > d->slot) size = 0;
+    const unsigned char *data = d->mem + (size_t)i * d->slot + off;
+    if (d->save && size > 0) fwrite(data, 1, (size_t)size, d->save);
+    if (d->in_count == 1 && size > 0) {
+        printf("movie: Decoder(video): first H.264 input: %d bytes at t=%.3f s, starts", size, ts / 1e6);
+        for (int k = 0; k < size && k < 8; k++) printf(" %02x", data[k]);
+        printf("\n");
+    }
+    if (size > 0 && d->mft) {
+        /* the decoder reads Annex B: a unit handed over without its start code gets one */
+        int sc = !(size >= 3 && data[0] == 0 && data[1] == 0 && (data[2] == 1 || (size >= 4 && data[2] == 0 && data[3] == 1)));
+        size_t pre = d->csd_sent ? 0 : d->csd_len, total = pre + (sc ? 4 : 0) + (size_t)size;
+        IMFMediaBuffer *mb = NULL;
+        IMFSample *s = NULL;
+        BYTE *p = NULL;
+        if (SUCCEEDED(MFCreateMemoryBuffer((DWORD)total, &mb)) && SUCCEEDED(IMFMediaBuffer_Lock(mb, &p, NULL, NULL))) {
+            if (pre) memcpy(p, d->csd, pre);
+            if (sc) { static const unsigned char code[4] = {0, 0, 0, 1}; memcpy(p + pre, code, 4); pre += 4; }
+            memcpy(p + pre, data, (size_t)size);
+            IMFMediaBuffer_Unlock(mb);
+            IMFMediaBuffer_SetCurrentLength(mb, (DWORD)total);
+            if (SUCCEEDED(MFCreateSample(&s))) {
+                IMFSample_AddBuffer(s, mb);
+                IMFSample_SetSampleTime(s, ts * 10);
+                HRESULT hr = IMFTransform_ProcessInput(d->mft, 0, s, 0);
+                if (hr == MF_E_NOTACCEPTING) { h264_collect(d); hr = IMFTransform_ProcessInput(d->mft, 0, s, 0); }
+                if (SUCCEEDED(hr)) d->csd_sent = 1;
+                else if (!d->warned_h264) { d->warned_h264 = 1; printf("movie: H.264 decoder input failed: %08lx\n", hr); }
+                IMFSample_Release(s);
+            }
+        }
+        if (mb) IMFMediaBuffer_Release(mb);
+        h264_collect(d);
+    }
+    if (ts > d->last_ts) d->last_ts = ts;
+    if ((flags & FLAG_EOS) && !d->eos_in) {           /* the rest of the pictures, then one end-of-stream buffer */
+        d->eos_in = 1;
+        if (d->mft) { IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_COMMAND_DRAIN, 0); h264_collect(d); }
+        if (d->pend_n < MAX_OUT) { d->pend[d->pend_n].s = NULL; d->pend[d->pend_n].ts = d->last_ts; d->pend[d->pend_n].flags = FLAG_EOS; d->pend_n++; }
+        printf("movie: Decoder(video): H.264 end of stream after %llu inputs\n", d->in_count);
+    }
+    if (d->eos_in) d->in_state[i] = IN_CODEC;         /* nothing more to feed: the game's feed thread waits instead of sending end of stream again */
+    else if (d->pend_n >= H264_PEND_LIMIT) { d->in_state[i] = IN_CODEC; d->parked[d->parked_n++] = i; }
+    else { d->in_state[i] = IN_OFFERED; d->in_list[d->in_n++] = i; }    /* the data was copied: the buffer can be filled again */
+    return h264_pump(d) | (d->in_state[i] == IN_OFFERED ? 1 : 0);
+}
+static void h264_close(Dec *d) {
+    for (int i = 0; i < d->pend_n; i++) if (d->pend[i].s) IMFSample_Release(d->pend[i].s);
+    d->pend_n = 0;
+    if (d->mft) { IMFTransform_ProcessMessage(d->mft, MFT_MESSAGE_NOTIFY_END_STREAMING, 0); IMFTransform_Release(d->mft); d->mft = NULL; }
+    if (d->save) { fclose(d->save); d->save = NULL; }
+    free(d->csd); d->csd = NULL;
+}
+
 static void dec_dtor_common(Ctx *c, int deleting) {
     Dec *d = dec_of(A0);
     if (d) {
+        dec_listed(d, 0);                             /* from here on dec_of finds nothing for this object */
+        com_init();
         dec_lock(d);
         dec_release_all(d);
-        dec_unlock(d);
-        DeleteCriticalSection(&d->cs);
+        h264_close(d);
         printf("movie: Decoder(%s) destroyed: %llu input buffers, %llu output buffers, %llu copied to the game, %llu refused, %llu flushes\n",
                d->is_video ? "video" : "audio", d->in_count, d->out_count, d->copied, d->dropped, d->flushes);
         free(d->mem);
-        free(d);
+        d->mem = NULL; d->nin = d->nout = 0;          /* the structure itself is kept (see g_dec_live): a few KB per decoder */
+        dec_unlock(d);
         wr64(A0 + 8, 0);
     }
     if (deleting) gcall(c, GAME_FREE, A0, 0, 0, 0, 0);       /* the game allocated the 16-byte object with f_710392dce0 [game 0x71036f1ccc] */
@@ -845,6 +1077,33 @@ static void dec_Configure(Ctx *c) {                   /* (MediaData *format) */
     d->track = track;
     printf("movie: Decoder(%s type %d, output format %d) configured for track %d (%s%s, %dx%d, %d Hz, %d ch)\n",
            d->is_video ? "video" : "audio", d->type, d->fmt, track, mime, ext ? "" : ", NO extractor link, ", d->w, d->h, d->rate, d->ch);
+    if (!ext && d->type == 1) {                       /* H.264 the game feeds itself (CreateH264DecoderConfigurationData made the format) */
+        uint64_t csd = 0; int64_t csd_len = 0, max_in = 0;
+        if (m) { md_get_ptr(m, "nn-h264-csd", &csd); md_get_i64(m, "nn-h264-csd-size", &csd_len); }
+        if (m) { int32_t mi = 0; if (md_get_i32(m, "max-input-size", &mi)) max_in = mi; else md_get_i64(m, "max-input-size", &max_in); }
+        com_init();
+        dec_lock(d);
+        int ok = 0;
+        if (!d->mft) {
+            if (csd && csd_len > 0) { d->csd = malloc((size_t)csd_len); memcpy(d->csd, (const void *)(uintptr_t)csd, (size_t)csd_len); d->csd_len = (size_t)csd_len; }
+            if (d->csd_len && (d->w <= 0 || d->h <= 0)) {     /* the size from the SPS (after its start code and header byte) */
+                int w = 0, h = 0; double fps = 0;
+                if (d->csd_len > 5 && h264_sps_dims(d->csd + 4, d->csd_len - 4, &w, &h, &fps)) { d->w = w; d->h = h; }
+            }
+            size_t slot = (size_t)(max_in > 0 ? max_in : 0) + 0x5000;
+            if (slot < (2u << 20)) slot = 2u << 20;   /* a 1080p key frame fits; the game copies whole NAL units into the buffer */
+            unsigned char *mem = calloc((size_t)d->nin, slot);
+            if (mem) { free(d->mem); d->mem = mem; d->slot = slot; d->h264 = 1; }
+            const char *save = getenv("SSBU_MOVIE_SAVE_H264");
+            if (save && save[0]) d->save = fopen(save, "wb");
+            ok = mem && h264_open(d);
+        } else ok = 1;
+        dec_unlock(d);
+        printf("movie: Decoder(video): H.264 elementary stream %s (%dx%d, parameter sets %zu bytes, input buffers %zu KB)\n",
+               ok ? "ready" : "NOT decodable", d->w, d->h, d->csd_len, d->slot >> 10);
+        RET(ok ? ST_OK : ST_UNSUPPORTED);
+        return;
+    }
     if (!ext) { RET(ST_UNSUPPORTED); return; }
     RET(ST_OK);                                       /* input buffers are offered by Start, not here */
 }
@@ -967,8 +1226,8 @@ static void dec_GetInputBuffer(Ctx *c) {              /* (int index, Buffer *out
     uint64_t b = A2;
     if (!d || !b || i < 0 || i >= d->nin) { RET(ST_INVALID); return; }
     buf_release(c, b);
-    wr64(b + B_BASE, (uint64_t)(uintptr_t)(d->mem + (size_t)i * SLOT_BYTES));
-    wr64(b + B_CAP, SLOT_BYTES);
+    wr64(b + B_BASE, (uint64_t)(uintptr_t)(d->mem + (size_t)i * d->slot));
+    wr64(b + B_CAP, d->slot);
     wr32(b + B_OFFSET, 0); wr32(b + B_SIZE, 0);
     RET(ST_OK);
 }
@@ -979,13 +1238,25 @@ static void dec_SendInputBufferForDecode(Ctx *c) {    /* (int index, int offset,
     int64_t ts = (int64_t)A4;
     uint32_t flags = (uint32_t)c->x[5];
     if (!d || i < 0 || i >= d->nin) { RET(ST_INVALID); return; }
+    if (d->h264) {                                    /* compressed data from the game itself */
+        com_init();
+        dec_lock(d);
+        int held = d->in_state[i] == IN_CLIENT, ev = 0;
+        if (held) { d->in_count++; ev = h264_send(d, i, (int)A2, size, ts, flags); }
+        else d->dropped++;
+        dec_unlock(d);
+        dlog(d, "SendInput H.264 %d: %d bytes t=%.3f flags %x%s", i, size, ts / 1e6, flags, held ? "" : " REFUSED (index not held by the game)");
+        dec_signal(d, ev);
+        RET(held ? ST_OK : ST_INVALID);
+        return;
+    }
     dec_lock(d);
     dec_error_check(d);
     IMFSample *sample = NULL;
     int stale = 0;
     Token t;
-    memcpy(&t, d->mem + (size_t)i * SLOT_BYTES, sizeof t);
-    memset(d->mem + (size_t)i * SLOT_BYTES, 0, sizeof t);
+    memcpy(&t, d->mem + (size_t)i * d->slot, sizeof t);
+    memset(d->mem + (size_t)i * d->slot, 0, sizeof t);
     if (t.magic == TOKEN_MAGIC && t.s) {
         sample = t.s;
         if (ts <= 0) ts = t.ts;
@@ -1079,13 +1350,14 @@ static size_t copy_sample(Dec *d, OutBuf *s, unsigned char *dst, size_t cap) {
                 if (SUCCEEDED(IMF2DBuffer_Lock2D(b2, &scan, &p2)) && scan && p2 > 0) { data = scan; pitch = p2; }
                 else { IMF2DBuffer_Release(b2); b2 = NULL; }
             }
-            if (!b2 && len != need && h > 0) pitch = (long)((len * 2 / 3) / (size_t)h);    /* tightly packed rows of another stride */
+            int rows = d->plane_h > h ? d->plane_h : h;   /* the H.264 transform's planes have 1088 rows for 1080 shown */
+            if (!b2 && len != need && h > 0) pitch = (long)((len * 2 / 3) / (size_t)rows);   /* tightly packed rows of another stride */
             if (pitch < w) pitch = w;
             if (cap < need) { if (!d->warned_small) { d->warned_small = 1; printf("movie: game buffer of %zu bytes is smaller than a %dx%d NV12 frame (%zu)\n", cap, w, h, need); } }
             else {
                 const unsigned char *src = data;
                 for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, src + (size_t)y * pitch, (size_t)w);
-                const unsigned char *uv = src + (size_t)pitch * h;
+                const unsigned char *uv = src + (size_t)pitch * rows;
                 for (size_t y = 0; y < uvrows; y++) memcpy(dst + ysize + y * (size_t)w, uv + y * (size_t)pitch, (size_t)w);
                 written = need;
             }
@@ -1214,9 +1486,12 @@ static void decoder_ctor(Ctx *c) {                    /* Decoder(DecoderType, De
     d->is_video = d->type >= 1 && d->type <= 3;
     d->nin = 8;                                       /* compressed-data buffers: only bound how far the feed runs ahead of the codec */
     d->nout = d->is_video ? 48 : 64;                                     /* decoded frames the game may hold or leave queued before the codec stalls: it queues more than a second of video before showing the first frame */
-    d->mem = calloc((size_t)d->nin, SLOT_BYTES);
+    d->slot = SLOT_BYTES;
+    d->mem = calloc((size_t)d->nin, d->slot);
+    d->guest = A0;
     wr64(A0, (uint64_t)(uintptr_t)g_dec_vtable);
     wr64(A0 + 8, (uint64_t)(uintptr_t)d);
+    dec_listed(d, 1);
     printf("movie: Decoder created (type %d = %s, output format %d, mode %d, %d)\n", d->type,
            d->type == 1 ? "H.264" : d->type == 2 ? "VP8" : d->type == 3 ? "VP9" : d->type == 4 ? "AAC" : d->type == 5 ? "Vorbis" : "?",
            d->fmt, d->mode, (int)A4);
@@ -1260,13 +1535,20 @@ static unsigned br_bits(BitReader *b, int n) { unsigned v = 0; while (n-- > 0) v
 static unsigned br_ue(BitReader *b) { int z = 0; while (!br_bit(b) && z < 32) z++; return z ? ((1u << z) - 1 + br_bits(b, z)) : 0; }
 static int br_se(BitReader *b) { unsigned v = br_ue(b); return (v & 1) ? (int)((v + 1) / 2) : -(int)(v / 2); }
 static void movie_GetH264PropertiesFromSps(Ctx *c) {  /* (const uint8_t *sps, size_t len, int *width, int *height, double *frameRate) -> bool */
-    const uint8_t *sps = (const uint8_t *)(uintptr_t)A0;
-    size_t len = A1;
-    if (!sps || len < 4) { RET(0); return; }
+    int width = 0, height = 0;
+    double fps = 0.0;
+    if (!h264_sps_dims((const uint8_t *)(uintptr_t)A0, A1, &width, &height, &fps)) { RET(0); return; }
+    if (A2) wr32(A2, (uint32_t)width);
+    if (A3) wr32(A3, (uint32_t)height);
+    if (A4) { uint64_t bits; memcpy(&bits, &fps, 8); wr64(A4, bits); }
+    RET(1);
+}
+static int h264_sps_dims(const uint8_t *sps, size_t len, int *out_w, int *out_h, double *out_fps) {   /* sps = the NAL unit, header byte first */
+    if (!sps || len < 4) return 0;
     uint8_t clean[512]; size_t n = 0;                 /* strip emulation prevention bytes */
     for (size_t i = 0; i < len && n < sizeof clean; i++) { if (i >= 2 && sps[i] == 3 && sps[i - 1] == 0 && sps[i - 2] == 0) continue; clean[n++] = sps[i]; }
     BitReader b = {clean, n, 0};
-    if ((br_bits(&b, 8) & 0x1f) != 7) { RET(0); return; }
+    if ((br_bits(&b, 8) & 0x1f) != 7) return 0;
     unsigned profile = br_bits(&b, 8); br_bits(&b, 16); br_ue(&b);
     unsigned chroma = 1;
     if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128) {
@@ -1294,21 +1576,29 @@ static void movie_GetH264PropertiesFromSps(Ctx *c) {  /* (const uint8_t *sps, si
         if (br_bit(&b)) { br_ue(&b); br_ue(&b); }
         if (br_bit(&b)) { unsigned num = br_bits(&b, 32), den = br_bits(&b, 32); if (num) fps = (double)den / (2.0 * num); }
     }
-    if (A2) wr32(A2, (uint32_t)width);
-    if (A3) wr32(A3, (uint32_t)height);
-    if (A4) { double f = fps; uint64_t bits; memcpy(&bits, &f, 8); wr64(A4, bits); }
-    RET(1);
+    *out_w = width; *out_h = height; *out_fps = fps;
+    return 1;
 }
+/* The format the game passes to Decoder::Configure for an H.264 elementary stream: the parameter sets are copied (with
+ * start codes, ready to go in front of the first unit) because the game's buffers do not outlive this call. */
 static void movie_CreateH264DecoderConfigurationData(Ctx *c) {   /* (sps, spsLen, pps, ppsLen, MediaData *out) */
     MD *m = md_of(A4);
-    if (!m) { RET(ST_INVALID); return; }
-    int w = 0, h = 0;
+    const uint8_t *sps = (const uint8_t *)(uintptr_t)A0, *pps = (const uint8_t *)(uintptr_t)A2;
+    size_t sl = A1, pl = A3;
+    if (!m || !sps || !sl || sl > 4096 || pl > 4096 || (pl && !pps)) { RET(ST_INVALID); return; }
+    unsigned char *csd = malloc(8 + sl + pl);         /* owned by the MediaData entry for the process's lifetime: a few dozen bytes per movie */
+    static const unsigned char sc[4] = {0, 0, 0, 1};
+    memcpy(csd, sc, 4); memcpy(csd + 4, sps, sl);
+    if (pl) { memcpy(csd + 4 + sl, sc, 4); memcpy(csd + 8 + sl, pps, pl); }
+    int w = 0, h = 0; double fps = 0;
+    int dims = h264_sps_dims(sps, sl, &w, &h, &fps);
     md_set_str(m, "mime", "video/avc");
+    md_set_ptr(m, "nn-h264-csd", (uint64_t)(uintptr_t)csd); md_set_i64(m, "nn-h264-csd-size", (int64_t)(4 + sl + (pl ? 4 + pl : 0)));
     md_set_i64(m, "csd-0-ptr", A0); md_set_i64(m, "csd-0-size", A1);
     md_set_i64(m, "csd-1-ptr", A2); md_set_i64(m, "csd-1-size", A3);
-    (void)w; (void)h;
-    printf("movie: CreateH264DecoderConfigurationData(sps %llu bytes, pps %llu bytes): H.264 elementary streams are not implemented\n", (unsigned long long)A1, (unsigned long long)A3);
-    RET(ST_UNSUPPORTED);
+    if (dims) { md_set_i32(m, "width", w); md_set_i32(m, "height", h); }
+    printf("movie: CreateH264DecoderConfigurationData(sps %zu bytes, pps %zu bytes): %dx%d, %.2f frames/s\n", sl, pl, w, h, fps);
+    RET(ST_OK);
 }
 
 /* ---------------------------------------------------------------- registration */
@@ -1354,7 +1644,86 @@ static const ImportDef movie_mf_imports[] = {
     {"_ZNK5movie9MediaData8ContainsEPKc", mdata_Contains}, {"_ZNK5movie9MediaData12CountEntriesEv", mdata_CountEntries},
 };
 
+/* SSBU_MOVIE_H264_TEST=<file> (test only): decodes an H.264 elementary stream (Annex B) through the path of the final
+ * smash movies (h264_open, h264_send, h264_pump, copy_sample), one NAL unit per input buffer without its start code as
+ * the game's helper GetH264NalUnitStartPositionAndNalSize cuts them, prints what came out and ends the process. */
+static void h264_selftest(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { printf("h264 test: cannot open %s\n", path); fflush(stdout); ExitProcess(1); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    unsigned char *buf = malloc((size_t)n);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { printf("h264 test: cannot read %s\n", path); fflush(stdout); ExitProcess(1); }
+    fclose(f);
+    com_init();
+    Dec *d = calloc(1, sizeof *d);
+    InitializeCriticalSection(&d->cs);
+    d->type = 1; d->fmt = 4; d->is_video = 1; d->nin = 8; d->nout = 48; d->h264 = 1; d->slot = 2u << 20;
+    d->mem = calloc((size_t)d->nin, d->slot);
+    const unsigned char *end = buf + n, *sps = NULL, *pps = NULL; size_t sl = 0, pl = 0;
+    for (const unsigned char *p = find_start_code(buf, end); p && (!sps || !pps); ) {
+        const unsigned char *nal = p + 3, *next = find_start_code(nal, end), *ne = next ? next : end;
+        while (ne > nal && ne[-1] == 0) ne--;
+        if ((nal[0] & 0x1f) == 7 && !sps) { sps = nal; sl = (size_t)(ne - nal); }
+        if ((nal[0] & 0x1f) == 8 && !pps) { pps = nal; pl = (size_t)(ne - nal); }
+        p = next;
+    }
+    if (!sps || !pps) { printf("h264 test: no SPS / PPS in %s\n", path); fflush(stdout); ExitProcess(1); }
+    d->csd = malloc(8 + sl + pl); d->csd_len = 8 + sl + pl;
+    memcpy(d->csd, "\0\0\0\1", 4); memcpy(d->csd + 4, sps, sl); memcpy(d->csd + 4 + sl, "\0\0\0\1", 4); memcpy(d->csd + 8 + sl, pps, pl);
+    double fps = 0; h264_sps_dims(sps, sl, &d->w, &d->h, &fps);
+    if (!h264_open(d)) { printf("h264 test: no decoder\n"); fflush(stdout); ExitProcess(1); }
+    size_t cap = (size_t)d->w * d->h * 2;
+    unsigned char *frame = malloc(cap);
+    /* the game's side: its feed thread fills every input buffer the decoder offers (one NAL unit each, then end of stream
+     * into each further one), its render path takes one decoded frame per game frame */
+    unsigned long long units = 0, pictures = 0, frames = 0, eos = 0, sum = 0, offers_after_eos = 0, game_frames = 0; double luma0 = -1;
+    int64_t ts = 0;
+    const unsigned char *p = find_start_code(buf, end);
+    for (int i = 0; i < d->nin; i++) { d->in_state[i] = IN_OFFERED; d->in_list[i] = i; }
+    d->in_n = d->nin;
+    while (!eos && game_frames < 100000) {
+        while (d->in_n > 0) {
+            int i = d->in_list[0];
+            memmove(d->in_list, d->in_list + 1, (size_t)(d->in_n - 1) * sizeof d->in_list[0]); d->in_n--;
+            d->in_state[i] = IN_CLIENT; d->in_count++;
+            if (!p) { h264_send(d, i, 0, 0, ts, FLAG_EOS); continue; }   /* the slots the game still held get one each, then are kept */
+            const unsigned char *nal = p + 3, *next = find_start_code(nal, end), *ne = next ? next : end;
+            while (ne > nal && ne[-1] == 0) ne--;
+            size_t len = (size_t)(ne - nal);
+            int type = nal[0] & 0x1f;
+            memcpy(d->mem + (size_t)i * d->slot, nal, len < d->slot ? len : d->slot);
+            units++;
+            h264_send(d, i, 0, (int)(len < d->slot ? len : d->slot), ts, 0);
+            if (type == 1 || type == 5) { pictures++; ts += (int64_t)(1e6 / (fps > 0 ? fps : 30)); }
+            p = next;
+        }
+        game_frames++;
+        if (d->out_n > 0) {                           /* one frame shown per game frame */
+            int o = d->out_list[0];
+            memmove(d->out_list, d->out_list + 1, (size_t)(d->out_n - 1) * sizeof d->out_list[0]); d->out_n--;
+            size_t got = copy_sample(d, &d->out[o], frame, cap);
+            if (got) {
+                frames++;
+                for (size_t k = 0; k < got; k += 97) sum = sum * 31 + frame[k];
+                if (luma0 < 0) { double s = 0; for (int k = 0; k < d->w * d->h; k++) s += frame[k]; luma0 = s / ((double)d->w * d->h); }
+            }
+            if (d->out[o].flags & FLAG_EOS) eos++;
+            if (d->out[o].s) IMFSample_Release(d->out[o].s);
+            memset(&d->out[o], 0, sizeof d->out[o]);
+            int before = d->in_n;
+            h264_pump(d);
+            if (d->eos_in && d->in_n > before) offers_after_eos += (unsigned long long)(d->in_n - before);   /* a slot handed out again */
+        }
+    }
+    printf("h264 test: %s: %llu NAL units, %llu pictures sent, %llu frames out (%dx%d, %.2f/s, planes of %d rows) in %llu game frames, "
+           "%llu frames thrown away, input buffers offered after the end of stream: %llu, first frame mean luma %.1f, checksum %016llx, end of stream %s\n",
+           path, units, pictures, frames, d->w, d->h, fps, d->plane_h, game_frames, d->dropped, offers_after_eos, luma0, sum, eos ? "delivered" : "MISSING");
+    fflush(stdout);
+    ExitProcess(frames && frames == pictures && eos && !d->dropped && !offers_after_eos ? 0 : 1);
+}
+
 void register_movie_mf_imports(void) {
+    if (getenv("SSBU_MOVIE_H264_TEST")) h264_selftest(getenv("SSBU_MOVIE_H264_TEST"));
     const char *env = getenv("SSBU_MOVIE");
     if (env && atoi(env) == 0) { printf("movie: SSBU_MOVIE=0, keeping the failing placeholder\n"); return; }
     g_log = getenv("SSBU_MOVIE_LOG") != NULL;
