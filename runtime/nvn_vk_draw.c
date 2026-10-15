@@ -2811,8 +2811,7 @@ static void vkd_shutdown(void) {
     if (RS_ON && rs_ui_native()) printf("nvn_vk_scale: SSBU_VK_UI_NATIVE=1: the window's textures are kept at the game's size; passes with such a colour target and a SCALED depth target (drawn without depth): %lld\n", (long long)g_rs_mixed);
     if (RS_ON) printf("nvn_vk_scale: resolution scale %.3f: %lld images made scaled, %lld fragment stages translated in this run for it (%lld of them read the pixel position, %lld fetch texels by integer position), %lld uploads into and %lld read-backs from a scaled image, %lld copies / blits touching one\n",
                       (double)rs_scale(), (long long)g_rs_images, (long long)g_rs_stages, (long long)g_rs_fcs, (long long)g_rs_tf, (long long)g_rs_up, (long long)g_rs_down, (long long)g_rs_blits);
-    if (RS_ON && rs_scale() > 1.0f) printf("nvn_vk_scale: supersampling: %lld 2:1 reduction steps at the present (rs_reduce)
-", (long long)g_rs_reduce_steps);
+    if (RS_ON && rs_scale() > 1.0f) printf("nvn_vk_scale: supersampling: %lld 2:1 reduction steps at the present (rs_reduce)\n", (long long)g_rs_reduce_steps);
     m4_stop();
     pcache_save();
     if (g_pcache) { vkDestroyPipelineCache(V.device, g_pcache, NULL); g_pcache = NULL; }
