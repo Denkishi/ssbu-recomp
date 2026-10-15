@@ -218,6 +218,7 @@ static LONG64 g_cs_steps, g_cs_hist[4];      /* game steps (1 + refreshes skippe
  * VSync Count Thread has counted, + 0x140 = the count at its previous present. Right after this call the game computes
  * steps = max(count - last, 1) (0x710386fc30) and then stores last = count. */
 void display_clock_sample(uint64_t index_ptr) {
+    { void hfr_picture(void); hfr_picture(); }      /* hfr.c: once per picture, before the game's next count of updates */
     if (g_lockstep && index_ptr) g_wnd_count_addr = index_ptr - 0x30 + 0x138;
     if (!g_clockstat || !index_ptr) return;
     uint64_t count = rd64(index_ptr - 0x30 + 0x138), last = rd64(index_ptr - 0x30 + 0x140);
