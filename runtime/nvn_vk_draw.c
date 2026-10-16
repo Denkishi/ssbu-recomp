@@ -2300,6 +2300,35 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
 /* ---------------------------------------------------------------- copies */
 /* CopyBufferToTexture and WriteTexels: texels from memory into a region of one level. The image is not synchronised
  * with the texture's own memory first (the OpenGL path does not either). */
+/* The layout of the texels of a copy between a texture and the game's memory (region r: x, y, z, w, h, d). In the game's
+ * memory a row of blocks starts every `pitch` bytes (the copy row stride, uncompressed formats; else rows are tight) and a
+ * layer / slice every `ipitch` bytes (the copy image stride, only with a row stride; else tight). Vulkan's copy is always
+ * given the texels PACKED TIGHT (bufferRowLength = bufferImageHeight = 0, always valid): when the game's strides are not
+ * tight the rows are moved between that and the game's memory on the CPU, one row at a time, in order (a row stride under
+ * the row's size makes the rows overlap, as the console's copy engine would write them).
+ * Before (2026-10-15) the strides went into the copy (bufferRowLength = row stride / bytes per texel, bufferImageHeight =
+ * image stride / row stride) and the buffer was sized from them. The game reads back a 1024 x 1024 RGBA8 region at the
+ * start of some fights with the strides of an earlier 320 x 360 copy still set (row stride 1280, image stride 460800:
+ * run h6): bufferRowLength 320 is under the width (invalid in Vulkan) and the buffer had 460800 bytes for a copy of about
+ * 4 MB, so the read-back wrote past its buffer. On NVIDIA (RTX 4060 Laptop,
+ * driver 610.62) that is "VK_ERROR_DEVICE_LOST" at the next submission: runs kamui2, memtest/mem_new, b1 and r1 (frame
+ * ~130 after a fight's start, right after the draws of program #7780 that get a dummy cube); in r1 VK_EXT_device_fault
+ * said "write to an invalid address" and the checkpoints (SSBU_VK_CHECKPOINTS=1) named this read-back copy. */
+typedef struct { uint64_t rowb, nrows, pitch, ipitch, size, span; int nz, direct; } CopyLayout;
+static void copy_layout(const VTex *vt, const int *r, int64_t row_stride, int64_t image_stride, int nz, CopyLayout *L) {
+    L->nz = nz > 0 ? nz : 1;
+    L->rowb = ((uint64_t)(r[3] > 0 ? r[3] : 0) + vt->bw - 1) / vt->bw * vt->bpb; L->nrows = ((uint64_t)(r[4] > 0 ? r[4] : 0) + vt->bh - 1) / vt->bh;
+    L->pitch = row_stride > 0 && vt->bw == 1 && vt->bpb ? (uint64_t)row_stride / vt->bpb * vt->bpb : L->rowb;      /* as GL_PACK_ROW_LENGTH = stride / bytes per texel */
+    L->ipitch = image_stride > 0 && row_stride > 0 && vt->bw == 1 ? (uint64_t)image_stride / (uint64_t)row_stride * L->pitch : L->pitch * L->nrows;
+    L->size = L->rowb * L->nrows * (uint64_t)L->nz;      /* the packed texels: what the Vulkan copy reads or writes */
+    L->span = L->nrows ? (uint64_t)(L->nz - 1) * L->ipitch + (L->nrows - 1) * L->pitch + L->rowb : 0;      /* the bytes of the game's memory the region covers */
+    L->direct = L->pitch == L->rowb && (L->nz == 1 || L->ipitch == L->rowb * L->nrows);
+    if (vt->bw == 1 && row_stride > 0 && (L->pitch < L->rowb || (image_stride > 0 && L->ipitch < L->pitch * L->nrows))) {      /* the strides the copy was given before */
+        static int n;
+        if (n++ < 10) printf("nvn_vk: a copy of a %d x %d x %d region (block size %d bytes) with row stride %lld and image stride %lld: smaller than the region; packed copy, laid out at those strides (before: an invalid copy that went past its buffer)\n",
+                             r[3], r[4], L->nz, vt->bpb, (long long)row_stride, (long long)image_stride);
+    }
+}
 static void write_region(Tex *t, const View *vp, const int *r, const void *data, int64_t row_stride, int64_t image_stride) {
     View v;
     memset(&v, 0, sizeof v);
@@ -2308,15 +2337,19 @@ static void write_region(Tex *t, const View *vp, const int *r, const void *data,
     if (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || vt->decode || vt->expand) { nvn_vk_missing("CopyBufferToTexture / WriteTexels into a depth, ASTC-decoded or 3-component texture"); return; }
     int level = (v.set & 0x81) == 0x81 ? v.lvl0 : 0, layer = (v.set & 0x82) == 0x82 ? v.lay0 : 0, depth = r[5] > 0 ? r[5] : 1;
     if (t->b.target != 2 && t->b.target != 4 && t->b.target != 9 && t->b.target != 8) layer = 0; else if (t->b.target != 2) layer += r[2];
-    uint64_t rowlen = row_stride && vt->bw == 1 ? (uint64_t)(row_stride / vt->bpb) : 0, rows = image_stride && row_stride && vt->bw == 1 ? (uint64_t)(image_stride / row_stride) : 0;
-    uint64_t bw = ((uint64_t)(rowlen ? rowlen : (uint64_t)r[3]) + vt->bw - 1) / vt->bw, bh = ((uint64_t)(rows ? rows : (uint64_t)r[4]) + vt->bh - 1) / vt->bh, size = bw * bh * vt->bpb * (uint64_t)depth;
-    uint64_t off = ring_raw(data, size);
+    /* the texels go into the stream ring packed tight (see copy_layout); only the slices the copy takes (one layer) */
+    CopyLayout L;
+    copy_layout(vt, r, row_stride, image_stride, vt->is3d ? depth : 1, &L);
+    uint8_t *packed = L.direct ? NULL : malloc((size_t)L.size);
+    if (packed) for (int z = 0; z < L.nz; z++) for (uint64_t y = 0; y < L.nrows; y++) memcpy(packed + (z * L.nrows + y) * L.rowb, (const uint8_t *)data + z * L.ipitch + y * L.pitch, (size_t)L.rowb);
+    uint64_t off = ring_raw(packed ? packed : data, L.size);
+    free(packed);
     pass_end(); cmd_begin();
-    if (vt->rs) { rs_upload(vt, level, layer, off, (uint32_t)rowlen, (uint32_t)rows, r[0], r[1], r[3], r[4]); t->gpu_written = 1; t->uploaded = 1; return; }      /* track O */
+    if (vt->rs) { rs_upload(vt, level, layer, off, 0, 0, r[0], r[1], r[3], r[4]); t->gpu_written = 1; t->uploaded = 1; return; }      /* track O */
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy c;
     memset(&c, 0, sizeof c);
-    c.bufferOffset = off; c.bufferRowLength = (uint32_t)rowlen; c.bufferImageHeight = (uint32_t)rows;
+    c.bufferOffset = off;
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)layer; c.imageSubresource.layerCount = 1;
     c.imageOffset.x = r[0]; c.imageOffset.y = r[1]; c.imageOffset.z = vt->is3d ? r[2] : 0;
     c.imageExtent.width = (uint32_t)r[3]; c.imageExtent.height = (uint32_t)r[4]; c.imageExtent.depth = (uint32_t)(vt->is3d ? depth : 1);
@@ -2343,8 +2376,9 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     if (vt->decode || vt->expand || vt->samples > 1) { nvn_vk_missing("ReadTexels / CopyTextureToBuffer of an ASTC-decoded, 3-component or multisample texture"); return 0; }
     if (vt->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) { nvn_vk_missing("ReadTexels / CopyTextureToBuffer of a combined depth-stencil texture"); return 0; }
     int level = vp && (vp->set & 0x81) == 0x81 ? vp->lvl0 : 0, layer = vp && (vp->set & 0x82) == 0x82 ? vp->lay0 : 0, depth = r[5] > 0 ? r[5] : 1;
-    uint64_t rowlen = row_stride && vt->bw == 1 ? (uint64_t)(row_stride / vt->bpb) : 0, rows = image_stride && row_stride && vt->bw == 1 ? (uint64_t)(image_stride / row_stride) : 0;
-    uint64_t bw = ((uint64_t)(rowlen ? rowlen : (uint64_t)r[3]) + vt->bw - 1) / vt->bw, bh = ((uint64_t)(rows ? rows : (uint64_t)r[4]) + vt->bh - 1) / vt->bh, size = bw * bh * vt->bpb * (uint64_t)depth;
+    CopyLayout L;
+    copy_layout(vt, r, row_stride, image_stride, depth, &L);
+    uint64_t size = L.size;
     if (!size) return 0;
     VMem mem;
     VkBuffer buf = vbuf_new(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mem);
@@ -2353,7 +2387,6 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
     VkImageLayout was = vt->layout;
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     memset(&c, 0, sizeof c);
-    c.bufferRowLength = (uint32_t)rowlen; c.bufferImageHeight = (uint32_t)rows;
     c.imageSubresource.aspectMask = vt->aspect; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)(layer + r[2]); c.imageSubresource.layerCount = vt->is3d ? 1 : (uint32_t)depth;
     c.imageOffset.x = r[0]; c.imageOffset.y = r[1]; c.imageOffset.z = vt->is3d ? r[2] : 0;
     c.imageExtent.width = (uint32_t)r[3]; c.imageExtent.height = (uint32_t)r[4]; c.imageExtent.depth = (uint32_t)(vt->is3d ? depth : 1);
@@ -2380,14 +2413,16 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
         c.imageSubresource.mipLevel = 0; c.imageSubresource.baseArrayLayer = 0; c.imageSubresource.layerCount = 1; c.imageOffset.x = c.imageOffset.y = c.imageOffset.z = 0;
         vkCmdCopyImageToBuffer(R.cmd, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
         g_rs_down++;
-    } else
-    vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    } else {
+        vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
+    }
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
     cmd_wait_all();
-    memcpy(out, mem.map, (size_t)size);
+    if (L.direct) memcpy(out, mem.map, (size_t)size);
+    else for (int z = 0; z < L.nz; z++) for (uint64_t y = 0; y < L.nrows; y++) memcpy((uint8_t *)out + z * L.ipitch + y * L.pitch, (const uint8_t *)mem.map + (z * L.nrows + y) * L.rowb, (size_t)L.rowb);
     vkDestroyBuffer(V.device, buf, NULL); vmem_free(mem);
     R.readbacks++;
-    return (size_t)size;
+    return (size_t)L.span;
 }
 static void vk_read_texels(void *arg) {
     ReadJob *j = arg;
