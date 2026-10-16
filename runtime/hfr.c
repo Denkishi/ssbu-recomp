@@ -29,7 +29,8 @@
  *                 updates every battle object (0x710137b3f0) with a per-update record built from it (0x71003ac660:
  *                 logic on update 0 of a cycle, the others through the motion module's sub-frame slots). When the
  *                 byte at 0x71052b82e8 is set the cycle is not advanced (0x710135ca30 / 0x710135cc10); the objects are
- *                 still updated, told so. [NOT MEASURED: whether the game's pause uses it or stops calling the step.]
+ *                 still updated, told so. MEASURED 2026-10-16 (SSBU_HFR_TRACE, pause in a 120 Hz fight): the game's
+ *                 pause is this: the step goes on running every update, the cycle and the match timer stand still.
  *   0x71014a2cd0  the largest N of the slow request table *(0x71052c2610) + 0x20.. (enabled, N byte pairs; at least 1).
  *                 The step calls it (BL at 0x710135cadc) when the table's dirty flag (+0x40) is set, stores the clamped
  *                 result (1..100) as the N asked for and clears the flag; the asked N becomes the cycle's N at the next
@@ -59,6 +60,7 @@
 #define FN_RATE_REQ_LUA 0x7101fca6d0ULL                /* Lua "rate_request": pushes 1 / N (f32 at top, type 3 at top + 8; top = L + 0x10), returns 1 */
 #define SLOW_TABLE_PTR 0x71052c2610ULL                 /* -> the slow request table; + 0x40 = its dirty flag */
 #define SLOW 0x71052c4184ULL                           /* the slow state (see above) */
+#define SLOW_STOPPED 0x71052b82e8ULL                   /* u32: not 0 = the step does not advance the cycle (the game's pause: measured 2026-10-16) */
 /* The update rate, 0x710523c004 (app::sv_information::get_delta_frame returns it; about 45 readers compute 60 / rate
  * frames per update: the match's sequencing, the battle's set-up and entrance, ...). Those run on every update, outside
  * the slow divisor: at 120 updates per second they would run twice as fast. Writers [SEEN]: 60 at nine places, 120 at
@@ -129,8 +131,9 @@ int hfr_rate(void) { return g_setting == 120 && g_live && g_doubled_now ? 120 : 
 /* TEST ONLY (SSBU_SHOT_BATTLE lines): the update within the slow cycle as the render thread sees it, -1 at 60 Hz. */
 int hfr_shot_phase(void) { return g_setting == 120 ? (int)rd8(SLOW + 6) : -1; }
 /* TEST ONLY (nnhid.c SSBU_SEQ without SSBU_DETERMINISTIC): 1 when the next update is one this mode adds, so that the input
- * sequence, which counts the console's updates, does not move for it. From the game's slow state, not from time. */
-int hfr_seq_skip(void) { return hfr_rate() == 120 && ((rd8(SLOW + 6) + 1u) & 1u); }
+ * sequence, which counts the console's updates, does not move for it. From the game's slow state, not from time. While
+ * the cycle stands still (pause) every update counts (else a pause on an odd phase would hold the sequence for good). */
+int hfr_seq_skip(void) { return hfr_rate() == 120 && !rd32(SLOW_STOPPED) && ((rd8(SLOW + 6) + 1u) & 1u); }
 
 static void battle_over(void) {
     InterlockedExchange(&g_live, 0);
