@@ -26,9 +26,14 @@ static inline uint32_t recip_estimate(uint32_t a) {            /* a in 256..511 
 static inline uint32_t recip_sqrt_estimate(uint32_t a) {       /* a in 128..511 */
     if (a < 256) a = a * 2 + 1;
     else { a = (a >> 1) << 1; a = (a + 1) * 2; }
-    uint32_t b = 512;
-    while ((uint64_t)a * (b + 1) * (b + 1) < (1ull << 28)) b++;
-    return (b + 1) / 2;
+    /* The manual's loop (b = 512; while (a * (b + 1)^2 < 2^28) b++; return (b + 1) / 2) took up to ~500 steps and was
+     * 8.7% of the game thread in a 2-fighter match (2026-10-15): k = b + 1 is found from sqrt and corrected exactly
+     * instead (identical for every a, checked for 1..4095). */
+    uint64_t k = (uint64_t)sqrt((double)(1u << 28) / a);
+    if (k < 513) k = 513;
+    while (k > 513 && (uint64_t)a * (k - 1) * (k - 1) >= (1ull << 28)) k--;
+    while ((uint64_t)a * k * k < (1ull << 28)) k++;
+    return (uint32_t)(k / 2);
 }
 
 /* Generic implementations on (sign, biased exponent, fraction left-aligned to 52 bits). */
