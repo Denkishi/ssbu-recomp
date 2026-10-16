@@ -1664,8 +1664,28 @@ static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 /* SSBU_VK_CBKEEP: the buffer's bytes go to guest memory. With the snapshot of the fill (SSBU_VK_CBMERGE, the default) only
  * the words compute changed since the fill are written, and a word the game changed since then stays the game's. */
+/* The guest range a kept buffer lands in is still committed read-write memory. The game can give the memory back while a
+ * buffer is kept: when an attract demo ends, its fighters' modules are unloaded and their memory decommitted, and the
+ * landing that followed wrote into a page without access (Linux build, idle run on the title screen, 2026-10-16: a crash
+ * in cb_keep_back on the render thread 4.5 minutes in, right after nn::ro::UnloadModule of four fighters). */
+static LONG64 g_ck_gone;
+static int cb_guest_writable(uint64_t a, uint64_t n) {
+    for (uint64_t p = a, end = a + n; p < end; ) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(P(p), &mi, sizeof mi) || mi.State != MEM_COMMIT || !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) return 0;
+        uint64_t next = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (next <= p) return 0;
+        p = next;
+    }
+    return 1;
+}
 static void cb_keep_back(CB *c, const uint8_t *src) {      /* src: the bytes in ordinary memory already (the copy of an asynchronous landing), or NULL = the buffer itself */
     if (!c->dirty && !c->stale) return;
+    if (!cb_guest_writable(c->addr, c->size)) {             /* the game gave the memory back: nothing to land in */
+        if (InterlockedIncrement64(&g_ck_gone) <= 5)
+            printf("nvn_vk_cbkeep: a kept compute buffer's guest range %llx + %llu is no longer committed memory: its results are dropped\n", (unsigned long long)c->addr, (unsigned long long)c->size);
+        return;
+    }
 #ifdef R1_MARK
     { void r1_wrote(uint64_t, uint64_t); r1_wrote(c->addr, c->size); }      /* R1 (r1_state.c): compute results written back into guest memory are marked */
 #endif
