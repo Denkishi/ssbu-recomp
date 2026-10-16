@@ -3562,7 +3562,11 @@ static void job_present(void *arg) {
         if (j->win->crop[2] > 0 && j->win->crop[3] > 0) memcpy(sr, j->win->crop, sizeof sr);
         glBindFramebuffer(GL_READ_FRAMEBUFFER_, g_fbo_read);
         glFramebufferTexture(GL_READ_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, t->o.gl, 0);
-        glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[2], sr[1] + sr[3], 0, r.bottom, r.right, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        void display_fit(int sw, int sh, int dw, int dh, int out[4]);      /* display.c: the picture keeps its 16:9 shape */
+        int d4[4];
+        display_fit(16, 9, (int)r.right, (int)r.bottom, d4);
+        if (d4[2] != r.right || d4[3] != r.bottom) { glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT); }
+        glBlitFramebuffer(sr[0], sr[1], sr[0] + sr[2], sr[1] + sr[3], d4[0], r.bottom - d4[1], d4[0] + d4[2], r.bottom - d4[1] - d4[3], GL_COLOR_BUFFER_BIT, GL_LINEAR);
         if (g_drawlog_frame >= 0 && frame == g_drawlog_frame + 1) save_bmp("frame_drawlog.bmp", t);      /* the frame the draw log describes */
         { int step = nvn_front_take_step_shot(); if (step) { char path[300]; const char *dir = getenv("SSBU_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp(path, t); } }
         nvn_front_draw_tag_clear();
