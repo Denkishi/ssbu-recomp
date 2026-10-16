@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <wincrypt.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -760,12 +761,52 @@ int nnfs_selftest(Ctx *c) {
     return bad;
 }
 
-/* ---- nn::account: one local user with a fixed id */
-static void acc_ListAllUsers(Ctx *c) { wr32(A0, 1); if ((int)A2 > 0) { wr64(A1, 1); wr64(A1 + 8, 0); } RET(0); }
-static volatile LONG g_acc_user_open;                    /* the one local user {1, 0} has been opened (there is no CloseUser import) */
-int account_user_is_open(uint64_t lo, uint64_t hi) { return g_acc_user_open && lo == 1 && hi == 0; }
-static void acc_TryOpenPreselectedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(1); }
-static void acc_GetUserId(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0); }
+/* ---- nn::account: one local user.
+ * Its id is {1, 0}, unless the machine plays local wireless over the internet (config\online.ini, ldn_online.inc):
+ * then players must be told apart as on consoles, where every user has a random 128-bit id. The id is then read
+ * from config\account.txt (32 hex digits), written there once from random bytes; SSBU_ACCOUNT_UID=<32 hex digits>
+ * overrides both (two copies of the game on one PC). */
+static uint64_t g_uid[2] = {1, 0};
+static void account_uid_init(void) {
+    static volatile LONG done;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) { while (done != 2) SwitchToThread(); return; }
+    char exe[MAX_PATH], path[MAX_PATH + 64], text[80] = "";
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    char *slash = strrchr(exe, '\\');
+    if (slash) *slash = 0;
+    const char *env = getenv("SSBU_ACCOUNT_UID");
+    if (env && strlen(env) >= 32) snprintf(text, sizeof text, "%s", env);
+    else {
+        snprintf(path, sizeof path, "%s\\..\\config\\account.txt", exe);
+        FILE *f = fopen(path, "r");
+        if (f) { if (!fgets(text, sizeof text, f)) text[0] = 0; fclose(f); }
+        else {
+            char ini[MAX_PATH + 64];
+            snprintf(ini, sizeof ini, "%s\\..\\config\\online.ini", exe);
+            if (GetFileAttributesA(ini) != INVALID_FILE_ATTRIBUTES) {
+                uint8_t r[16] = {0};
+                HCRYPTPROV prov;
+                if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 16, r); CryptReleaseContext(prov, 0); }
+                for (int i = 0; i < 16; i++) sprintf(text + i * 2, "%02x", r[i]);
+                if ((f = fopen(path, "w"))) { fprintf(f, "%s\n", text); fclose(f); }
+            }
+        }
+    }
+    if (strlen(text) >= 32) {
+        char lo[17], hi[17];
+        memcpy(hi, text, 16); hi[16] = 0; memcpy(lo, text + 16, 16); lo[16] = 0;
+        uint64_t h = _strtoui64(hi, NULL, 16), l = _strtoui64(lo, NULL, 16);
+        if (h || l) { g_uid[0] = l; g_uid[1] = h; }
+        printf("nn::account: user id %016llx%016llx\n", (unsigned long long)g_uid[1], (unsigned long long)g_uid[0]);
+    }
+    done = 2;
+}
+void account_uid(uint64_t *lo, uint64_t *hi) { account_uid_init(); *lo = g_uid[0]; *hi = g_uid[1]; }   /* also nnmisc.c */
+static void acc_ListAllUsers(Ctx *c) { account_uid_init(); wr32(A0, 1); if ((int)A2 > 0) { wr64(A1, g_uid[0]); wr64(A1 + 8, g_uid[1]); } RET(0); }
+static volatile LONG g_acc_user_open;                    /* the one local user has been opened (there is no CloseUser import) */
+int account_user_is_open(uint64_t lo, uint64_t hi) { account_uid_init(); return g_acc_user_open && lo == g_uid[0] && hi == g_uid[1]; }
+static void acc_TryOpenPreselectedUser(Ctx *c) { account_uid_init(); wr64(A0, g_uid[0]); wr64(A0 + 8, g_uid[1]); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(1); }
+static void acc_GetUserId(Ctx *c) { account_uid_init(); wr64(A0, g_uid[0]); wr64(A0 + 8, g_uid[1]); RET(0); }
 /* The nickname of the console user is the name of the Windows user (SSBU_NICKNAME overrides): UTF-8, at most 32
  * bytes, NUL-terminated, in the 33-byte Nickname. */
 static void acc_GetNickname(Ctx *c) {
