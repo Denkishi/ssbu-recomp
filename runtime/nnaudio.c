@@ -27,6 +27,7 @@
  * guest's event is signalled then. Without an output device the buffers are released by the clock instead.
  *
  * Environment: SSBU_WAV=<file>          write the first 30 s of what is played to a WAV file
+ *              SSBU_WAV_FROM=<s>        start that recording after s seconds of played audio (default 0)
  *              SSBU_AUDIO_CHANNELS=6    grant 6 channels when the game asks for them (default: stereo, the game
  *                                       then does its own mix-down, as on a console set to stereo output)
  *              SSBU_AUDIO_LOG=1         print the statistics every second instead of every 10 s
@@ -110,7 +111,7 @@ static unsigned long long g_frames_submitted, g_starved;
 static FILE *g_wav;
 static int g_tone_left, g_heard;
 static unsigned long long g_tone_phase;
-static unsigned long long g_wav_bytes;
+static unsigned long long g_wav_bytes, g_wav_skip;      /* g_wav_skip: frames still to pass before the recording starts */
 
 static LONGLONG now_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 
@@ -284,6 +285,7 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
     if (wav && !g_wav) {
         g_wav = fopen(wav, "wb");
         g_wav_bytes = 0;
+        g_wav_skip = getenv("SSBU_WAV_FROM") ? (unsigned long long)atoi(getenv("SSBU_WAV_FROM")) * (unsigned)g_rate : 0;
         if (g_wav) wav_header();
     }
     g_tone_left = getenv("SSBU_AUDIO_TONE") ? g_rate / 512 : 0;
@@ -334,7 +336,8 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
                 if ((g_total_appended & 63) == 0) fflush(hf);
             }
         }
-        if (g_wav && g_wav_bytes < (unsigned long long)WAV_SECONDS * (unsigned)g_rate * 4) {
+        if (g_wav && g_wav_skip) g_wav_skip = g_wav_skip > frames ? g_wav_skip - frames : 0;
+        else if (g_wav && g_wav_bytes < (unsigned long long)WAV_SECONDS * (unsigned)g_rate * 4) {
             fwrite(s->pcm, 4, frames, g_wav);
             g_wav_bytes += (unsigned long long)frames * 4;
         }
