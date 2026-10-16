@@ -1,12 +1,32 @@
-/* Included by nnnet_c4a.inc: nn::ldn (local wireless) carried over the internet through a room server
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Structure layouts, result codes and the host / station design follow, without copied code:
+ *   Eden  src/core/hle/service/ldn/ldn_types.h      (GPL-3.0-or-later; yuzu lineage)
+ *   Eden  src/core/hle/service/ldn/ldn_results.h    (GPL-2.0-or-later / GPL-3.0-or-later)
+ *   Eden  src/core/hle/service/ldn/lan_discovery.cpp (GPL-2.0-or-later, yuzu Emulator Project)
+ * See tools/online/NOTICE. Compiled only into a build made with scripts\setup.py --ldn-online on (SSBU_LDN_ONLINE).
+ *
+ * Included by nnnet_c4a.inc: nn::ldn (local wireless) carried over the internet through a room server
  * (tools/online/ldn_room_server.py), and the virtual-address path of the socket layer that goes with it.
  *
  * Configuration: <exe folder>\..\config\online.ini (or the environment, which wins):
- *     server = host:port          SSBU_LDN_SERVER
- *     room   = <password>         SSBU_LDN_ROOM      players with the same password meet in the same room
- *     name   = <player name>      SSBU_LDN_NAME      shown in the server's log only
- * Without a server and a room, nothing changes: nn::ldn::Initialize answers "wireless off" (0x2ecb) as before.
- * tools/online/online.ini.example is a template. SSBU_LDN_TRACE=1 logs every nn::ldn call and every game datagram.
+ *     server   = host:port        SSBU_LDN_SERVER     a host the user types; there is no default server
+ *     room     = <password>       SSBU_LDN_ROOM       players with the same password meet in the same room
+ *     nickname = <name>           SSBU_LDN_NICKNAME   REQUIRED to go online: the name the other players see (the
+ *                                                     game's account nickname); the Windows user name is never sent
+ * Without a server, a room and a nickname, nothing changes: nn::ldn::Initialize answers "wireless off" (0x2ecb).
+ * Refused as well while runahead = on (graphics.ini): a speculative frame would send and receive the game's packets,
+ * and rolling it back would not roll back the other player. tools/online/online.ini.example is a template.
+ * SSBU_LDN_TRACE=1 logs every nn::ldn call and every game datagram. The log never holds the server address, the room
+ * password or a real network address (virtual addresses 169.254.1.N only).
+ *
+ * Everything that comes from the room is untrusted: frame lengths are bounded (64 KB), messages shorter than their
+ * structure are dropped, and every NetworkInfo / NodeInfo from another player is sanitized (counts, lengths, string
+ * ends) before the game can read it. Guest memory is written only inside the game's own nn::ldn and recv calls; the
+ * receiving threads write host memory only. ldn_fuzz_selftest (SSBU_SDK_SELFTEST) feeds random messages through it.
+ *
+ * Both players must run the same game: a build fingerprint (main.elf, the game DLL, the script-module folder, and the
+ * switches that change fighters: SSBU_MODS, SSBU_CHARACTERS, SSBU_LOOSE_FILES, SSBU_FIGHTER_SRC / _BIN, fighters_bin)
+ * is sent on joining; the server refuses a member whose fingerprint differs from the room's.
  *
  * What the game sees: a console whose local-wireless radio works. Initialize connects to the server, which hands out a
  * virtual address 169.254.1.N/24. The LDN state machine follows [eden] hle/service/ldn/lan_discovery.cpp (the yuzu
@@ -21,6 +41,8 @@
  * SendTo a virtual address is wrapped and sent to the server over UDP; datagrams from the server are handed to the
  * host socket of that virtual port through a local injector socket, with a 6-byte header (source address and port)
  * that Recv / RecvFrom strip again. Poll keeps working because the data really arrives on the host socket. */
+
+#include <psapi.h>                                  /* K32EnumProcessModules: the game DLL of the fingerprint */
 
 #define LDN_RESULT(d) (203u | ((uint32_t)(d) << 9))
 #define LDN_ADVERTISE_TOO_LARGE LDN_RESULT(10)
@@ -59,7 +81,8 @@ typedef struct { uint16_t vport; uint16_t host_port; } LdnPort;
 static struct {
     CRITICAL_SECTION cs;
     int cs_ready, configured, online;
-    char host[256], room[128], name[64];
+    char host[256], room[128], nickname[33];
+    uint8_t fingerprint[8];
     uint16_t port;
     SOCKET tcp, udp, inj;
     struct sockaddr_in server;
@@ -80,6 +103,7 @@ static struct {
     uint16_t next_vport;
 } g_ldn;
 
+static int g_ldn_fuzzing;                                /* ldn_fuzz_selftest: the join / leave lines are not printed */
 static int ldn_trace(void) { static int t = -1; if (t < 0) t = getenv("SSBU_LDN_TRACE") != NULL; return t; }   /* SSBU_LDN_TRACE: every call and datagram */
 static uint32_t ldn_rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void ldn_wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
@@ -90,6 +114,7 @@ static int ldn_is_virtual(uint32_t be_addr) {             /* address as stored i
 }
 
 /* ---------------------------------------------------------------- configuration */
+int gfx_runahead(void);                                   /* gfx_options.c: runahead = on | off */
 static void ldn_trim(char *s) {
     char *e = s + strlen(s);
     while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
@@ -103,7 +128,7 @@ static void ldn_load_config(void) {
     g_ldn.cs_ready = 1;
     g_ldn.tcp = g_ldn.udp = g_ldn.inj = INVALID_SOCKET;
     g_ldn.next_vport = 49152;
-    char exe[MAX_PATH], path[MAX_PATH + 64], line[512], server[300] = "";
+    char exe[MAX_PATH], path[MAX_PATH + 64], line[512], server[300] = "", nick[64] = "";
     GetModuleFileNameA(NULL, exe, MAX_PATH);
     char *slash = strrchr(exe, '\\');
     if (slash) *slash = 0;
@@ -117,24 +142,33 @@ static void ldn_load_config(void) {
         ldn_trim(k); ldn_trim(v);
         if (!_stricmp(k, "server")) snprintf(server, sizeof server, "%s", v);
         else if (!_stricmp(k, "room")) snprintf(g_ldn.room, sizeof g_ldn.room, "%s", v);
-        else if (!_stricmp(k, "name")) snprintf(g_ldn.name, sizeof g_ldn.name, "%s", v);
+        else if (!_stricmp(k, "nickname")) snprintf(nick, sizeof nick, "%s", v);
     }
     if (f) fclose(f);
     const char *e;
     if ((e = getenv("SSBU_LDN_SERVER")) && *e) snprintf(server, sizeof server, "%s", e);
     if ((e = getenv("SSBU_LDN_ROOM")) && *e) snprintf(g_ldn.room, sizeof g_ldn.room, "%s", e);
-    if ((e = getenv("SSBU_LDN_NAME")) && *e) snprintf(g_ldn.name, sizeof g_ldn.name, "%s", e);
-    if (!g_ldn.name[0]) snprintf(g_ldn.name, sizeof g_ldn.name, "player");
+    if ((e = getenv("SSBU_LDN_NICKNAME")) && *e) snprintf(nick, sizeof nick, "%s", e);
     char *colon = strrchr(server, ':');
     g_ldn.port = 39010;
     if (colon) { *colon = 0; g_ldn.port = (uint16_t)atoi(colon + 1); }
     snprintf(g_ldn.host, sizeof g_ldn.host, "%s", server);
-    g_ldn.configured = g_ldn.host[0] && g_ldn.room[0];
-    printf("nn::ldn: %s\n", g_ldn.configured ? "online through a room server (config\\online.ini / SSBU_LDN_*)" :
-           "no room server configured (config\\online.ini): local wireless reports \"wireless off\"");
-    if (g_ldn.configured) printf("nn::ldn: server %s:%u, room password set (%u characters), name \"%s\"\n",
-                                 g_ldn.host, g_ldn.port, (unsigned)strlen(g_ldn.room), g_ldn.name);
+    if (!g_ldn.host[0] && !g_ldn.room[0]) return;     /* not asked for: the default model, nothing said */
+    const char *why = NULL;
+    /* the nickname the other players see: 1..32 bytes of UTF-8 (the account Nickname holds 33 with its NUL), no control characters */
+    size_t nl = strlen(nick);
+    int bad = nl == 0 || nl > 32;
+    for (size_t i = 0; i < nl && !bad; i++) bad = (unsigned char)nick[i] < 0x20 || nick[i] == 0x7f;
+    if (!g_ldn.host[0] || !g_ldn.room[0]) why = "online.ini needs both server and room";
+    else if (bad) why = "online.ini needs nickname = <the name other players see> (1 to 32 bytes; the Windows user name is never sent)";
+    else if (gfx_runahead()) why = "runahead = on in graphics.ini: local wireless is a lockstep of both games, which run-ahead's speculative frames would break";
+    if (why) { printf("nn::ldn: local wireless over the internet is OFF: %s\n", why); return; }
+    memcpy(g_ldn.nickname, nick, nl + 1);
+    g_ldn.configured = 1;
+    printf("nn::ldn: local wireless over the internet is ON (config\\online.ini / SSBU_LDN_*): room password and nickname set\n");
 }
+/* The account nickname while online is configured: the explicit one, never the Windows user name (nnfs.c acc_GetNickname). */
+const char *ldn_online_nickname(void) { ldn_load_config(); return g_ldn.configured ? g_ldn.nickname : NULL; }
 
 /* ---------------------------------------------------------------- server connection */
 static int ldn_send_frame(uint8_t type, const void *a, uint32_t na, const void *b, uint32_t nb) {
@@ -199,7 +233,7 @@ static void ldn_host_drop(uint32_t vip) {
     for (int i = 1; i < 8; i++) if (g_ldn.clients[i] == vip) {
         g_ldn.clients[i] = 0;
         char t[20]; ldn_ip_text(vip, t);
-        printf("nn::ldn: station %s left node slot %d\n", t, i);
+        if (!g_ldn_fuzzing) printf("nn::ldn: station %s left node slot %d\n", t, i);
         ldn_update_nodes();
     }
 }
@@ -207,9 +241,34 @@ static void ldn_lost_host(int16_t reason) {
     g_ldn.host_vip = 0;
     if (g_ldn.state == LDN_STA_CONNECTED) {
         g_ldn.disconnect_reason = reason;
-        printf("nn::ldn: the host's network is gone (reason %d)\n", reason);
+        if (!g_ldn_fuzzing) printf("nn::ldn: the host's network is gone (reason %d)\n", reason);
         ldn_set_state(LDN_STA_OPENED);
     }
+}
+
+/* Another player's NodeInfo / NetworkInfo, before the game can see it: flags 0/1, node ids 0..7, string ends, counts
+ * and lengths within their arrays. `from` (the sender's virtual address as the server saw it) replaces what a node says
+ * about its own address. */
+static void ldn_fake_mac(uint8_t *mac);
+static void ldn_sanitize_node(uint8_t *nd, int slot) {
+    nd[0xa] = (uint8_t)slot;
+    nd[0xb] = nd[0xb] ? 1 : 0;
+    nd[0xc + 32] = 0;                                     /* user name: 33 bytes with its NUL */
+    nd[0x2d] = 0;
+}
+static void ldn_sanitize_info(uint8_t *ni) {
+    if (ni[NI_SSID] > 32) ni[NI_SSID] = 32;
+    memset(ni + NI_SSID + 1 + ni[NI_SSID], 0, 33 - ni[NI_SSID]);
+    if (ni[NI_NETTYPE] > 3) ni[NI_NETTYPE] = 2;
+    if (!ni[NI_NODE_MAX] || ni[NI_NODE_MAX] > 8) ni[NI_NODE_MAX] = 8;
+    if (ni[NI_NODE_COUNT] > ni[NI_NODE_MAX]) ni[NI_NODE_COUNT] = ni[NI_NODE_MAX];
+    if (ni[NI_ACCEPT] > 3) ni[NI_ACCEPT] = 0;
+    for (int i = 0; i < 8; i++) ldn_sanitize_node(ni + NI_NODES + i * NODE_SIZE, i);
+    uint16_t adv;
+    memcpy(&adv, ni + NI_ADV_SIZE, 2);
+    if (adv > 384) adv = 384;
+    memcpy(ni + NI_ADV_SIZE, &adv, 2);
+    memset(ni + NI_ADV + adv, 0, 384 - adv);
 }
 
 static void ldn_on_message(uint32_t src, uint8_t type, const uint8_t *d, uint32_t n) {
@@ -220,20 +279,29 @@ static void ldn_on_message(uint32_t src, uint8_t type, const uint8_t *d, uint32_
         if (g_ldn.state == LDN_AP_CREATED) ldn_send_msg(src, LM_SCAN_RESP, g_ldn.info, NI_SIZE);
         break;
     case LM_SCAN_RESP:
-        if (n >= NI_SIZE && g_ldn.nscan < 16) {
+        if (n == NI_SIZE && g_ldn.nscan < 16) {
+            uint8_t ni[NI_SIZE];
+            memcpy(ni, d, NI_SIZE);
+            ldn_sanitize_info(ni);
+            ldn_wr32(ni + NI_NODES, src);                 /* the host is the sender */
             int dup = 0;
-            for (int i = 0; i < g_ldn.nscan; i++) if (!memcmp(g_ldn.scan[i] + NI_BSSID, d + NI_BSSID, 6)) { memcpy(g_ldn.scan[i], d, NI_SIZE); dup = 1; }
-            if (!dup) memcpy(g_ldn.scan[g_ldn.nscan++], d, NI_SIZE);
+            for (int i = 0; i < g_ldn.nscan; i++) if (ldn_rd32(g_ldn.scan[i] + NI_NODES) == src) { memcpy(g_ldn.scan[i], ni, NI_SIZE); dup = 1; }
+            if (!dup) memcpy(g_ldn.scan[g_ldn.nscan++], ni, NI_SIZE);
         }
         break;
     case LM_CONNECT:
-        if (g_ldn.state == LDN_AP_CREATED && n >= NODE_SIZE) {
+        if (g_ldn.state == LDN_AP_CREATED && n == NODE_SIZE) {
             int slot = 0, max = g_ldn.info[NI_NODE_MAX] ? g_ldn.info[NI_NODE_MAX] : 8;
             for (int i = 1; i < 8 && i < max && !slot; i++) if (!g_ldn.clients[i] || g_ldn.clients[i] == src) slot = i;
-            if (!slot || g_ldn.accept_policy == 1) { printf("nn::ldn: station %s refused (%s)\n", t, slot ? "accept policy" : "network full"); ldn_send_msg(src, LM_DESTROY, NULL, 0); break; }
+            if (!slot || g_ldn.accept_policy == 1) { if (!g_ldn_fuzzing) printf("nn::ldn: station %s refused (%s)\n", t, slot ? "accept policy" : "network full"); ldn_send_msg(src, LM_DESTROY, NULL, 0); break; }
             g_ldn.clients[slot] = src;
-            memcpy(g_ldn.info + NI_NODES + slot * NODE_SIZE, d, NODE_SIZE);
-            printf("nn::ldn: station %s joined in node slot %d\n", t, slot);
+            uint8_t *nd = g_ldn.info + NI_NODES + slot * NODE_SIZE;
+            memcpy(nd, d, NODE_SIZE);
+            ldn_sanitize_node(nd, slot);
+            ldn_wr32(nd, src);                            /* its address and MAC are the ones the server saw */
+            { uint32_t keep = g_ldn.vip; g_ldn.vip = src; ldn_fake_mac(nd + 4); g_ldn.vip = keep; }
+            nd[0xb] = 1;
+            if (!g_ldn_fuzzing) printf("nn::ldn: station %s joined in node slot %d\n", t, slot);
             ldn_update_nodes();
         }
         break;
@@ -244,9 +312,11 @@ static void ldn_on_message(uint32_t src, uint8_t type, const uint8_t *d, uint32_
         if (src == g_ldn.host_vip) ldn_lost_host(4);              /* DestroyedByUser */
         break;
     case LM_SYNC:
-        if ((g_ldn.state == LDN_STA_OPENED || g_ldn.state == LDN_STA_CONNECTED) && n >= NI_SIZE && src == g_ldn.host_vip) {
+        if ((g_ldn.state == LDN_STA_OPENED || g_ldn.state == LDN_STA_CONNECTED) && n == NI_SIZE && src == g_ldn.host_vip) {
             memcpy(g_ldn.info, d, NI_SIZE);
-            if (g_ldn.state == LDN_STA_OPENED) { printf("nn::ldn: connected to the host's network\n"); ldn_set_state(LDN_STA_CONNECTED); }
+            ldn_sanitize_info(g_ldn.info);
+            ldn_wr32(g_ldn.info + NI_NODES, src);
+            if (g_ldn.state == LDN_STA_OPENED) { if (!g_ldn_fuzzing) printf("nn::ldn: connected to the host's network\n"); ldn_set_state(LDN_STA_CONNECTED); }
             ldn_node_changes();
         }
         break;
@@ -385,15 +455,106 @@ static void ldn_disconnect_server(void) {
     g_ldn.tcp = g_ldn.udp = INVALID_SOCKET;
     printf("nn::ldn: left the room server\n");
 }
+/* ---------------------------------------------------------------- build fingerprint
+ * FNV-1a 64 over what decides how the game plays; folders by the names and sizes of their files (paths differ between
+ * PCs, contents of the same build do not). Order-independent for folders (entries are XOR-summed). */
+static uint64_t ldn_fnv(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+static uint64_t ldn_fnv_str(uint64_t h, const char *s) { return ldn_fnv(h, s, strlen(s) + 1); }
+static uint64_t ldn_fnv_file(uint64_t h, const char *path, int *ok) {
+    FILE *f = fopen(path, "rb");
+    *ok = f != NULL;
+    if (!f) return ldn_fnv_str(h, "missing");
+    static uint8_t buf[1 << 20];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) h = ldn_fnv(h, buf, n);
+    fclose(f);
+    return h;
+}
+static uint64_t ldn_fnv_folder(uint64_t h, const char *dir, int depth, int *files) {
+    char pat[MAX_PATH * 2];
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE fh = FindFirstFileA(pat, &fd);
+    uint64_t sum = 0;
+    if (fh != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            uint64_t e = ldn_fnv_str(0xcbf29ce484222325ull, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                char sub[MAX_PATH * 2];
+                snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
+                if (depth > 0) e = ldn_fnv_folder(e, sub, depth - 1, files);
+            } else {
+                e = ldn_fnv(e, &fd.nFileSizeLow, 4); e = ldn_fnv(e, &fd.nFileSizeHigh, 4);
+                (*files)++;
+            }
+            sum ^= e;
+        } while (FindNextFileA(fh, &fd));
+        FindClose(fh);
+    }
+    return ldn_fnv(h, &sum, 8);
+}
+static void ldn_make_fingerprint(void) {
+    char exe[MAX_PATH], p[MAX_PATH * 2];
+    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    char *slash = strrchr(exe, '\\');
+    if (slash) *slash = 0;
+    uint64_t h = ldn_fnv_str(0xcbf29ce484222325ull, "ssbu-ldn-fingerprint-1");
+    int ok = 0, n = 0;
+    /* the game itself: main.elf (13.0.4 only, setup.py convert checks it) */
+    if (__argc > 1) snprintf(p, sizeof p, "%s", __argv[1]); else snprintf(p, sizeof p, "%s\\..\\binaries\\13.0.4\\main.elf", exe);
+    h = ldn_fnv_file(h, p, &ok);
+    /* the lifted game DLL this exe was linked against (a new-fighter-kinds build links another one) */
+    HMODULE mods[512];
+    DWORD need = 0;
+    if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need))
+        for (DWORD i = 0; i < need / sizeof(HMODULE) && i < 512; i++) {
+            char name[MAX_PATH];
+            if (!GetModuleFileNameA(mods[i], name, MAX_PATH)) continue;
+            const char *base = strrchr(name, '\\'); base = base ? base + 1 : name;
+            if (_strnicmp(base, "ssbu_game", 9)) continue;
+            WIN32_FILE_ATTRIBUTE_DATA fa;
+            h = ldn_fnv_str(h, base);
+            if (GetFileAttributesExA(name, GetFileExInfoStandard, &fa)) { h = ldn_fnv(h, &fa.nFileSizeLow, 4); h = ldn_fnv(h, &fa.nFileSizeHigh, 4); }
+        }
+    /* the script modules, and every switch that replaces fighter code or files */
+    const char *nro = getenv("SSBU_NRO_BIN");
+    snprintf(p, sizeof p, "%s\\%s", exe, nro && nro[0] ? nro : "nro_bin_eh_o2");
+    h = ldn_fnv_str(h, nro && nro[0] ? nro : "nro_bin_eh_o2"); h = ldn_fnv_folder(h, p, 0, &n);
+    const char *src = getenv("SSBU_FIGHTER_SRC"), *fbin = getenv("SSBU_FIGHTER_BIN");
+    if (!(src && src[0] == '0')) {
+        snprintf(p, sizeof p, "%s\\%s", exe, fbin && fbin[0] ? fbin : "fighters_bin");
+        h = ldn_fnv_str(h, "fighter source"); h = ldn_fnv_folder(h, p, 0, &n);
+    }
+    const char *dirs[] = {"SSBU_MODS", "SSBU_CHARACTERS"};
+    for (int i = 0; i < 2; i++) {
+        const char *d = getenv(dirs[i]);
+        if (!d || !d[0]) continue;
+        if (d[1] == ':' || d[0] == '\\') snprintf(p, sizeof p, "%s", d); else snprintf(p, sizeof p, "%s\\%s", exe, d);
+        h = ldn_fnv_str(h, dirs[i]); h = ldn_fnv_folder(h, p, 2, &n);
+    }
+    const char *lf = getenv("SSBU_LOOSE_FILES");
+    if (lf && lf[0] && lf[0] != '0') h = ldn_fnv_str(h, "SSBU_LOOSE_FILES");
+    memcpy(g_ldn.fingerprint, &h, 8);
+    printf("nn::ldn: build fingerprint %016llx (main.elf %s, game DLL, script modules, fighter source / mods / characters / loose files: %d files)\n",
+           (unsigned long long)h, ok ? "read" : "NOT FOUND", n);
+}
+
 static int ldn_connect_server(void) {
     if (g_ldn.online) return 1;
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
+    static int fp_done;
+    if (!fp_done) { ldn_make_fingerprint(); fp_done = 1; }
     struct addrinfo hints = {0}, *res = NULL;
     char port[8];
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
     snprintf(port, sizeof port, "%u", g_ldn.port);
-    if (getaddrinfo(g_ldn.host, port, &hints, &res) != 0 || !res) { printf("nn::ldn: cannot resolve %s\n", g_ldn.host); return 0; }
+    if (getaddrinfo(g_ldn.host, port, &hints, &res) != 0 || !res) { printf("nn::ldn: the room server's name cannot be resolved\n"); return 0; }
     memcpy(&g_ldn.server, res->ai_addr, sizeof g_ldn.server);
     freeaddrinfo(res);
     g_ldn.tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -402,21 +563,24 @@ static int ldn_connect_server(void) {
     DWORD tmo = 5000;
     setsockopt(g_ldn.tcp, SOL_SOCKET, SO_RCVTIMEO, (char *)&tmo, sizeof tmo);
     if (connect(g_ldn.tcp, (struct sockaddr *)&g_ldn.server, sizeof g_ldn.server) != 0) {
-        printf("nn::ldn: cannot reach the room server %s:%u (error %d)\n", g_ldn.host, g_ldn.port, WSAGetLastError());
+        printf("nn::ldn: cannot reach the room server (Winsock error %d)\n", WSAGetLastError());
         closesocket(g_ldn.tcp); g_ldn.tcp = INVALID_SOCKET;
         return 0;
     }
-    uint8_t hello[1 + 1 + 127 + 1 + 63];
-    size_t rl = strlen(g_ldn.room), nl = strlen(g_ldn.name);
+    /* HELLO, protocol 2: version, room password, nickname, build fingerprint (tools/online/ldn_room_server.py) */
+    uint8_t hello[1 + 1 + 127 + 1 + 32 + 8];
+    size_t rl = strlen(g_ldn.room), nl = strlen(g_ldn.nickname);
     if (rl > 127) rl = 127;
-    if (nl > 63) nl = 63;
-    hello[0] = 1; hello[1] = (uint8_t)rl; memcpy(hello + 2, g_ldn.room, rl);
-    hello[2 + rl] = (uint8_t)nl; memcpy(hello + 3 + rl, g_ldn.name, nl);
-    uint8_t head[5], body[64];
-    if (!ldn_send_frame(1, hello, (uint32_t)(3 + rl + nl), NULL, 0) || !ldn_recv_all(g_ldn.tcp, head, 5) ||
-        ldn_rd32(head) < 1 || ldn_rd32(head) > sizeof body + 1 || !ldn_recv_all(g_ldn.tcp, body, ldn_rd32(head) - 1) || head[4] != 2) {
-        if (head[4] == 4) printf("nn::ldn: the room server refused: %.*s\n", body[0], body + 1);
-        else printf("nn::ldn: no answer from the room server\n");
+    hello[0] = 2; hello[1] = (uint8_t)rl; memcpy(hello + 2, g_ldn.room, rl);
+    hello[2 + rl] = (uint8_t)nl; memcpy(hello + 3 + rl, g_ldn.nickname, nl);
+    memcpy(hello + 3 + rl + nl, g_ldn.fingerprint, 8);
+    uint8_t head[5] = {0}, body[260] = {0};
+    uint32_t blen = 0;
+    int got = ldn_send_frame(1, hello, (uint32_t)(3 + rl + nl + 8), NULL, 0) && ldn_recv_all(g_ldn.tcp, head, 5) &&
+              (blen = ldn_rd32(head)) >= 1 && blen <= sizeof body + 1 && ldn_recv_all(g_ldn.tcp, body, (int)blen - 1);
+    if (!got || head[4] != 2 || blen < 17) {
+        if (got && head[4] == 4 && blen >= 2) printf("nn::ldn: the room server refused: %.*s\n", (int)(body[0] < blen - 2 ? body[0] : blen - 2), body + 1);
+        else printf("nn::ldn: no valid answer from the room server\n");
         closesocket(g_ldn.tcp); g_ldn.tcp = INVALID_SOCKET;
         return 0;
     }
@@ -782,4 +946,65 @@ static void ldn_Disconnect(Ctx *c) {
     LeaveCriticalSection(&g_ldn.cs);
     printf("nn::ldn::Disconnect\n");
     RET(0);
+}
+
+/* ---------------------------------------------------------------- fuzz test of the room-message parser (c4a self-test)
+ * Random and corrupted messages (every type, any length, structured NetworkInfo / NodeInfo with random fields) in the
+ * host and station states; after each one every NetworkInfo the game could read must be within its bounds. Nothing is
+ * sent (no server connection) and the state is reset afterwards. */
+static int ldn_info_ok(const uint8_t *ni) {
+    uint16_t adv;
+    memcpy(&adv, ni + NI_ADV_SIZE, 2);
+    if (ni[NI_SSID] > 32 || ni[NI_SSID + 1 + ni[NI_SSID]] != 0 || adv > 384) return 0;
+    if (!ni[NI_NODE_MAX] || ni[NI_NODE_MAX] > 8 || ni[NI_NODE_COUNT] > ni[NI_NODE_MAX] || ni[NI_NETTYPE] > 3) return 0;
+    for (int i = 0; i < 8; i++) {
+        const uint8_t *nd = ni + NI_NODES + i * NODE_SIZE;
+        if (nd[0xa] != i || nd[0xb] > 1 || nd[0xc + 32] != 0) return 0;
+    }
+    for (int k = adv; k < 384; k++) if (ni[NI_ADV + k]) return 0;
+    return 1;
+}
+static uint64_t ldn_fz(uint64_t *r) { *r ^= *r << 13; *r ^= *r >> 7; *r ^= *r << 17; return *r; }   /* xorshift64 */
+static int ldn_fuzz_selftest(int rounds) {
+    ldn_load_config();
+    if (g_ldn.online) { printf("  ldn fuzz: skipped (connected to a room)\n"); return 1; }
+    uint64_t r = 0x9e3779b97f4a7c15ull;
+    #define FZ() ldn_fz(&r)
+    static uint8_t buf[0x600];
+    int bad = 0, states[3] = {LDN_AP_CREATED, LDN_STA_OPENED, LDN_STA_CONNECTED};
+    uint8_t types[8] = {LM_SCAN, LM_SCAN_RESP, LM_CONNECT, LM_DISCONNECT, LM_DESTROY, LM_SYNC, LM_GONE, 0};
+    uint64_t keep_event = g_ldn.event;
+    g_ldn.event = 0;
+    g_ldn_fuzzing = 1;
+    for (int i = 0; i < rounds && !bad; i++) {
+        if (i % 1000 == 0) {                              /* a fresh network now and then */
+            memset(g_ldn.info, 0, NI_SIZE); g_ldn.info[NI_NODE_MAX] = 8; g_ldn.info[NI_NODE_COUNT] = 1;
+            for (int k = 0; k < 8; k++) g_ldn.info[NI_NODES + k * NODE_SIZE + 0xa] = (uint8_t)k;
+            memset(g_ldn.clients, 0, sizeof g_ldn.clients); g_ldn.nscan = 0;
+            g_ldn.state = states[FZ() % 3];
+            g_ldn.host_vip = 0xa9fe0101u + (uint32_t)(FZ() % 3);
+        }
+        uint32_t n;
+        switch (FZ() % 4) { case 0: n = NI_SIZE; break; case 1: n = NODE_SIZE; break; case 2: n = (uint32_t)(FZ() % 8); break; default: n = (uint32_t)(FZ() % sizeof buf); }
+        for (uint32_t k = 0; k < n; k++) buf[k] = (uint8_t)FZ();
+        if (n == NI_SIZE && FZ() % 2) {                   /* plausible NetworkInfo with hostile fields */
+            buf[NI_SSID] = (uint8_t)(FZ() % 64); buf[NI_NODE_MAX] = (uint8_t)(FZ() % 12); buf[NI_NODE_COUNT] = (uint8_t)(FZ() % 12);
+            uint16_t adv = (uint16_t)(FZ() % 1024); memcpy(buf + NI_ADV_SIZE, &adv, 2);
+        }
+        uint8_t type = (FZ() % 5) ? types[FZ() % 8] : (uint8_t)FZ();
+        uint32_t src = 0xa9fe0101u + (uint32_t)(FZ() % 4);
+        ldn_on_message(src, type, buf, n);
+        if ((g_ldn.state == LDN_STA_CONNECTED || g_ldn.state == LDN_STA_OPENED) && g_ldn.info[NI_NODE_MAX] && !ldn_info_ok(g_ldn.info)) bad = 1;
+        for (int k = 0; k < g_ldn.nscan; k++) if (!ldn_info_ok(g_ldn.scan[k])) bad = 2;
+        if (g_ldn.nscan > 16) bad = 3;
+        if (g_ldn.state == LDN_AP_CREATED)
+            for (int k = 1; k < 8; k++) if (g_ldn.clients[k] && (g_ldn.info[NI_NODES + k * NODE_SIZE + 0xc + 32] || g_ldn.info[NI_NODES + k * NODE_SIZE + 0xb] != 1)) bad = 4;
+        if (bad) printf("  ldn fuzz: round %d, message type %u, %u bytes: check %d failed\n", i, type, n, bad);
+        ldn_inject(src, (uint16_t)FZ(), (uint16_t)FZ(), buf, (int)(n % 2048));     /* no socket has a virtual port: dropped */
+    }
+    #undef FZ
+    memset(g_ldn.info, 0, NI_SIZE); memset(g_ldn.clients, 0, sizeof g_ldn.clients);
+    g_ldn.nscan = 0; g_ldn.host_vip = 0; g_ldn.state = LDN_NONE; g_ldn.event = keep_event;
+    g_ldn_dropped = 0; g_ldn_fuzzing = 0;
+    return !bad;
 }

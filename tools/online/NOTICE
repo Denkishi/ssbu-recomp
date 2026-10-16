@@ -1,0 +1,18 @@
+Local wireless over the internet (runtime/ldn_online.inc, tools/online/*)
+=======================================================================
+
+The C and Python code here is new and licensed as the rest of this repository: GPL-3.0-or-later.
+
+No code was copied. The layouts of the nn::ldn structures (NetworkInfo, CommonNetworkInfo, LdnNetworkInfo, NodeInfo,
+ScanFilter, NetworkConfig, SecurityConfig, SecurityParameter, UserConfig), the nn::ldn result codes (module 203) and the
+design of a host that keeps the NetworkInfo and syncs it to stations that join through a room follow these files of the
+Eden emulator (yuzu lineage), read at the commit checked out by scripts/setup.py's reference folder:
+
+  src/core/hle/service/ldn/ldn_types.h          GPL-3.0-or-later (Eden Emulator Project), GPL-2.0-or-later (yuzu)
+  src/core/hle/service/ldn/ldn_results.h        GPL-3.0-or-later (Eden Emulator Project), GPL-2.0-or-later (yuzu)
+  src/core/hle/service/ldn/lan_discovery.cpp    GPL-3.0-or-later (Eden Emulator Project), GPL-2.0-or-later (yuzu)
+
+GPL-2.0-or-later and GPL-3.0-or-later sources are compatible with this repository's GPL-3.0-or-later.
+
+The room protocol is this project's own (documented at the top of ldn_room_server.py); it is not the yuzu room protocol
+and does not talk to yuzu room servers. No Nintendo service is contacted: nn::nifm keeps answering "no internet".

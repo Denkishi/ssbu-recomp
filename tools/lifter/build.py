@@ -75,6 +75,11 @@ HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, 
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
               '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
+# RECOMP_LDN_ONLINE=1 (scripts\setup.py --ldn-online on): local wireless over a room server (ldn_online.inc) is compiled
+# into the exe; otherwise the exe has none of that code. The two variants keep their host objects apart.
+LDN_ONLINE = os.environ.get('RECOMP_LDN_ONLINE') == '1'
+if LDN_ONLINE:
+    HOST_FLAGS.append('-DSSBU_LDN_ONLINE')
 SDL_DIR = os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'lib', 'x64')      # SDL3 for nnpad_sdl.c; SDL3.dll is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts\setup.py)
 LIBS = ['-luser32', '-lgdi32', '-lwinmm', '-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32', '-lshlwapi']
 
@@ -120,7 +125,7 @@ def cmd_link():
         return 1
     exe = os.environ.get('RECOMP_EXE', 'ssbu_native.exe')      # parallel work: one exe name per worker
     out = os.path.join(HERE, exe)
-    objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0])
+    objdir = os.path.join(HERE, 'obj_host', os.path.splitext(exe)[0] + ('_ldn' if LDN_ONLINE else ''))
     os.makedirs(objdir, exist_ok=True)
     t0 = time.time()
     newest_dep = max([os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith(('.h', '.inc'))] + [os.path.getmtime(os.path.join(HERE, 'build.py'))])
