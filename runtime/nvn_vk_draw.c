@@ -1948,7 +1948,7 @@ static void compute_pipe_make(VStage *v) {         /* any thread */
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = v->mod; ci.stage.pName = "main"; ci.layout = v->cl;
         VkPipeline cp = NULL;
-        VkResult r = vkCreateComputePipelines(V.device, g_pcache, 1, &ci, NULL, &cp);
+        VkResult r = pw_compute(&ci, &cp);
         if (r != VK_SUCCESS) vkd_fail("vkCreateComputePipelines (compute stage %u): %s", v->id, vk_result_name(r));
         v->cp = cp;
         InterlockedIncrement64(&R.pipelines);
@@ -3475,6 +3475,12 @@ static void vkd_init(void) {
     cmd_wait_all();
     CreateDirectoryA("../cache/vk", NULL);
     prewarm_start();
+    /* Isolated, read-only history benchmark: no guest, preparation, or cache save. */
+    if (getenv("SSBU_VK_PREWARM_BENCH") && atoi(getenv("SSBU_VK_PREWARM_BENCH"))) {
+        prewarm_wait();
+        printf("nvn_vk_prewarm_bench: complete; no game started, no cache saved\n");
+        fflush(stdout); ExitProcess(0);
+    }
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SSBU_VK_DEBUG=1)");
     if (RS_ON) printf("nvn_vk_scale: internal resolution scale %.3f (%s): screen-class targets are made at %d x %d instead of 1920 x 1080; fragment stages are another translation\n",
