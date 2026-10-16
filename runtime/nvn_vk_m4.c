@@ -65,8 +65,17 @@ static volatile LONG g_in_fight;
  * "in a fight" for the purpose of NOT holding a caller = a fight frame within the last 600 frames. */
 static volatile LONG64 g_fight_last = -100000;
 static int fight_recent(void) { return g_in_fight || nvn_front_frame_next() - g_fight_last < 600; }
+/* 2026-10-16: frames in a row without a compute dispatch (no fighter on screen: menus, loading screens), counted by the
+ * render thread (nvn_vk_draw.c), and the barrier holding a loading screen. Either opens, inside the 600 frames of
+ * fight_recent, the work that otherwise waits for "no fight" (the preparation, the announced containers): in run
+ * 20261016-090403 the menu after the first fight (frames ~1500-1800) fell inside those 600 frames and the preparation stood
+ * at 132 of 521 containers from frame 1388 to the exit. 120 frames: a fight frame without a dispatch comes alone (run s7fn2,
+ * frame 2072), not two seconds in a row. */
+static volatile LONG g_light_run, g_bar_wait;
+static int fight_far(void) { return g_light_run >= 120 || !fight_recent(); }      /* the preparation's test */
+static int bg_open(void) { return g_bar_wait || fight_far(); }      /* the announced containers' test: also while the barrier holds a loading screen */
 static LONG64 g_var_known;
-static LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
+static LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done, g_aq_queued, g_aq_done;
 /* SSBU_VK_HOLDLOG=1 only: when and by whom a stage's code was first handed to the workers (0 = nvnProgramSetShaders,
  * 1 = the container scan's background queue), so that a hold can say whether anyone knew the code before its draw. */
 static struct { uint64_t hb; int32_t frame; int32_t origin; } g_ho[65536];
@@ -322,7 +331,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
                    s == 5 ? "compute" : s ? "fragment" : "vertex", how == 1 ? "made at the draw" : "waited for (a worker was making it)", (double)dt * 1000.0 / (double)fq.QuadPart, p->serial, (unsigned long long)v->hb,
                    key[0], key[1], key[2], key[3], v->key[0], v->key[1], v->key[2], v->key[3], fo, v->from_rec ? "from its record on disk" : "translated now (no record)");
             EnterCriticalSection(&g_sh_lock);
-            printf("nvn_vk_hold:     %s; jobs waiting now: %lld foreground, %lld background (container scan)\n", ho_text(v->hb), (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done));
+            printf("nvn_vk_hold:     %s; jobs waiting now: %lld foreground, %lld background (container scan), %lld announced containers\n", ho_text(v->hb), (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done), (long long)(g_aq_queued - g_aq_done));
             LeaveCriticalSection(&g_sh_lock); } }
     st->vk = v; memcpy(v->local, st->local, sizeof v->local);
     return v->ok ? v : NULL;
@@ -877,6 +886,23 @@ static void job_push_bg(Job *j) {                  /* g_sh_lock held */
     g_bq_tail = j; g_bq_queued++;
     WakeConditionVariable(&g_jq_cv);
 }
+/* 2026-10-16, the ANNOUNCED queue: every variation of a container file the index named (pix_announce, prep 3). It was on
+ * g_bq, which no fight cap limits: run 20261016-090403 announced 274-811 variations at a time inside a fight (frames 5109,
+ * 8656, 8948, 9554), and each time the process went from 30-40 to 100-190 ms of CPU per frame while a quarter to half of the
+ * frames missed their refresh. Near a fight (bg_open) at most g_ann_fight_cap workers take from it (0: it waits for the next
+ * loading screen, which waits for it as it waited for g_bq). What the game itself hands over of such a container is a
+ * program on g_jq as before, and a draw that needs a stage still waiting here makes it (hold) or queues it in front
+ * (skip_queue_stage): nothing waits for this queue in a fight. SSBU_VK_ANN_FIGHT=<n> workers in a fight. */
+static Job *g_aq_head, *g_aq_tail;
+static LONG64 g_aq_queued, g_aq_done, g_aq_running, g_aq_fight_q;      /* queued / done: also declared at the top (the hold log) */
+static int g_ann_fight_cap = 0;
+static void job_push_ann(Job *j) {                 /* g_sh_lock held */
+    j->next = NULL;
+    if (g_aq_tail) g_aq_tail->next = j; else g_aq_head = j;
+    g_aq_tail = j; g_aq_queued++;
+    if (!bg_open()) g_aq_fight_q++;
+    WakeConditionVariable(&g_jq_cv);
+}
 static void job_push_front(Job *j);
 static void job_copy_src(Job *j, uint8_t **d, int i, const SSrc *s);
 static void skip_queue_stage(const SSrc *src, const uint32_t *key, uint32_t fo) {      /* render thread, no lock held: the stage a skipped draw needs, to the front of the workers' queue (once) */
@@ -1103,30 +1129,31 @@ static void m4_barrier(LONG64 frame, LONG64 draws) {
     if (!on || draws > 60 || !g_pw_nthread) return;
     int save = 0;
     EnterCriticalSection(&g_sh_lock);
-    if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) {
+    if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || g_aq_queued != g_aq_done) {
         LONG64 t0 = tk();
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        g_bar_wait = 1; WakeAllConditionVariable(&g_jq_cv);      /* 2026-10-16: the announced queue is open to every worker while a loading screen is held (bg_open) */
         /* session 10: a loading screen that waits for the workers anyway (after the boot: frame 300 on) also waits for the
          * part of the preparation that is made into memory (the largest container: the one a fight hands over at "GO"), and
          * while it waits that part has every worker at normal priority */
         int keep = frame >= 300 && g_pk_queued != g_pk_done;
         if (keep) { g_prep_urgent = 1; g_bar_keep_n++; WakeAllConditionVariable(&g_jq_cv); }
-        LONG64 d0 = g_jq_done + g_bq_done, tlast = t0;
-        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || (keep && g_pk_queued != g_pk_done)) && tk() - t0 < 20 * fq.QuadPart) {
+        LONG64 d0 = g_jq_done + g_bq_done + g_aq_done, tlast = t0;
+        while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || g_aq_queued != g_aq_done || (keep && g_pk_queued != g_pk_done)) && tk() - t0 < 20 * fq.QuadPart) {
             WD_SLEEP(&g_sh_cv, &g_sh_lock, 20);
             if (tk() - t0 > fq.QuadPart * 15 / 100 && tk() - tlast > fq.QuadPart / 10) {      /* session 11: held longer than 150 ms: the same picture again, with the progress bar, ten times a second */
-                LONG64 tot = g_jq_queued + g_bq_queued - d0, dn = g_jq_done + g_bq_done - d0;
+                LONG64 tot = g_jq_queued + g_bq_queued + g_aq_queued - d0, dn = g_jq_done + g_bq_done + g_aq_done - d0;
                 tlast = tk();
                 LeaveCriticalSection(&g_sh_lock);
                 present_progress(tot > 0 ? (float)dn / (float)tot : 0.0f);
                 EnterCriticalSection(&g_sh_lock);
             }
         }
-        g_prep_urgent = 0;
+        g_prep_urgent = 0; g_bar_wait = 0;
         LONG64 dt = tk() - t0;
         if (keep) { g_bar_keep_tk += dt; printf("nvn_vk_barrier: frame %lld: the loading screen also waited for the preparation's containers kept in memory (%.0f ms in all for this frame)\n", (long long)frame, (double)dt * 1000.0 / (double)fq.QuadPart); }
         g_bar_n++; g_bar_tk += dt; if (dt > g_bar_max) g_bar_max = dt;
-        if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) { g_bar_timeout++; printf("nvn_vk_barrier: TIME-OUT at frame %lld: after 20 s the workers still have %lld + %lld jobs: the frame is presented, pipelines may be made at a draw\n", (long long)frame, (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done)); }
+        if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done || g_aq_queued != g_aq_done) { g_bar_timeout++; printf("nvn_vk_barrier: TIME-OUT at frame %lld: after 20 s the workers still have %lld + %lld + %lld (announced containers) jobs: the frame is presented, pipelines may be made at a draw\n", (long long)frame, (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done), (long long)(g_aq_queued - g_aq_done)); }
         else if (dt * 10 > fq.QuadPart) printf("nvn_vk_barrier: frame %lld (a loading screen: %lld draws) was held %.0f ms until the workers had finished every queued stage and pipeline\n", (long long)frame, (long long)draws, (double)dt * 1000.0 / (double)fq.QuadPart);
         save = g_pcsave_want && frame >= 300 && !fight_recent();
     }
@@ -1268,8 +1295,8 @@ static int pix_find(uint64_t hb, int *files) {     /* any thread: the container 
 }
 typedef struct { char name[40]; uint32_t size; uint8_t layout /* a layout archive's container ("...ArchiveShader...") */, late /* its pool was laid inside a fight (this run or an earlier one) */; } PrepFile;
 static PrepFile g_prep_file[1024];
-/* A worker: container file `f` is read and every variation goes to the background queue (the barrier and the callers of
- * nvnProgramSetShaders outside a fight wait for that queue). why: 0 a pool was laid over its code, 1 one of its programs was handed over. */
+/* A worker: container file `f` is read and every variation goes to the announced queue g_aq (the barrier and the callers of
+ * nvnProgramSetShaders outside a fight wait for that queue; near a fight it is paused, job_push_ann). why: 0 a pool was laid over its code, 1 one of its programs was handed over. */
 static void pix_announce(int f, int why) {
     char path[400];
     if (f < 0 || f >= 1024) return;
@@ -1414,12 +1441,15 @@ static DWORD WINAPI pw_main(void *arg) {
         }
         EnterCriticalSection(&g_sh_lock);
         /* session 10: a preparation job may be taken when nothing else waits; in a fight by at most g_prep_fight_cap workers */
-#define PQ_OK (g_pq_head && g_pq_running < (g_prep_urgent ? 64 : fight_recent() ? g_prep_fight_cap : g_prep_cap))
-        while (!g_jq_head && !g_bq_head && !PQ_OK && !g_m4_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, g_pq_head ? 50 : INFINITE);
+#define PQ_OK (g_pq_head && g_pq_running < (g_prep_urgent ? 64 : fight_far() ? g_prep_cap : g_prep_fight_cap))
+        /* 2026-10-16: the announced containers (g_aq) after g_bq: every worker when no fight is near, g_ann_fight_cap near one */
+#define AQ_OK (g_aq_head && (bg_open() || g_aq_running < g_ann_fight_cap))
+        while (!g_jq_head && !g_bq_head && !AQ_OK && !PQ_OK && !g_m4_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, g_pq_head || g_aq_head ? 50 : INFINITE);
         Job *j = g_jq_head;
         int bg = 0;
         if (j) { g_jq_head = j->next; if (!g_jq_head) g_jq_tail = NULL; }
         else if (!g_m4_quit && (j = g_bq_head) != NULL) { g_bq_head = j->next; if (!g_bq_head) g_bq_tail = NULL; bg = 1; }      /* at exit the background work is left undone */
+        else if (!g_m4_quit && AQ_OK) { j = g_aq_head; g_aq_head = j->next; if (!g_aq_head) g_aq_tail = NULL; bg = 3; g_aq_running++; }
         else if (!g_m4_quit && PQ_OK) { j = g_pq_head; g_pq_head = j->next; if (!g_pq_head) g_pq_tail = NULL; bg = 2; g_pq_running++; }
         Pipe *p = NULL;
         if (j && j->kind == 1 && j->pipe->state == 0) { p = j->pipe; p->state = 1; }
@@ -1429,6 +1459,7 @@ static DWORD WINAPI pw_main(void *arg) {
             int want = g_prep_urgent ? THREAD_PRIORITY_NORMAL : g_in_fight ? THREAD_PRIORITY_LOWEST : THREAD_PRIORITY_BELOW_NORMAL;
             SetThreadPriority(GetCurrentThread(), want); prio = -99;      /* set again at the next job (workers_boost may have changed it meanwhile) */
         }
+        if (bg == 3 && g_in_fight) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); prio = -99; }      /* SSBU_VK_ANN_FIGHT > 0 only */
         if (j->kind == 0) { if (j->prep == 2) job_prep(j); else job_prog(j); }
         else if (j->kind == 2) job_draw(j);
         else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && !g_offline && stage_fits_universal(v)) { int lh; stagelib_ensure(v, 0, &lh); } else if (j->cont == -7 && v && v->ok) gpl_fo_made(v); }
@@ -1441,7 +1472,7 @@ static DWORD WINAPI pw_main(void *arg) {
         int pk = j->prep == 1;
         free(j);
         EnterCriticalSection(&g_sh_lock);
-        if (bg == 2) { g_pq_done++; g_pq_running--; if (pk) g_pk_done++; } else if (bg) g_bq_done++; else g_jq_done++;
+        if (bg == 2) { g_pq_done++; g_pq_running--; if (pk) g_pk_done++; } else if (bg == 3) { g_aq_done++; g_aq_running--; } else if (bg) g_bq_done++; else g_jq_done++;
         WakeAllConditionVariable(&g_sh_cv);
         LeaveCriticalSection(&g_sh_lock);
     }
@@ -1522,10 +1553,10 @@ void nvn_vk_program_set(void *prog) {
     int fr = fight_recent();
     /* session 7: in a fight the caller (the game's main thread) is not held at all: a draw that needs the program waits for it
      * on the render thread, a program not drawn in this frame costs nothing */
-    if (!fr && (g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done)) {
+    if (!fr && (g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done || g_aq_queued > g_aq_done)) {
         LONG64 t0 = tk();
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-        while ((g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done) && tk() - t0 < 30 * fq.QuadPart) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
+        while ((g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done || g_aq_queued > g_aq_done) && tk() - t0 < 30 * fq.QuadPart) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
         g_set_held++; g_set_held_tk += tk() - t0;
         nvn_setsh_part[7] += tk() - t0;
     }
@@ -1720,8 +1751,8 @@ static void m4_report(void) {
     }
     if (D.has_gpl) printf("nvn_vk_gpl: mode %s; pipelines linked again with optimisation by the workers: %lld of %lld queued, %.0f ms of worker time\n", gpl_sep() ? "2 (a library per stage)" : "1 (a library per stage pair)", (long long)g_gpl_opt_n, (long long)g_gpl_opt_q, (double)g_gpl_opt_tk * 1000.0 / (double)fq.QuadPart);
     printf("nvn_vk_skip: shader_wait = %s; draws left out because a stage or pipeline was not ready: %lld in %lld frames (stage not ready %lld, pipeline not ready %lld)\n", skip_on() ? "skip (near a fight)" : "hold (the default)", (long long)g_skip_n, (long long)g_skip_frames, (long long)g_skip_stage, (long long)g_skip_pipe);
-    if (g_pix_ready) printf("nvn_vk_prep: containers announced whole from the index: %lld because a pool was laid over their code, %lld because one of their programs was handed over (%lld of all these while IN A FIGHT), %lld variations queued; pools looked up: %lld found in the index, %lld not; programs handed over whose variation several files hold (no container named): %lld; header searches not made near a fight: %lld\n",
-                            (long long)g_pix_ann_pool, (long long)g_pix_ann_prog, (long long)g_pix_ann_fight, (long long)g_pix_ann_vars, (long long)g_pix_pool_hit, (long long)g_pix_pool_miss, (long long)g_pix_ambiguous, (long long)g_cs_skipped);
+    if (g_pix_ready) printf("nvn_vk_prep: containers announced whole from the index: %lld because a pool was laid over their code, %lld because one of their programs was handed over (%lld of all these while IN A FIGHT), %lld variations queued (%lld of them near a fight, where at most %d workers take them; %lld done, %lld waiting); pools looked up: %lld found in the index, %lld not; programs handed over whose variation several files hold (no container named): %lld; header searches not made near a fight: %lld\n",
+                            (long long)g_pix_ann_pool, (long long)g_pix_ann_prog, (long long)g_pix_ann_fight, (long long)g_pix_ann_vars, (long long)g_aq_fight_q, g_ann_fight_cap, (long long)g_aq_done, (long long)(g_aq_queued - g_aq_done), (long long)g_pix_pool_hit, (long long)g_pix_pool_miss, (long long)g_pix_ambiguous, (long long)g_cs_skipped);
     if (g_prep_state == 1 || g_prep_state == 2) { prep_line(g_prep_state == 2 ? "report (finished)" : "report (NOT finished)"); printf("nvn_vk_prep: fight frames that passed while it ran: %lld; times the render thread raised the workers' priority because it had to wait for one: %lld; loading-screen frames that also waited for the containers kept in memory: %lld, %.0f ms in all\n", (long long)g_prep_fight_frames, (long long)g_boosts, (long long)g_bar_keep_n, (double)g_bar_keep_tk * 1000.0 / (double)fq.QuadPart); }
     printf("nvn_vk_barrier: loading-screen frames held for the workers: %lld, %.0f ms in all, longest %.0f ms, time-outs %lld | progress bar: %lld extra presents of a held loading screen, %lld normal frames with the thin bar (store / preparation running, no fight near)\n", (long long)g_bar_n, (double)g_bar_tk * 1000.0 / (double)fq.QuadPart, (double)g_bar_max * 1000.0 / (double)fq.QuadPart, (long long)g_bar_timeout, (long long)g_ovl_presents, (long long)g_ovl_frames);
     for (int i = 0; i < g_rtlog_n; i++) printf("nvn_vk_rt: %d x %d (mip level %d), %d colour targets (first format 0x%x), depth format 0x%x: %lld passes, %lld of them in fight frames, first in frame %lld\n", g_rtlog[i].w, g_rtlog[i].h, g_rtlog[i].lv, g_rtlog[i].ncol, g_rtlog[i].cf, g_rtlog[i].df, g_rtlog[i].n, g_rtlog[i].fight, g_rtlog[i].first);
@@ -2051,13 +2082,13 @@ static int cont_walk(uint64_t base, uint64_t size, int tag, int *njobs, uint64_t
         for (int i = 0; i < 3; i++) if (has[i]) need += (size_t)s[i].code_len + s[i].cdata_size + 16;
         Job *j = calloc(1, sizeof *j + need);
         uint8_t *d = j->data;
-        j->cont = tag < 0 ? 0 : tag;               /* tag -1 / -2 (session 10): a container of the preparation, read from the game's data: no pair bookkeeping, its own queue (-1 made into memory, -2 into the cache only); -4: a container file announced from the index (background queue, as the scan's) */
+        j->cont = tag < 0 ? 0 : tag;               /* tag -1 / -2 (session 10): a container of the preparation, read from the game's data: no pair bookkeeping, its own queue (-1 made into memory, -2 into the cache only); -4: a container file announced from the index (its own queue, g_aq) */
         j->prep = tag == -4 ? 3 : tag < 0 ? -tag : 0;
         for (int i = 0; i < 3; i++) if (has[i]) job_copy_src(j, &d, i, &s[i]);
         if (tag >= 0) InterlockedAdd64(&g_cs_bytes, (LONG64)need);
         EnterCriticalSection(&g_sh_lock);
         if (holdlog_on() && !g_offline) for (int i = 0; i < 2; i++) if (has[i]) ho_note(ssrc_hb(&s[i]), tag < 0 ? 2 : 1);
-        if (tag < 0 && tag != -4) job_push_prep(j); else job_push_bg(j);
+        if (tag == -4) job_push_ann(j); else if (tag < 0) job_push_prep(j); else job_push_bg(j);
         LeaveCriticalSection(&g_sh_lock);
         (*njobs)++;
     }
@@ -2442,6 +2473,7 @@ static void prep_start(void) {
     if (getenv("SSBU_VK_SWEEP_LOG") && atoi(getenv("SSBU_VK_SWEEP_LOG"))) CloseHandle(CreateThread(NULL, 0, sweep_main, NULL, 0, NULL));
     int on = e ? atoi(e) != 0 : (D.has_gpl && gpl_sep());
     if (getenv("SSBU_VK_PREP_FIGHT")) g_prep_fight_cap = atoi(getenv("SSBU_VK_PREP_FIGHT"));
+    if (getenv("SSBU_VK_ANN_FIGHT")) g_ann_fight_cap = atoi(getenv("SSBU_VK_ANN_FIGHT"));
     g_prep_cap = g_pw_nthread > 1 ? g_pw_nthread / 2 : 1;
     if (getenv("SSBU_VK_PREP_WORKERS") && atoi(getenv("SSBU_VK_PREP_WORKERS")) > 0) g_prep_cap = atoi(getenv("SSBU_VK_PREP_WORKERS"));
     if (getenv("SSBU_VK_PREP_KEEP")) g_prep_keep = atoi(getenv("SSBU_VK_PREP_KEEP"));
