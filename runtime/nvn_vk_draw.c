@@ -34,6 +34,8 @@ static PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperti
 static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 static PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 #define VKC(call) do { VkResult r_ = (call); if (r_ != VK_SUCCESS) vk_fatal(#call, r_); } while (0)
+static void ckpt_op(const char *what, uint64_t obj, int a, int b, int c);      /* device loss report: a marker before a command that is not a draw */
+#define CKPT_OP(what, obj, a, b, c) do { if (D.has_ckpt) ckpt_op(what, (uint64_t)(uintptr_t)(obj), (int)(a), (int)(b), (int)(c)); } while (0)
 
 static struct {
     VkPhysicalDeviceFeatures2 f2; VkPhysicalDeviceVulkan11Features f11; VkPhysicalDeviceVulkan12Features f12; VkPhysicalDeviceVulkan13Features f13;
@@ -41,11 +43,15 @@ static struct {
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT iu8; VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT plr; VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vad;
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3;
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl;
+    VkPhysicalDeviceFaultFeaturesEXT fault;
     const char *exts[16]; uint32_t next;
     int has_vids, has_cbc, has_pv, has_iu8, has_plr, has_vad, has_push, has_eds3, debug;
-    int has_gpl, ext_gpl, ext_so;
+    int has_gpl, ext_gpl, ext_so, has_fault, has_ckpt;
     VkPhysicalDeviceMemoryProperties mp;
 } D;
+static PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT;
+static PFN_vkCmdSetCheckpointNV vkCmdSetCheckpointNV;
+static PFN_vkGetQueueCheckpointDataNV vkGetQueueCheckpointDataNV;
 static void vkd_fail(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); ExitProcess(6);
 }
@@ -81,9 +87,14 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
      * without the pass formats, a draw only LINKS. SSBU_VK_GPL=1 turns it on (needs extended dynamic state 3 as well). */
     D.ext_gpl = has_name(dext, ndext, "VK_EXT_graphics_pipeline_library") && has_name(dext, ndext, "VK_KHR_pipeline_library"); D.ext_so = has_name(dext, ndext, "VK_EXT_shader_object");
     if (D.ext_gpl && vk_gpl_mode()) { D.exts[D.next++] = "VK_KHR_pipeline_library"; EXT(has_gpl, "VK_EXT_graphics_pipeline_library", gpl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT) }
+    /* a lost device says what it knows (vkd_lost_report): the fault (costs nothing until a loss) and, with
+     * SSBU_VK_CHECKPOINTS=1, the last commands the GPU started and finished (a marker before every command) */
+    EXT(has_fault, "VK_EXT_device_fault", fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT)
 #undef EXT
+    if (getenv("SSBU_VK_CHECKPOINTS") && atoi(getenv("SSBU_VK_CHECKPOINTS")) && has_name(dext, ndext, "VK_NV_device_diagnostic_checkpoints")) { D.has_ckpt = 1; D.exts[D.next++] = "VK_NV_device_diagnostic_checkpoints"; }
     if (has_name(dext, ndext, "VK_KHR_push_descriptor") && !(getenv("SSBU_VK_PUSH") && !atoi(getenv("SSBU_VK_PUSH")))) { D.has_push = 1; D.exts[D.next++] = "VK_KHR_push_descriptor"; }
     vkGetPhysicalDeviceFeatures2(V.gpu, &D.f2);                    /* every supported feature of these structures is enabled */
+    D.has_fault = D.has_fault && D.fault.deviceFault; D.fault.deviceFaultVendorBinary = VK_FALSE;
     D.has_vids = D.has_vids && D.vids.vertexInputDynamicState; D.has_cbc = D.has_cbc && D.cbc.customBorderColors && D.cbc.customBorderColorWithoutFormat;
     D.has_pv = D.has_pv && D.pv.provokingVertexLast; D.has_iu8 = D.has_iu8 && D.iu8.indexTypeUint8; D.has_plr = D.has_plr && D.plr.primitiveTopologyListRestart;
     /* session 4: blend / mask / polygon / multisample state out of the pipeline key, only when the GPU has ALL of these (else all stay in the key) */
@@ -237,7 +248,7 @@ static struct {
     LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
 } R;
 
-static void pass_end(void) { if (R.in_pass) { vkCmdEndRendering(R.cmd); R.in_pass = 0; } }
+static void pass_end(void) { if (R.in_pass) { vkCmdEndRendering(R.cmd); R.in_pass = 0; CKPT_OP("pass end (w, h)", 0, R.pass_w, R.pass_h, 0); } }
 static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 /* Session 5, SSBU_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
@@ -355,6 +366,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (g_ts_on > 0) vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_ts_pool, (uint32_t)R.cur * 2 + 1);
     if (g_pt_on > 0 && g_pt_slot[R.cur].n) g_pt_draws[g_pt_slot[R.cur].kind[g_pt_slot[R.cur].n - 1]] += g_cmd_draws - g_pt_slot[R.cur].d0;
     if (g_tl_t0) { LONG64 now = tk(); if (!g_tl_first) g_tl_first = now; g_tl_last = now; }
+    CKPT_OP("end of the command buffer (submission)", 0, (int)(R.serial + 1), 0, 0);
     VKC(vkEndCommandBuffer(s->cmd));
     VkFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -516,6 +528,7 @@ static void image_barrier(VkImage img, VkFlags aspect, VkImageLayout from, VkIma
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.image = img;
     b.subresourceRange.aspectMask = aspect; b.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS; b.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
     b.srcAccessMask = layout_access(from); b.dstAccessMask = layout_access(to); b.oldLayout = from; b.newLayout = to;
+    CKPT_OP("layout change (image, from, to)", img, from, to, aspect);
     vkCmdPipelineBarrier(R.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 static void vt_layout(VTex *vt, VkImageLayout to) {
@@ -693,6 +706,7 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)layer; c.imageSubresource.layerCount = 1;
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = (uint32_t)(vt->is3d ? d : 1);
     if (!vt->is3d && (uint32_t)layer >= (uint32_t)vt->layers) return;
+    CKPT_OP("upload (image, level, layer, w)", vt->img, level, layer, w);
     vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     R.upload_bytes += (LONG64)size;
 }
@@ -754,6 +768,7 @@ static VTex *vt_get2(Tex *t, int sync) {
             VkImageSubresourceRange sr = {vt->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             if (vt->samples == 1) {
+                CKPT_OP("clear of a new image (image, w, h, levels)", vt->img, vt->w, vt->h, vt->levels);
                 if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
                 else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
             }
@@ -1298,6 +1313,7 @@ static int pass_begin(void) {
     cmd_begin();                                   /* vt_get may have submitted (ring wrap) */
     ri.renderArea.extent.width = (uint32_t)w; ri.renderArea.extent.height = (uint32_t)h; ri.layerCount = 1; ri.colorAttachmentCount = (uint32_t)R.ncol; ri.pColorAttachments = ca;
     if (g_pt_on > 0) { Tex *c0 = R.ncol ? R.col[0].tex : NULL; pt_mark(w, h, R.ncol, c0 ? (int)c0->b.format : 0, ri.pDepthAttachment != NULL, c0 && wintex_is(c0), 0); }
+    CKPT_OP("pass begin (first colour view, w, h, colour count)", ca[0].imageView, w, h, R.ncol);
     vkCmdBeginRendering(R.cmd, &ri);
     R.in_pass = 1; R.pass_w = w; R.pass_h = h;
     return 1;
@@ -1328,6 +1344,102 @@ static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSet
 static struct { VTex *d2, *d1, *d3; VkImageView v[7]; } g_dummy;
 static struct { VkImageView view; VkSampler smp; VkImageLayout layout; } g_dtex[140], g_tset_list[32768];      /* g_tset_list: the lists of the cached sets, for the full comparison */
 static int g_ndtex;
+/* What a draw sampled (device loss report, SSBU_VK_CHECKPOINTS=1): one entry per entry of g_dtex. */
+typedef struct { uint16_t fmt, w, h, d; uint8_t lv, target, dim, unit, stage, dummy; } DTexInfo;
+static DTexInfo g_dtex_info[140];
+/* Device loss report. With SSBU_VK_CHECKPOINTS=1 a marker (VK_NV_device_diagnostic_checkpoints) goes before every draw,
+ * dispatch, copy, blit, clear, layout change, pass begin / end and the end of every command buffer, with a record of the
+ * command; after a loss the queue says which markers reached the top and the bottom of the pipe, which names the command
+ * the GPU was executing (2026-10-15: a read-back copy, see read_region). */
+typedef struct { LONG64 frame; uint32_t seq; uint8_t kind, prim, itype, ntex; int prog; uint32_t vs, fs; uint64_t vs_hb, fs_hb; uint32_t count, inst, first; int32_t base; uint64_t serial; const char *what; uint64_t obj; DTexInfo tex[12]; } DrawRec;
+#define DREC_N 16384
+static DrawRec g_drec[DREC_N];
+static uint32_t g_drec_seq;
+static VStage *g_dvs, *g_dfs;                      /* the stages of the draw draw_prepare prepared last */
+static void ckpt_mark(int kind, unsigned prim, uint32_t count, uint32_t inst, uint32_t first, int32_t base, unsigned itype) {      /* kind: 0 draw, 1 indexed draw, 2 dispatch */
+    if (!D.has_ckpt) return;
+    uint32_t seq = ++g_drec_seq;
+    DrawRec *d = &g_drec[seq % DREC_N];
+    memset(d, 0, sizeof *d);
+    d->seq = seq; d->frame = nvn_front_frame_next(); d->kind = (uint8_t)kind; d->prim = (uint8_t)prim; d->itype = (uint8_t)itype; d->count = count; d->inst = inst; d->first = first; d->base = base;
+    d->serial = R.serial + 1;
+    if (kind != 2) {
+        d->prog = R.prog[1] ? R.prog[1]->serial : R.prog[0] ? R.prog[0]->serial : -1;
+        if (g_dvs) { d->vs = g_dvs->id; d->vs_hb = g_dvs->hb; }
+        if (g_dfs) { d->fs = g_dfs->id; d->fs_hb = g_dfs->hb; }
+        d->ntex = (uint8_t)(g_ndtex < 12 ? g_ndtex : 12);
+        memcpy(d->tex, g_dtex_info, sizeof d->tex[0] * d->ntex);
+    } else d->prog = R.prog[5] ? R.prog[5]->serial : -1;
+    vkCmdSetCheckpointNV(R.cmd, (void *)(uintptr_t)seq);
+}
+static void ckpt_op(const char *what, uint64_t obj, int a, int b, int c) {
+    if (!R.cmd) return;
+    uint32_t seq = ++g_drec_seq;
+    DrawRec *d = &g_drec[seq % DREC_N];
+    memset(d, 0, sizeof *d);
+    d->seq = seq; d->frame = nvn_front_frame_next(); d->kind = 3; d->what = what; d->obj = obj; d->count = (uint32_t)a; d->inst = (uint32_t)b; d->first = (uint32_t)c; d->serial = R.serial + 1;
+    vkCmdSetCheckpointNV(R.cmd, (void *)(uintptr_t)seq);
+}
+static void drec_print(const char *tag, uint32_t seq) {
+    DrawRec *d = &g_drec[seq % DREC_N];
+    if (d->seq != seq) { printf("nvn_vk_lost: %s: marker %u (no record)\n", tag, seq); return; }
+    if (d->kind == 3) { printf("nvn_vk_lost: %s: marker %u, frame %lld, submission %llu, %s: object %llx, %d %d %d\n", tag, seq, (long long)d->frame, (unsigned long long)d->serial, d->what, (unsigned long long)d->obj, (int)d->count, (int)d->inst, (int)d->first); return; }
+    printf("nvn_vk_lost: %s: marker %u, frame %lld, submission %llu, %s prim %u count %u instances %u first %u base %d, program #%d, stages %u (%016llx) / %u (%016llx), textures:",
+           tag, seq, (long long)d->frame, (unsigned long long)d->serial, d->kind == 2 ? "DISPATCH" : d->kind ? "indexed draw" : "draw", d->prim, d->count, d->inst, d->first, d->base, d->prog,
+           d->vs, (unsigned long long)d->vs_hb, d->fs, (unsigned long long)d->fs_hb);
+    for (int i = 0; i < d->ntex; i++) {
+        DTexInfo *t = &d->tex[i];
+        printf(" [%s%u kind %u: fmt 0x%x %ux%ux%u lv %u target %u%s]", t->stage ? "f" : "v", t->unit, t->dim, t->fmt, t->w, t->h, t->d, t->lv, t->target, t->dummy ? " DUMMY" : "");
+    }
+    printf("\n");
+}
+static void vkd_lost_report(void) {                /* nvn_vk.c vk_fatal, once */
+    static int once;
+    if (once++) return;
+    printf("nvn_vk_lost: the device is lost; submissions made %llu, seen finished %llu\n", (unsigned long long)R.serial, (unsigned long long)R.done);
+    if (D.has_fault) {
+        VkDeviceFaultCountsEXT c = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        VkResult r = vkGetDeviceFaultInfoEXT(V.device, &c, NULL);
+        printf("nvn_vk_lost: vkGetDeviceFaultInfoEXT: %s, %u address records, %u vendor records\n", vk_result_name(r), c.addressInfoCount, c.vendorInfoCount);
+        if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+            VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+            fi.pAddressInfos = calloc(c.addressInfoCount + 1, sizeof *fi.pAddressInfos); fi.pVendorInfos = calloc(c.vendorInfoCount + 1, sizeof *fi.pVendorInfos);
+            c.vendorBinarySize = 0;
+            r = vkGetDeviceFaultInfoEXT(V.device, &c, &fi);
+            static const char *const k_at[7] = {"none", "READ OF AN INVALID ADDRESS", "WRITE TO AN INVALID ADDRESS", "EXECUTION OF AN INVALID ADDRESS", "instruction pointer unknown", "instruction pointer invalid", "instruction pointer of a fault"};
+            printf("nvn_vk_lost: fault: \"%s\" (%s)\n", fi.description, vk_result_name(r));
+            for (uint32_t i = 0; i < c.addressInfoCount; i++)
+                printf("nvn_vk_lost:   address record %u: %s, address 0x%llx (precision 0x%llx)\n", i, fi.pAddressInfos[i].addressType < 7 ? k_at[fi.pAddressInfos[i].addressType] : "?",
+                       (unsigned long long)fi.pAddressInfos[i].reportedAddress, (unsigned long long)fi.pAddressInfos[i].addressPrecision);
+            for (uint32_t i = 0; i < c.vendorInfoCount; i++)
+                printf("nvn_vk_lost:   vendor record %u: %s, code 0x%llx, data 0x%llx\n", i, fi.pVendorInfos[i].description, (unsigned long long)fi.pVendorInfos[i].vendorFaultCode, (unsigned long long)fi.pVendorInfos[i].vendorFaultData);
+        }
+    }
+    if (D.has_ckpt) {
+        uint32_t n = 0, top = 0, bottom = 0, mn = ~0u, mx = 0;
+        VkCheckpointDataNV cd[32];
+        vkGetQueueCheckpointDataNV(V.queue, &n, NULL);
+        if (n > 32) n = 32;
+        for (uint32_t i = 0; i < n; i++) { memset(&cd[i], 0, sizeof cd[i]); cd[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV; }
+        vkGetQueueCheckpointDataNV(V.queue, &n, cd);
+        printf("nvn_vk_lost: %u checkpoints reported; the last marker recorded is %u\n", n, g_drec_seq);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t m = (uint32_t)(uintptr_t)cd[i].pCheckpointMarker;
+            printf("nvn_vk_lost: checkpoint at pipeline stage 0x%x: marker %u\n", (unsigned)cd[i].stage, m);
+            if (cd[i].stage == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT) top = m;
+            if (cd[i].stage == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT) bottom = m;
+            if (m < mn) mn = m;
+            if (m > mx) mx = m;
+        }
+        if (n && !top) top = mx;
+        if (n && !bottom) bottom = mn;
+        /* a marker that reached a stage = everything recorded BEFORE it passed that stage: the commands between the last
+         * marker that reached the bottom of the pipe and the last one that reached the top are the ones that may not have finished */
+        if (bottom) for (uint32_t m = bottom > 12 ? bottom - 12 : 1; m < bottom; m++) drec_print("finished", m);
+        for (uint32_t m = bottom ? bottom : 1; top && m <= top + 6 && m <= bottom + 60; m++) drec_print(m <= top ? "STARTED, MAY NOT HAVE FINISHED" : "after the last started", m);
+    }
+    fflush(stdout);
+}
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static void resolve_sampler(int s, VStage *v, int i) {
     unsigned u = v->smp[i].unit;
@@ -1335,6 +1447,8 @@ static void resolve_sampler(int s, VStage *v, int i) {
     View view;
     SamplerParams sp;
     int r = u < 32 ? nvn_front_handle(R.tpool, R.spool, R.nvn_tex[s][u], &t, &view, &sp) : 0;
+    DTexInfo *di = &g_dtex_info[g_ndtex];
+    memset(di, 0, sizeof *di); di->dim = v->smp[i].dim; di->unit = (uint8_t)u; di->stage = (uint8_t)s; di->dummy = 1;
     g_dtex[g_ndtex].view = g_dummy.v[v->smp[i].dim]; g_dtex[g_ndtex].smp = g_smp_default; g_dtex[g_ndtex].layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (r & 1) {
         VTex *vt = vt_get(t);
@@ -1343,13 +1457,14 @@ static void resolve_sampler(int s, VStage *v, int i) {
         for (int k = 0; k < R.ncol; k++) attached |= R.col[k].tex == t;
         eview_of(t, vt, &view, &e);
         int have = target_dim(e.target);
+        di->fmt = (uint16_t)t->b.format; di->w = (uint16_t)t->b.width; di->h = (uint16_t)t->b.height; di->d = (uint16_t)t->b.depth; di->lv = (uint8_t)nvn_front_tex_levels(t); di->target = (uint8_t)e.target;
         int ok = have == dim || (dim == DIM_2D && (have == DIM_2DA || have == DIM_CUBE || have == DIM_CUBEA)) || (dim == DIM_2DA && (have == DIM_2D || have == DIM_CUBE || have == DIM_CUBEA)) ||
                  (dim == DIM_CUBE && have == DIM_CUBEA) || (dim == DIM_CUBEA && have == DIM_CUBE) || (dim == DIM_1D && have == DIM_1DA) || (dim == DIM_1DA && have == DIM_1D) ||
                  ((dim == DIM_CUBE || dim == DIM_CUBEA) && (have == DIM_2DA) && e.nlay >= 6 && vt->w == vt->h);
         if (ok && vt->samples == 1) {
             if (attached && have_targets_live()) { if (!vt->feedback) { vt->feedback = 1; R.feedback++; pass_end(); } vt_layout(vt, VK_IMAGE_LAYOUT_GENERAL); }
             else vt_layout(vt, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout;
+            g_dtex[g_ndtex].view = vt_view(vt, &e, dim, 0); g_dtex[g_ndtex].layout = vt->layout; di->dummy = 0;
         } else { static int n; R.dummy_kind++;
             if (n < 3) printf("nvn_vk: (detail of the next line) frame %lld, program #%d, texture format 0x%x, %d x %d x %d, %d levels, draws so far with a dummy for a view-kind mismatch: %lld\n", (long long)nvn_front_frame_next(), R.prog[s] ? R.prog[s]->serial : -1, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), (long long)R.dummy_kind);
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
@@ -2025,6 +2140,7 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
     if (nw) vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL);
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cp);
     vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v->cl, 0, 2, sets, 0, NULL);
+    ckpt_mark(2, 0, gx, gy, gz, 0, 0);
     vkCmdDispatch(R.cmd, gx, gy, gz);
     if (v->ssbo_w) {                               /* what the dispatch wrote is read by later dispatches and draws of this command buffer */
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -2060,6 +2176,7 @@ static int draw_prepare(unsigned prim) {
     if (vs) { uint32_t need = fs ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0; if (need != vs->fo) vs = vstage_get(R.prog[0], 0, key0, need); }
     if (g_skip_flag) { g_skip_flag = 0; if (!vs || (!depth_only && !fs)) return 0; }      /* shader_wait = skip: the draw is left out (counted in vstage_get) */
     if (!vs || (!depth_only && !fs)) { nvn_vk_missing("a draw whose vertex or fragment stage could not be translated or compiled (the log names the stage)"); return 0; }
+    g_dvs = vs; g_dfs = fs;
 
     /* 1. textures (may upload, change layouts, end the pass) */
     g_ndtex = 0;
@@ -2353,6 +2470,7 @@ static void write_region(Tex *t, const View *vp, const int *r, const void *data,
     c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.mipLevel = (uint32_t)level; c.imageSubresource.baseArrayLayer = vt->is3d ? 0 : (uint32_t)layer; c.imageSubresource.layerCount = 1;
     c.imageOffset.x = r[0]; c.imageOffset.y = r[1]; c.imageOffset.z = vt->is3d ? r[2] : 0;
     c.imageExtent.width = (uint32_t)r[3]; c.imageExtent.height = (uint32_t)r[4]; c.imageExtent.depth = (uint32_t)(vt->is3d ? depth : 1);
+    CKPT_OP("copy into a texture (image, x, y, w)", vt->img, c.imageOffset.x, c.imageOffset.y, c.imageExtent.width);
     vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     t->gpu_written = 1; t->uploaded = 1;
 }
@@ -2414,6 +2532,7 @@ static size_t read_region(Tex *t, const View *vp, const int *r, void *out, int64
         vkCmdCopyImageToBuffer(R.cmd, tmp->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
         g_rs_down++;
     } else {
+        CKPT_OP("read back of a texture (image, w, h, layers)", vt->img, c.imageExtent.width, c.imageExtent.height, depth);
         vkCmdCopyImageToBuffer(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &c);
     }
     if (was != VK_IMAGE_LAYOUT_UNDEFINED) vt_layout(vt, was);
@@ -2480,12 +2599,14 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
         memset(&rv, 0, sizeof rv);
         rv.srcSubresource = b.srcSubresource; rv.dstSubresource = b.dstSubresource; rv.srcOffset = b.srcOffsets[0]; rv.dstOffset = b.dstOffsets[0];
         rv.extent.width = (uint32_t)rs_sw; rv.extent.height = (uint32_t)rs_sh; rv.extent.depth = 1;
+        CKPT_OP("resolve (destination image, w, h)", vd->img, rv.extent.width, rv.extent.height, 0);
         vkCmdResolveImage(R.cmd, vs->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vd->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &rv);
         return;
     }
     if (vs->samples > 1 || vd->samples > 1) { nvn_vk_missing("a scaled or depth copy of a multisample texture"); return; }
     /* glBlitFramebuffer with FRAMEBUFFER_SRGB off copies the stored values; vkCmdBlitImage converts between an sRGB and a
      * linear format. Same class on both sides = the same values. */
+    CKPT_OP("blit (destination image, x1, y1)", vd->img, b.dstOffsets[1].x, b.dstOffsets[1].y, 0);
     vkCmdBlitImage(R.cmd, vs->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vd->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, linear && vs->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 
@@ -2644,6 +2765,7 @@ static void exec(const Cmd *m, int depth) {
         memset(&ca, 0, sizeof ca); memset(&cr, 0, sizeof cr);
         ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca.colorAttachment = i; memcpy(&ca.clearValue.color, blob, 16);
         cr.rect.offset.x = sx; cr.rect.offset.y = sy; cr.rect.extent.width = (uint32_t)sw; cr.rect.extent.height = (uint32_t)sh; cr.layerCount = 1;
+        CKPT_OP("clear of an attachment (aspect, w, h)", ca.aspectMask, cr.rect.extent.width, cr.rect.extent.height, ca.colorAttachment);
         vkCmdClearAttachments(R.cmd, 1, &ca, 1, &cr);
         R.frame_clears++; nvn_front_count(2, 1);
         break;
@@ -2669,12 +2791,14 @@ static void exec(const Cmd *m, int depth) {
         if (!ca.aspectMask) break;
         memcpy(&ca.clearValue.depthStencil.depth, &a[3], 4); ca.clearValue.depthStencil.stencil = (uint32_t)a[1];
         cr.rect.offset.x = sx; cr.rect.offset.y = sy; cr.rect.extent.width = (uint32_t)sw; cr.rect.extent.height = (uint32_t)sh; cr.layerCount = 1;
+        CKPT_OP("clear of an attachment (aspect, w, h)", ca.aspectMask, cr.rect.extent.width, cr.rect.extent.height, ca.colorAttachment);
         vkCmdClearAttachments(R.cmd, 1, &ca, 1, &cr);
         R.frame_clears++; nvn_front_count(2, 1);
         break;
     }
     case OP_DRAW_ARRAYS:
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        ckpt_mark(0, (unsigned)a[0], (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], 0, 0);
         vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
         break;
@@ -2687,6 +2811,7 @@ static void exec(const Cmd *m, int depth) {
         buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
         { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        ckpt_mark(1, (unsigned)a[0], (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], t);
         vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
         break;
@@ -2741,6 +2866,7 @@ static void exec(const Cmd *m, int depth) {
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 1, (uint32_t)(vt->is3d ? 0 : layer), 1};
         VkClearColorValue cv;
         memcpy(&cv, blob + 48, 16);
+        CKPT_OP("clear of a texture (image, level, layer)", vt->img, sr.baseMipLevel, sr.baseArrayLayer, 0);
         vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cv, 1, &sr);
         t->gpu_written = 1; t->uploaded = 1;
         break;
@@ -2953,6 +3079,7 @@ static void overlay_draw(uint32_t index) {
         b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.dstSubresource.layerCount = 1;
         b.srcOffsets[1].x = 8; b.srcOffsets[1].y = 8; b.srcOffsets[1].z = 1;
         b.dstOffsets[0].x = pass ? x0 : x0 - 2; b.dstOffsets[0].y = pass ? y0 : y0 - 2; b.dstOffsets[1].x = pass ? xe : x1 + 2; b.dstOffsets[1].y = pass ? y1 : y1 + 2; b.dstOffsets[1].z = 1;
+        CKPT_OP("progress bar blit (swapchain image, index)", V.images[index], index, 0, 0);
         vkCmdBlitImage(R.cmd, g_ovl.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     }
     if (g_ovl.screen) {                             /* session 14: the first-run preparation screen: four lines of text over the bar */
@@ -3193,6 +3320,7 @@ swap: ;
             b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + s4[2]; b.srcOffsets[1].y = s4[1] + s4[3]; b.srcOffsets[1].z = 1;
             b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
             if (g_pt_on > 0) pt_mark((int)V.extent.width, (int)V.extent.height, 0, 0, 0, 1, 2);
+            CKPT_OP("present blit (swapchain image, index, w)", V.images[index], index, vt->w, 0);
             vkCmdBlitImage(R.cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);      /* PR #8: src = vt, or the last reduction step */
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         fl_capture(vt, fl_s4, frame, fl_layout);      /* session 13: 16x9 copy of what is presented, for the flash detector */
@@ -3472,6 +3600,12 @@ static void vkd_init(void) {
 #undef X
     vkCmdSetVertexInputEXT = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(V.device, "vkCmdSetVertexInputEXT");
     if (D.has_push) { vkCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(V.device, "vkCmdPushDescriptorSetKHR"); if (!vkCmdPushDescriptorSetKHR) D.has_push = 0; }
+    if (D.has_fault) { vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(V.device, "vkGetDeviceFaultInfoEXT"); D.has_fault = vkGetDeviceFaultInfoEXT != NULL; }
+    if (D.has_ckpt) {
+        vkCmdSetCheckpointNV = (PFN_vkCmdSetCheckpointNV)vkGetDeviceProcAddr(V.device, "vkCmdSetCheckpointNV"); vkGetQueueCheckpointDataNV = (PFN_vkGetQueueCheckpointDataNV)vkGetDeviceProcAddr(V.device, "vkGetQueueCheckpointDataNV");
+        D.has_ckpt = vkCmdSetCheckpointNV && vkGetQueueCheckpointDataNV;
+    }
+    printf("nvn_vk: device loss report: fault information %s, a marker before every command %s\n", D.has_fault ? "yes (VK_EXT_device_fault)" : "no", D.has_ckpt ? "YES (SSBU_VK_CHECKPOINTS=1)" : "no (SSBU_VK_CHECKPOINTS=1)");
     if (D.has_eds3) {
 #define X3(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has VK_EXT_extended_dynamic_state3 but no " #n);
         X3(vkCmdSetColorBlendEnableEXT) X3(vkCmdSetColorBlendEquationEXT) X3(vkCmdSetColorWriteMaskEXT) X3(vkCmdSetPolygonModeEXT) X3(vkCmdSetAlphaToCoverageEnableEXT) X3(vkCmdSetSampleMaskEXT)

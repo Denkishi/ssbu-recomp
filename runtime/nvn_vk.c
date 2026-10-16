@@ -131,9 +131,11 @@ static const char *vk_result_name(VkResult r) {
     snprintf(buf, sizeof buf, "VkResult %d", (int)r);
     return buf;
 }
+static void vkd_lost_report(void);                                    /* nvn_vk_draw.c: what the driver and the markers say about the loss */
 static void vk_fatal(const char *what, VkResult r) {
     printf("nvn_vk: %s failed: %s\n", what, vk_result_name(r));
     fflush(stdout);
+    if (r == VK_ERROR_DEVICE_LOST && V.device) vkd_lost_report();
     ExitProcess(5);
 }
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */
