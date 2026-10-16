@@ -490,6 +490,11 @@ static void *hnew(uint64_t g, uint32_t kind, size_t size) {
 
 static SRWLOCK g_pool_lock = SRWLOCK_INIT;
 static Tex *volatile g_all_tex;            /* every texture, newest first (never unlinked: host records of textures are not freed) */
+/* The textures not finalised, for nvn_gl_memory_written. It walked g_all_tex at every FlushMappedRange, and that list only
+ * grows: 37,933 textures after 30 minutes of attract demos, about 600 of them alive (Linux run, 2026-10-14). */
+static SRWLOCK g_live_tex_lock = SRWLOCK_INIT;
+static Tex **g_live_tex;
+static int g_live_tex_n, g_live_tex_cap;
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
 void nvn_label_drop(uint64_t obj);
@@ -4138,13 +4143,24 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     t->storage = tex_storage_size2(&t->b, &t->data_size);
     t->guest = A0;
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
+    AcquireSRWLockExclusive(&g_live_tex_lock);
+    if (g_live_tex_n == g_live_tex_cap) { g_live_tex_cap = g_live_tex_cap ? 2 * g_live_tex_cap : 1024; g_live_tex = realloc(g_live_tex, (size_t)g_live_tex_cap * sizeof *g_live_tex); }
+    t->live_i = g_live_tex_n;
+    g_live_tex[g_live_tex_n++] = t;
+    ReleaseSRWLockExclusive(&g_live_tex_lock);
     RET(1);
 }
 static void tex_finalize(Ctx *c) {
     gl_barrier();
     Tex *t = hobj(A0, K_TEX);
     if (!t) return;
-    InterlockedExchange(&t->dead, 1);
+    if (!InterlockedExchange(&t->dead, 1)) {         /* out of the live list once, even if finalised twice */
+        AcquireSRWLockExclusive(&g_live_tex_lock);
+        Tex *last = g_live_tex[--g_live_tex_n];        /* the last one takes its place */
+        g_live_tex[t->live_i] = last;
+        last->live_i = t->live_i;
+        ReleaseSRWLockExclusive(&g_live_tex_lock);
+    }
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
     defer_free(K_TEX, t);
@@ -5509,8 +5525,12 @@ static void vk_shutdown_at_exit(void) {
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
-    for (Tex *t = g_all_tex; t; t = t->all_next)
-        if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    AcquireSRWLockShared(&g_live_tex_lock);
+    for (int i = 0; i < g_live_tex_n; i++) {
+        Tex *t = g_live_tex[i];
+        if (t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    }
+    ReleaseSRWLockShared(&g_live_tex_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {

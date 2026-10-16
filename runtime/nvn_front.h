@@ -40,6 +40,7 @@ typedef struct Tex {
     size_t storage, data_size;
     int glevels, dirty, uploaded, gpu_written, label_dirty;
     struct Tex *all_next;                  /* every texture ever made (g_all_tex) */
+    int live_i;                            /* its place in g_live_tex (nvn_gl.c) while it is not finalised */
     uint64_t hash;
     uint64_t ww_seen; int ww_hashed;       /* write-watch stamp seen at the last look; hash is a full hash (see ww_newest) */
     uint32_t checked;
