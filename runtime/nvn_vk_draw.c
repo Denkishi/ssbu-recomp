@@ -3188,7 +3188,7 @@ swap: ;
     g_tm[4] += tp[5] - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     tp[6] = tk();
-    { static LONG64 disp_prev; g_in_fight = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_fight) { g_fight_last = frame; if (g_prep_state == 1) g_prep_fight_frames++; } }      /* a frame with compute dispatches (skinning): fighters are on screen */
+    { static LONG64 disp_prev; g_in_fight = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_fight) { g_fight_last = frame; if (g_prep_state == 1) g_prep_fight_frames++; } g_light_run = g_in_fight ? 0 : g_light_run < 1000000 ? g_light_run + 1 : g_light_run; }      /* a frame with compute dispatches (skinning): fighters are on screen */
     {   /* session 9: per-frame record for the "nvn_vk_gpu_fight:" line */
         static LONG64 t_prev;
         LONG64 t_now = tk();
