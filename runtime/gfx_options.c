@@ -32,6 +32,8 @@ static const char *const k_default_ini =
 ";   windowed:   a normal window with the client size below.\r\n"
 ";   borderless: no frame, covers the monitor the window is on (the desktop keeps its resolution).\r\n"
 ";   fullscreen: as borderless, and always on top. (Exclusive fullscreen with a mode change is not implemented.)\r\n"
+";   F11 switches between the window and a borderless window over the monitor at any time. The picture keeps its 16:9\r\n"
+";   shape: the window resizes in 16:9, and other shapes (maximized, another monitor) get black bars.\r\n"
 "window = windowed\r\n"
 "width = 1280\r\n"
 "height = 720\r\n"
