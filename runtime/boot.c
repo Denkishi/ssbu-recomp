@@ -6,6 +6,8 @@
 #include <malloc.h>
 #include <math.h>
 #include <windows.h>
+#include <psapi.h>
+#include <time.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -278,9 +280,46 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     return 0;
 }
 
+/* The first lines of every log: which binaries these are (link time stamps of the exe and of the DLLs beside it, the values
+ * a minidump also shows) and where the process runs, so that a log from another PC names its build. */
+static void print_build_identity(void) {
+    char exe[MAX_PATH], name[MAX_PATH], host[256] = "?";
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH), hn = sizeof host;
+    if (!n || n >= MAX_PATH) return;
+    const char *slash = strrchr(exe, '\\');
+    size_t dl = slash ? (size_t)(slash - exe + 1) : 0;
+    GetComputerNameA(host, &hn);
+    SYSTEMTIME st; GetLocalTime(&st);
+    printf("build: %s, started %04d-%02d-%02d %02d:%02d:%02d on %s, process %lu\n", exe, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, host, GetCurrentProcessId());
+    HMODULE mods[256];
+    DWORD need = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need)) return;
+    for (DWORD i = 0; i < need / sizeof mods[0] && i < 256; i++) {
+        if (!GetModuleFileNameA(mods[i], name, MAX_PATH) || _strnicmp(name, exe, dl)) continue;      /* ours: the exe's folder */
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)mods[i] + ((const IMAGE_DOS_HEADER *)mods[i])->e_lfanew);
+        __time64_t t = nt->FileHeader.TimeDateStamp;
+        struct tm tm;
+        char when[32] = "?";
+        if (!_gmtime64_s(&tm, &t)) strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S UTC", &tm);
+        printf("build: %-22s linked %s (stamp %08lx, image %lu bytes)\n", name + dl, when, (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)nt->OptionalHeader.SizeOfImage);
+    }
+}
+
+/* SSBU_CRASH_TEST=<seconds>: a write to address 0 after that time, on a thread of its own: tries the whole crash path of a
+ * PC (crash report, minidump) without waiting for a real crash. Test only. */
+static DWORD WINAPI crash_test(LPVOID arg) {
+    (void)arg;
+    Sleep((DWORD)(atof(getenv("SSBU_CRASH_TEST")) * 1000.0));
+    printf("SSBU_CRASH_TEST: writing to address 0 now\n");
+    *(volatile int *)(uintptr_t)0 = 1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--write-dump")) { int diag_dump_helper(int, char **); return diag_dump_helper(argc, argv); }   /* hostrt.c: minidump of the crashed game, written from outside */
     g_elf = argc > 1 ? argv[1] : "..\\binaries\\13.0.4\\main.elf";
     setvbuf(stdout, NULL, _IONBF, 0);
+    print_build_identity();
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);
         int tool;
@@ -298,6 +337,7 @@ int main(int argc, char **argv) {
     }
     cxxrt_install_data();
     runtime_init(g_elf, getenv("SSBU_TRACE") ? getenv("SSBU_TRACE") : "boot_trace.txt");
+    if (getenv("SSBU_CRASH_TEST")) CloseHandle(CreateThread(NULL, 0, crash_test, NULL, 0, NULL));
     register_imports(base_imports, (int)(sizeof base_imports / sizeof base_imports[0]));
     register_sdk_imports();
     register_cxx_imports();

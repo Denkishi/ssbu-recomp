@@ -7,13 +7,17 @@
  *   - our locks (g_sh_lock, g_gpl_lock): the thread that owns each;
  *   - every wait of ours that was entered through WD_SLEEP (function, line, how long);
  *   - EVERY thread of the process: its name (guest thread name / render / main), whether it used CPU in the last 300 ms,
- *     and its call stack: host functions by name when <exe name>.map is next to the exe (tests\s12_link.py writes it; without
+ *     and its call stack: host functions by name when <exe name>.map is next to the exe (build.py link writes it; without
  *     it: module + offset), functions of the lifted game as "guest f_<address>", system and driver DLLs by nearest export.
+ * The first two reports also write a minidump (<exe name>_freeze_<time>.dmp; hostrt.c diag_minidump). With SSBU_REPORT_DIR
+ * set, the report and the dumps go to that folder instead of next to the exe.
  * The report is repeated after 4x the time (5 s, 20 s, 80 s, ...), at most 6 times a run; a line says when frames come back.
  * It only reads: nothing is unblocked or killed. Threads are suspended one at a time for the few microseconds of the unwind;
  * nothing is printed or allocated while one is suspended. */
 #include <tlhelp32.h>
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
+int diag_report_path(char *out, size_t size, const char *suffix);     /* hostrt.c */
+void diag_minidump(EXCEPTION_POINTERS *ep, const char *why);
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile LONG g_wd_quit;
 static HANDLE g_wd_thread;
@@ -127,12 +131,12 @@ static void wd_owner(const char *name, CRITICAL_SECTION *cs) {
 unsigned long nvn_front_present_tid(void);         /* nvn_gl.c */
 static void wd_dump(double stall_s, LONG64 tries_since) {
     static struct { DWORD tid; ULONGLONG cpu0, cpu1, born; int prio, nfr; uint64_t pc[28]; } th[400];
-    char path[MAX_PATH + 16], tb[48], ab[400];
+    char path[2 * MAX_PATH], tb[48], ab[400];
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     SYSTEMTIME st; GetLocalTime(&st);
-    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId(), n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     int nt = 0;
-    if (n > 4) { strcpy(path + n - 4, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
+    if (diag_report_path(path, sizeof path, "_freeze.txt")) g_wd_fp = fopen(path, "ab");
     wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)pid, (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
@@ -311,6 +315,7 @@ static DWORD WINAPI wd_main(void *arg) {
         if (IsIconic((HWND)nvn_front_hwnd()) && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
         if (s < 4.0) dumps_short++; else dumps++;
         wd_dump(s, g_wd_try - try0);
+        { static int minidumps; if (minidumps++ < 2) diag_minidump(NULL, "freeze"); }      /* the first two reports, short or long */
         reported = s; next = s < 4.0 ? 5.0 : s * 4;      /* session 13: 1 s, then 5 s, 20 s, 80 s, ... */
     }
     return 0;
@@ -323,7 +328,7 @@ static void wd_start(void) {
     if (limit < 1) limit = 1;
     g_wd_thread = CreateThread(NULL, 0, wd_main, &limit, 0, NULL);
     if (g_wd_thread) SetThreadPriority(g_wd_thread, THREAD_PRIORITY_ABOVE_NORMAL);
-    printf("nvn_vk_watchdog: on: a report of every thread (locks, waits, call stacks) is written to the log and to <exe>_freeze.txt when no frame reaches the window for %.0f s (SSBU_VK_WATCHDOG=<seconds>, 0 = off)\n", limit);
+    printf("nvn_vk_watchdog: on: a report of every thread (locks, waits, call stacks) is written to the log and to <exe>_freeze.txt (with a minidump) when no frame reaches the window for %.0f s (SSBU_VK_WATCHDOG=<seconds>, 0 = off)\n", limit);
 }
 /* Session 13, TEST ONLY (SSBU_STACKS_AT=<seconds>, read in nvn_gl.c): the report of every thread once, with either renderer
  * (found with it: why SSBU_RENDERER=gl stood still at its start). The Vulkan fields of the report are zero under OpenGL. */
