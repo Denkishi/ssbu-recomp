@@ -5299,6 +5299,13 @@ static void dev_finalize_command_handle(Ctx *c) {       /* (device, handle): the
  * of this file's (nvn_vk.c's own, through nvn_render_run) runs as it is. Step S2 replaces this table by the RBackend
  * interface. */
 void nvn_render_run(void (*fn)(void *), void *arg) { gl_run(fn, arg); }
+/* Pool/buffer finalization may be followed immediately by a decommit or reuse of the guest's storage. A queue barrier
+ * alone is insufficient on Vulkan: kept compute buffers and asynchronous landings outlive the jobs that used them. */
+void nvn_front_memory_retire(uint64_t addr, uint64_t size) {
+    if (!addr || !size || !g_render_tid) return;
+    if (g_rb == &rb_vk) { Range range = {addr, size}; gl_run(nvn_vk_memory_retire, &range); }
+    else gl_barrier();
+}
 /* Seam step S2: the OpenGL back end as an RBackend (nvn_front.h); rb_vk is in nvn_vk_draw.c. */
 static void rb_gl_idle(void) { gl_housekeeping(); }
 const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_present_movie, job_fence, job_sync_wait, job_server_wait, job_sync_drop, job_flush, job_finish,

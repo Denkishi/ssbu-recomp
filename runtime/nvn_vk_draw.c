@@ -1907,6 +1907,24 @@ static void cb_sync(void) {                        /* guest memory must hold wha
     }
     cb_land(mid);
 }
+/* Finalization runs in queue order, while the guest storage still exists. Drain every overlapping CB, including
+ * state 4 (an asynchronous landing). Never use the per-batch kept index here: cb_sync can add entries to it after
+ * that index was built. Unrelated kept buffers retain their GPU-side contents and their reuse opportunity. */
+static int cb_in_range(const CB *c, const Range *r) {
+    if (!c->size || !r->size) return 0;
+    return c->addr >= r->addr ? c->addr - r->addr < r->size : r->addr - c->addr < c->size;
+}
+void nvn_vk_memory_retire(void *arg) {
+    const Range *range = arg;
+    for (int i = 0; i < 256; i++) {
+        if (g_cb[i].state && g_cb[i].state <= 2 && cb_in_range(&g_cb[i], range)) { cb_sync(); break; }
+    }
+    for (int i = 0; i < 256; i++) {
+        CB *c = &g_cb[i];
+        if (c->state < 3 || !cb_in_range(c, range)) continue;
+        if (c->state == 3) cb_kept_land(c, 3); else cb_land_force(c, 3);
+    }
+}
 static void cb_batch_end(void) {
     if (!g_cb_live) return;
     g_cb_serial = cmd_submit(NULL, NULL);

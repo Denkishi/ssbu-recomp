@@ -99,7 +99,12 @@ static void builder_get_device(Ctx *c) { RET(g_device); }
 static void pool_builder_get_memory(Ctx *c) { RET(nobj(A0)->memory); }
 static void pool_builder_get_size(Ctx *c) { RET(nobj(A0)->size); }
 static void pool_builder_get_flags(Ctx *c) { RET(nobj(A0)->flags); }
-static void pool_finalize(Ctx *c) { nvn_label_drop(A0); nobj_drop(A0); }
+void nvn_front_memory_retire(uint64_t addr, uint64_t size);      /* finish deferred reads and compute copy-back before the guest releases this storage */
+static void pool_finalize(Ctx *c) {
+    NvnObj *o = nobj(A0);
+    nvn_front_memory_retire(o->memory, o->size);
+    nvn_label_drop(A0); nobj_drop(A0);
+}
 static void obj_set_label(Ctx *c) { nvn_label_set(A0, A1 ? (const char *)(uintptr_t)A1 : ""); }
 /* FlushMappedRange(object, offset, size): the CPU wrote this range and the GPU must see it. Pool memory is ordinary host memory here,
  * so what has to be told is the backend, which keeps copies of textures. */
@@ -109,7 +114,11 @@ static void buffer_builder_get_offset(Ctx *c) { RET(nobj(A0)->offset); }
 static void buffer_builder_get_size(Ctx *c) { RET(nobj(A0)->size); }
 static void buffer_get_pool(Ctx *c) { RET(nobj(A0)->pool); }
 static void buffer_get_offset(Ctx *c) { RET(nobj(A0)->offset); }
-static void buffer_finalize(Ctx *c) { nvn_label_drop(A0); nobj_drop(A0); }
+static void buffer_finalize(Ctx *c) {
+    NvnObj *o = nobj(A0);
+    nvn_front_memory_retire(o->memory, o->size);
+    nvn_label_drop(A0); nobj_drop(A0);
+}
 static void obj_debug_id(Ctx *c) { RET(A0); }
 static void pool_builder_storage(Ctx *c) { log_call(c); NvnObj *b = nobj(A0); b->memory = A1; b->size = A2; }   /* (builder, memory, size) */
 static void pool_builder_flags(Ctx *c) { nobj(A0)->flags = A1; }                                               /* (builder, flags) */
