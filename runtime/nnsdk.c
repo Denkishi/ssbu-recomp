@@ -86,8 +86,9 @@ static void os_AllocateAddressRegion(Ctx *c) {
     wr64(A0, (uint64_t)p);
     RET(p ? 0 : 0x1015);                                 /* any non-zero nn::Result means failure */
 }
-static void os_AllocateMemoryPages(Ctx *c) { RET(VirtualAlloc(P(0), (SIZE_T)A1, MEM_COMMIT, PAGE_READWRITE) ? 0 : 0x1015); }
-static void os_FreeMemoryPages(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), (SIZE_T)A1, MEM_DECOMMIT); cxxrt_mem_changed(); RET(0); }
+volatile LONG64 g_mp_alloc_n, g_mp_alloc_b, g_mp_free_n, g_mp_free_b;      /* calls and bytes, for the "nvn_vk_mem:" line (nvn_vk_draw.c) */
+static void os_AllocateMemoryPages(Ctx *c) { InterlockedIncrement64(&g_mp_alloc_n); InterlockedAdd64(&g_mp_alloc_b, (LONG64)A1); RET(VirtualAlloc(P(0), (SIZE_T)A1, MEM_COMMIT, PAGE_READWRITE) ? 0 : 0x1015); }
+static void os_FreeMemoryPages(Ctx *c) { InterlockedIncrement64(&g_mp_free_n); InterlockedAdd64(&g_mp_free_b, (LONG64)A1); cxxrt_mem_changed(); VirtualFree(P(0), (SIZE_T)A1, MEM_DECOMMIT); cxxrt_mem_changed(); RET(0); }
 static void os_FreeAddressRegion(Ctx *c) { cxxrt_mem_changed(); VirtualFree(P(0), 0, MEM_RELEASE); cxxrt_mem_changed(); RET(0); }
 
 /* ---- more libc */

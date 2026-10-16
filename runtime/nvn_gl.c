@@ -247,6 +247,7 @@ static CRITICAL_SECTION g_job_lock;
 static Job *g_job_head, *g_job_tail;
 static HANDLE g_job_event, g_ready_event;
 static DWORD g_render_tid;
+DWORD nvn_render_tid(void) { return g_render_tid; }      /* boot.c SSBU_PROF mode h */
 static HWND g_hwnd;
 static HDC g_dc;
 static __declspec(thread) HANDLE t_done;
@@ -345,6 +346,8 @@ static GLuint g_gs_last_prog[2];
 static uint32_t g_gs_last_attr[16];
 static inline LONG64 pf_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 static inline void pf_add(int k, LONG64 t0) { InterlockedExchangeAdd64(&g_pf[k], pf_now() - t0); InterlockedIncrement64(&g_pfn[k]); }
+LONG64 nvn_pf_waits(void) { return g_pf[PF_WAIT_SUBMIT] + g_pf[PF_WAIT_PRESENT] + g_pf[PF_WAIT_OTHER]; }      /* display.c: frame-split line */
+LONG64 nvn_pf_paced(void) { return g_pf[PF_PACE]; }
 void nvn_pf_pace(LONG64 ticks) { InterlockedExchangeAdd64(&g_pf[PF_PACE], ticks); InterlockedIncrement64(&g_pfn[PF_PACE]); }     /* display.c */
 
 static void logf_limited(int *counter, int limit, const char *fmt, ...) {
@@ -5144,9 +5147,13 @@ void nvn_front_ccmp_landed(void) {
     }
     g_ccmp_npend = 0;
 }
+/* nvn_vk_draw.c present thread (SSBU_PRESENT_PACE): the frame times are taken when a frame really goes to the window, so the
+ * mark is made there (nvn_front_frame_mark) and not at the end of the render thread's present job. */
+volatile LONG g_front_mark_external;
+void nvn_front_frame_mark(long long frame) { pf_frame_mark((LONG64)frame); }
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears) {
     LONG64 frame = g_st.frames + 1;
-    pf_frame_mark(frame);
+    if (!g_front_mark_external) pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;
     if (frame <= 3 || frame % 600 == 0 || draws != 0 && g_logn < 40 && (g_logn++, 1))
@@ -5199,9 +5206,33 @@ static void vk_shutdown_at_exit(void) {
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
+/* Performance: this walked every texture record ever made (about 5,000 in a fight) at every flush, 3 % of the main thread's
+ * samples. Now an index sorted by start address with the running maximum of the ends (rebuilt when a texture was made since,
+ * dead ones dropped then): the textures marked are the same (alive, storage overlapping the range). */
+typedef struct { uint64_t lo, hi, maxhi; Tex *t; } TexIv;
+static TexIv *g_tiv;
+static int g_ntiv, g_tiv_cap;
+static Tex *g_tiv_head;
+static SRWLOCK g_tiv_lock = SRWLOCK_INIT;
+static int tiv_cmp(const void *a, const void *b) { const TexIv *x = a, *y = b; return x->lo < y->lo ? -1 : x->lo > y->lo; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
-    for (Tex *t = g_all_tex; t; t = t->all_next)
-        if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    AcquireSRWLockExclusive(&g_tiv_lock);
+    Tex *head = g_all_tex;
+    if (head != g_tiv_head) {                      /* textures were made since the index was built: build it again */
+        int n = 0;
+        for (Tex *t = head; t; t = t->all_next) if (!t->dead && t->mem) n++;
+        if (n > g_tiv_cap) { g_tiv_cap = n * 2 + 256; g_tiv = realloc(g_tiv, sizeof *g_tiv * (size_t)g_tiv_cap); }
+        n = 0;
+        for (Tex *t = head; t; t = t->all_next) if (!t->dead && t->mem) { g_tiv[n].lo = (uint64_t)(uintptr_t)t->mem; g_tiv[n].hi = g_tiv[n].lo + t->storage; g_tiv[n].t = t; n++; }
+        qsort(g_tiv, (size_t)n, sizeof *g_tiv, tiv_cmp);
+        for (int i = 0; i < n; i++) g_tiv[i].maxhi = i && g_tiv[i - 1].maxhi > g_tiv[i].hi ? g_tiv[i - 1].maxhi : g_tiv[i].hi;
+        g_ntiv = n; g_tiv_head = head;
+    }
+    int lo = 0, hi = g_ntiv;                       /* first entry with start >= addr + size */
+    while (lo < hi) { int mid = (lo + hi) / 2; if (g_tiv[mid].lo < addr + size) lo = mid + 1; else hi = mid; }
+    for (int i = lo - 1; i >= 0 && g_tiv[i].maxhi > addr; i--)
+        if (g_tiv[i].hi > addr && !g_tiv[i].t->dead) g_tiv[i].t->dirty = 1;
+    ReleaseSRWLockExclusive(&g_tiv_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {

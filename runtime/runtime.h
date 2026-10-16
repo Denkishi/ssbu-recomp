@@ -44,6 +44,13 @@ void guest_svc(Ctx *c, uint32_t number);
     static inline uint##bits##_t rd##bits(uint64_t a) { uint##bits##_t v; memcpy(&v, (void *)(uintptr_t)a, sizeof v); return v; } \
     static inline void wr##bits(uint64_t a, uint##bits##_t v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
+/* Ordered and exclusive loads / stores (LDAR, STLR, LDAXR, LDXR): atomics with the guest's ordering. On x86 they are plain
+ * moves; what they add is that the compiler keeps them in order with the accesses around them. */
+#define DEF_ORD(bits) \
+    static inline uint##bits##_t lda##bits(uint64_t a) { return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_ACQUIRE); } \
+    static inline uint##bits##_t ldx##bits(uint64_t a) { return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_RELAXED); } \
+    static inline void stl##bits(uint64_t a, uint##bits##_t v) { __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_RELEASE); }
+DEF_ORD(8) DEF_ORD(16) DEF_ORD(32) DEF_ORD(64)
 
 /* STXR: store only if the location still holds the value the matching LDXR read. Returns 0 on success. */
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);

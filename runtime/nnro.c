@@ -410,6 +410,7 @@ static int attach_dll(NroModule *m) {
         dll = LoadLibraryA(path);
     }
     if (!dll) return 0;
+    { void resident_module(void *); resident_module(dll); }     /* boot.c: its code pages are read in the background now, not at their first call */
     NroBindFn bind = (NroBindFn)(void *)GetProcAddress(dll, "nro_bind");
     if (!bind) { FreeLibrary(dll); return 0; }
     NroTables t;

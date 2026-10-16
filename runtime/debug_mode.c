@@ -57,6 +57,7 @@ static void scan_copies(uint64_t rec) {
 /* SSBU_DEBUG_WATCH=1: hardware write watchpoints (debug registers of every thread) on a few fields of the first two
  * records; each write prints the guest functions on the stack of the writer (finds the code that fills the record). */
 #include <tlhelp32.h>
+int hfr_setting(void);                                /* hfr.c */
 /* SSBU_DEBUG_MATCH="p1=<fighter>,p2=<fighter>,stage=<name>,form=omega,cpu=<level>,items=off|on,time=<min>|stock=<n>" */
 static struct { int p[2]; char stage[48]; int omega, cpu, items, time, stock; char text[256]; } g_dm = {{-1, -1}, "", 0, -1, -1, -1, -1, ""};
 static char g_dm_name[2][32];
@@ -328,7 +329,7 @@ static DWORD WINAPI dump_thread(LPVOID arg) {
 
 void debug_mode_init(void) {
     const char *end = getenv("SSBU_DEBUG_END"), *list = getenv("SSBU_DEBUG_MATCH_LIST");
-    if (end && atof(end) > 0) { g_end_limit = (LONG64)(strchr(end, 's') ? atof(end) * 60.0 : atof(end)); printf("debug end: the run ends after %lld fight frames\n", (long long)g_end_limit); }
+    if (end && atof(end) > 0) { g_end_limit = (LONG64)(strchr(end, 's') ? atof(end) * (double)hfr_setting() : atof(end));      /* presented frames: 120 per second of fight with frame_rate = 120 */ printf("debug end: the run ends after %lld fight frames\n", (long long)g_end_limit); }
     if (list && !(g_dm_list = fopen(list, "r"))) printf("debug match: SSBU_DEBUG_MATCH_LIST: cannot open %s\n", list);
     if (g_dm_list && !getenv("SSBU_DEBUG_MATCH")) snprintf(g_dm.text, sizeof g_dm.text, "(list)");
     if (getenv("SSBU_DEBUG_MATCH") || g_dm_list) {

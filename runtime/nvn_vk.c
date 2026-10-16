@@ -33,6 +33,8 @@
 static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties *dext, uint32_t ndext);     /* nvn_vk_draw.c (included at the end) */
 static void vkd_init(void);
 static void vkd_shutdown(void);
+static void pq_drain(void);                               /* nvn_vk_draw.c: the present thread has shown every frame handed to it */
+static SRWLOCK g_qlock = SRWLOCK_INIT;                    /* vkQueueSubmit / vkQueuePresentKHR: the render thread and the present thread share the queue */
 
 typedef char vk_min_check_properties[sizeof(VkPhysicalDeviceProperties) == 824 ? 1 : -1];
 typedef char vk_min_check_caps[sizeof(VkSurfaceCapabilitiesKHR) == 52 ? 1 : -1];
@@ -178,6 +180,7 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 static void wait_last_submit(void);
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
+    pq_drain();
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
@@ -432,6 +435,7 @@ static void wait_last_submit(void) {
 /* Clears the next swapchain image to one colour and presents it. Never waits for the display (see the present mode). */
 static void present_colour(const float rgba[4]) {
     if (!V.alive) return;
+    pq_drain();
     wait_last_submit();
     if (!V.swapchain && !swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
     uint32_t index = 0;
@@ -472,7 +476,9 @@ static void present_colour(const float rgba[4]) {
     sb.waitSemaphoreCount = 1; sb.pWaitSemaphores = &V.acquired; sb.pWaitDstStageMask = &wait_stage;
     sb.commandBufferCount = 1; sb.pCommandBuffers = &V.cmd;
     sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &V.rendered;
+    AcquireSRWLockExclusive(&g_qlock);
     r = vkQueueSubmit(V.queue, 1, &sb, V.fence);
+    ReleaseSRWLockExclusive(&g_qlock);
     if (!vk_ok("vkQueueSubmit", r)) { InterlockedIncrement64(&g_vk_skipped); return; }
     V.fence_pending = 1;
 
@@ -480,7 +486,9 @@ static void present_colour(const float rgba[4]) {
     memset(&pr, 0, sizeof pr);
     pr.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &V.rendered; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
+    AcquireSRWLockExclusive(&g_qlock);
     r = vkQueuePresentKHR(V.queue, &pr);
+    ReleaseSRWLockExclusive(&g_qlock);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
     else vk_ok("vkQueuePresentKHR", r);
     InterlockedIncrement64(&g_vk_frames);

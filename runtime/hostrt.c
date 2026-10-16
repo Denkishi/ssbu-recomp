@@ -193,10 +193,17 @@ void icall_dump(FILE *out, uint64_t main_ctx) {
                     (unsigned long long)g_icall[i].x0, (unsigned long long)g_icall[i].x1, (unsigned long long)g_icall[i].x2);
 }
 
+/* Performance: a small per-thread cache in front of the hash table (megabytes, one cache miss or two per lookup): virtual
+ * calls go to few targets. The table never changes once built, so a cached answer stays right. */
+#define ICACHE_N 2048
+static __declspec(thread) struct { uint64_t addr; void (*fn)(Ctx *); } t_icache[ICACHE_N];
 void call_indirect(Ctx *c, uint64_t addr) {
     if (g_icall_mode) icall_record(c, addr);
     if (addr - GUEST_BASE < IMAGE_SIZE) {            /* P3: the common case first (a function of main); the ranges tested below do not overlap it */
+        unsigned k = (unsigned)(addr >> 2) & (ICACHE_N - 1);
+        if (t_icache[k].addr == addr) { t_icache[k].fn(c); return; }
         void (*fn)(Ctx *) = lookup_guest(addr);
+        if (fn && g_fn_mask) { t_icache[k].addr = addr; t_icache[k].fn = fn; }
         if (!fn) guest_trap("indirect call to an address that is not a known function", addr);
         fn(c);
         return;

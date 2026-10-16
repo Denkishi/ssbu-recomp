@@ -267,8 +267,16 @@ class Fn:
             return SET(bits(w, 4, 0), 1, '0ULL')        # fpcr / fpsr read
         if (w & 0xffffffe0) in (0xd51b4400, 0xd51b4420):
             return ';'                                   # fpcr / fpsr write
-        if (w & 0xfffff0ff) in (0xd503305f, 0xd50330bf, 0xd503309f, 0xd50330df):
-            return ';'                                   # clrex / dmb / dsb / isb
+        if (w & 0xfffff0ff) == 0xd503305f:
+            return ';'                                   # clrex
+        # dmb / dsb / isb: the order the guest asks for. On x86 (TSO) an acquire or release fence costs nothing but forbids the
+        # compiler to move memory accesses across it; a full barrier is an mfence. Before, all three were ';': correct only
+        # as long as the compiler kept the guest's order by chance (clang 9 -O1 did; clang 23 -O2 does not).
+        if (w & 0xfffff0ff) in (0xd50330bf, 0xd503309f):
+            kind = bits(w, 9, 8)                         # CRm<1:0>: 1 loads only (LD), 2 stores only (ST), 3 / 0 all
+            return {1: '__atomic_thread_fence(__ATOMIC_ACQUIRE);', 2: '__atomic_thread_fence(__ATOMIC_RELEASE);'}.get(kind, '__atomic_thread_fence(__ATOMIC_SEQ_CST);')
+        if (w & 0xfffff0ff) == 0xd50330df:
+            return '__atomic_signal_fence(__ATOMIC_SEQ_CST);'     # isb: no reordering by the compiler
         raise Unimpl('system')
 
     # ---- loads and stores
@@ -367,12 +375,12 @@ class Fn:
                 raise Unimpl('excl-pair')
             nb = 8 << size
             rs = bits(w, 20, 16)
-            if o2:                                       # ldar / stlr: ordered, not exclusive
+            if o2:                                       # ldar / stlr: ordered (acquire / release atomics: runtime.h lda / stl)
                 if load:
-                    return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
-                return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
-            if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
+                    return SET(rt, 1, 'lda%d(%s)' % (nb, XS(rn)))
+                return 'stl%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
+            if load:                                     # ldxr / ldaxr: remember address and value (ldaxr: an acquire load)
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = %s%d(a); %s }' % (XS(rn), 'lda' if bits(w, 15, 15) else 'ldx', nb, SET(rt, 1, 'c->ex_val'))
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
             return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store

@@ -1666,6 +1666,7 @@ static void prewarm_wait(void) {                   /* render thread, before its 
     fflush(stdout);
     free(g_pw_rec); g_pw_rec = NULL;
 }
+static LONG64 g_crun_hit, g_crun_vq;          /* run_below (further down): answers from its record, VirtualQuery calls */
 static void m4_report(void) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     if (D.has_gpl) {
@@ -1688,6 +1689,7 @@ static void m4_report(void) {
     printf("nvn_vk: texture descriptor sets: %lld reused after a full comparison of their lists, %lld hash hits with a different list (given a set of their own); samplers given a dummy because the texture is of another kind than the shader declares: %lld\n", (long long)R.sets_reused, (long long)R.tset_collisions, (long long)R.dummy_kind);
     printf("nvn_vk_m4: holds of the render thread at a draw: %lld, %.0f ms in all, longest %.1f ms (stage made at the draw %lld / %.0f ms, stage waited for %lld / %.0f ms, pipeline made at the draw %lld / %.0f ms, pipeline waited for %lld / %.0f ms)\n",
            (long long)n, (double)t * k, (double)g_hold_max * k, (long long)g_hold_n[0], (double)g_hold_tk[0] * k, (long long)g_hold_n[1], (double)g_hold_tk[1] * k, (long long)g_hold_n[2], (double)g_hold_tk[2] * k, (long long)g_hold_n[3], (double)g_hold_tk[3] * k);
+    printf("nvn_vk_cscan: readable runs: %lld answered from the record, %lld VirtualQuery calls\n", (long long)g_crun_hit, (long long)g_crun_vq);
     printf("nvn_vk_m4: workers: %lld programs handed over, %lld stages made by them, %lld pipelines made by them; look-ahead: %lld pipelines and %lld draws with stages still to make sent ahead, %.0f ms of reading in all; blind prediction: %lld keys, %lld used; pass signatures %d; nvnProgramSetShaders held its caller %lld times, %.0f ms in all\n",
            (long long)g_w_progs, (long long)g_w_stages, (long long)g_w_pipes, (long long)g_scan_pipes, (long long)g_scan_jobs, (double)g_tm[9] * k, (long long)g_pred_made, (long long)g_pred_used, g_nsig, (long long)g_set_held, (double)g_set_held_tk * k);
     printf("nvn_vk_cscan: searches for a container header: %lld made (%lld given up at their time budget); answered by an interval a failed search had proved empty: %lld at once, %lld after looking at the steps above it\n", (long long)g_cs_search, (long long)g_cs_gaveup, (long long)g_cs_neg_hit, (long long)g_cs_neg_ext);
@@ -1865,20 +1867,69 @@ static void cont_learn(PairRec *pr) {              /* g_sh_lock held: a pair of 
  * (VirtualQuery over an area cut into very many regions, memory not touched before) = the frame of 362-441 ms at the
  * start of the fight. A search that finds its container takes 0.0-0.6 ms, 5.4 ms for the largest container seen. */
 static LONG64 g_cs_gaveup;
+/* Readable runs (performance). VirtualQuery answers for the page asked about and the run of pages with the same state ABOVE it,
+ * walking the page tables to the run's end: 2-5 ms inside the game's heap (gigabytes committed in one run). The searches
+ * below go DOWN from an address, so they asked once per 4 KB step: 8 steps between two budget checks were 30-50 ms, and a
+ * frame where the game makes 15 programs lost 0.5 s (nvn_setsh lines of run "diag3 memcounters"). Now run_below asks once at
+ * the lowest address the search may reach (one answer usually covers the whole range) and remembers the runs in the game's
+ * own regions until guest memory is next decommitted, released or protected (nncxxrt.c epoch), as cxxrt_readable does. */
+LONG cxxrt_mem_epoch(void); int cxxrt_is_guest(uint64_t p);
+static struct { uint64_t lo, hi; LONG epoch; } g_crun[8];
+static unsigned g_crun_next;
+static SRWLOCK g_crun_lock = SRWLOCK_INIT;
+static int vq_readable(uint64_t x, uint64_t *hi) {
+    MEMORY_BASIC_INFORMATION mi;
+    InterlockedIncrement64(&g_crun_vq);
+    if (!VirtualQuery((const void *)(uintptr_t)x, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
+    *hi = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+    return 1;
+}
+/* The lowest page-aligned L >= stop (rounded down to its page) such that [L, a + 32) is committed and readable; 0 when a is not. */
+static uint64_t run_below(uint64_t a, uint64_t stop, LONG64 t0, LONG64 budget) {
+    LONG ep = cxxrt_mem_epoch();
+    int guest = cxxrt_is_guest(a);
+    uint64_t s = stop & ~(uint64_t)4095, L = a & ~(uint64_t)4095, hi = 0;
+    if (guest) {
+        AcquireSRWLockShared(&g_crun_lock);
+        for (int i = 0; i < 8; i++) if (g_crun[i].epoch == ep && g_crun[i].lo <= a && a + 32 <= g_crun[i].hi) { L = g_crun[i].lo > s ? g_crun[i].lo : s; hi = 1; break; }
+        ReleaseSRWLockShared(&g_crun_lock);
+        if (hi) { InterlockedIncrement64(&g_crun_hit); return L; }
+    }
+    if (!vq_readable(a, &hi) || a + 32 > hi) return 0;
+    uint64_t rlo = L, rhi = hi, try_at[2] = {s, a > s + (1u << 20) ? (a - (1u << 20)) & ~(uint64_t)4095 : s};
+    for (int k = 0; k < 2 && rlo > s; k++) {       /* one answer from below usually covers the whole range */
+        uint64_t h2;
+        if (try_at[k] >= rlo || (budget && tk() - t0 > budget)) continue;
+        if (vq_readable(try_at[k], &h2) && h2 >= a + 32) { rlo = try_at[k]; if (h2 > rhi) rhi = h2; }
+    }
+    if (guest && cxxrt_mem_epoch() == ep) {
+        AcquireSRWLockExclusive(&g_crun_lock);
+        unsigned k = g_crun_next++ & 7;
+        g_crun[k].lo = rlo; g_crun[k].hi = rhi; g_crun[k].epoch = ep;
+        ReleaseSRWLockExclusive(&g_crun_lock);
+    }
+    return rlo;
+}
 static uint64_t cont_find(uint64_t control, uint64_t *size, uint64_t *neg_lo, LONG64 budget) {
     uint64_t step = g_cscan_step, a = control & ~(step - 1), stop = control > (g_cscan_reach << 20) ? control - (g_cscan_reach << 20) : 0x10000;
     LONG64 t0 = tk();
     unsigned nstep = 0;
     *neg_lo = 0;
     if ((control >> 28) == 0x710) return 0;        /* inside the game's own image (0x7100000000 + 256 MB): a program built into the exe, no container; the image is thousands of small regions for VirtualQuery (40 ms a search, measured) */
+    LONG64 vq_tk = 0, vq_max = 0; int nreg = 0;      /* "nvn_vk_cfind:" lines (first 60): a search that took more than twice its budget, and where the time went */
+    #define CF_DIAG(why) do { LONG64 tt_ = tk() - t0; static LONG nl_; if (tt_ > 2 * budget && budget && InterlockedIncrement(&nl_) <= 60) { LARGE_INTEGER f_; QueryPerformanceFrequency(&f_); printf("nvn_vk_cfind: %s after %.1f ms: %u steps, %d regions, VirtualQuery %.1f ms (longest %.1f ms), control %llx%c", why, tt_ * 1000.0 / f_.QuadPart, nstep, nreg, vq_tk * 1000.0 / f_.QuadPart, vq_max * 1000.0 / f_.QuadPart, (unsigned long long)control, 10); } } while (0)
     for (int regions = 0; a >= stop && regions < 256; regions++) {
-        MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery((const void *)(uintptr_t)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) break;
-        uint64_t lo = (uint64_t)(uintptr_t)mi.BaseAddress;
+        if (budget && tk() - t0 > budget) { CF_DIAG("given up (region)"); InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
+        LONG64 tq = tk();
+        uint64_t lo = run_below(a, stop, t0, budget);
+        tq = tk() - tq; vq_tk += tq; if (tq > vq_max) vq_max = tq; nreg++;
+        if (!lo) break;
         if (lo < stop) lo = stop;
-        if (budget && tk() - t0 > budget) { InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
         for (; a >= lo; a -= step) {
-            if (budget && (++nstep & 255) == 0 && tk() - t0 > budget) { InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
+            /* every 8 steps (was 256): a step reads a page of its own, and on a PC short of memory that page may have been
+             * trimmed (a read from the page file): 256 such steps were 0.1-1.1 s on the game's main thread in fight frames
+             * (nvn_setsh lines of run "resident split32 run1", SSBU_VK_PREP=0) */
+            if (budget && (++nstep & 7) == 0 && tk() - t0 > budget) { CF_DIAG("given up (step)"); InterlockedIncrement64(&g_cs_gaveup); *neg_lo = a + step; return 0; }
             if (g32(a) == 0x48534E42u && (g32(a + 0xC) & 0xffff) == 0xFEFFu) {
                 uint64_t sz = g32(a + 0x1C);
                 if (sz < 0x60 || control >= a + sz) { *neg_lo = a + (sz < step ? step : sz); return 0; }
@@ -1887,6 +1938,7 @@ static uint64_t cont_find(uint64_t control, uint64_t *size, uint64_t *neg_lo, LO
             }
         }
     }
+    CF_DIAG("ended");
     *neg_lo = a + step;
     return 0;
 }
@@ -1900,13 +1952,18 @@ typedef struct { uint64_t lo, hi; long long frame; } NegIv;
 static NegIv g_negiv[16];
 static int g_negiv_i;
 static LONG64 g_cs_neg_hit, g_cs_neg_ext, g_cs_search;
-static int cont_range_empty(uint64_t above, uint64_t control) {      /* 1: readable and no header at a step in (above, control] */
+static int cont_range_empty(uint64_t above, uint64_t control, LONG64 budget) {      /* 1: readable and no header at a step in (above, control]; -1: gave up at the time budget (ticks, 0 = none) */
     uint64_t step = g_cscan_step, a = control & ~(step - 1);
+    LONG64 t0 = tk();
+    unsigned nstep = 0;
     while (a > above) {
-        MEMORY_BASIC_INFORMATION mi;
-        if (!VirtualQuery((const void *)(uintptr_t)a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
-        uint64_t lo = (uint64_t)(uintptr_t)mi.BaseAddress;
-        for (; a > above && a >= lo; a -= step) if (g32(a) == 0x48534E42u) return 0;
+        if (budget && tk() - t0 > budget) return -1;
+        uint64_t lo = run_below(a, above + 1, t0, budget);
+        if (!lo) return 0;
+        for (; a > above && a >= lo; a -= step) {
+            if (budget && (++nstep & 7) == 0 && tk() - t0 > budget) return -1;
+            if (g32(a) == 0x48534E42u) return 0;
+        }
     }
     return 1;
 }
@@ -2067,7 +2124,17 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
     }
     LeaveCriticalSection(&g_sh_lock);
     LONG64 t0 = tk();
-    if (ext >= 0 && cont_range_empty(ext_hi, control)) {      /* nothing new between the proved interval and this address: the same failure */
+    /* the budget: 10 ms; 20 ms for a pool outside a fight (loading). SSBU_VK_CSCAN_BUDGET=<ms> (0 = none, as before session 8) */
+    static int bms = -1; static LONG64 fqq;
+    if (bms < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fqq = f.QuadPart; bms = getenv("SSBU_VK_CSCAN_BUDGET") ? atoi(getenv("SSBU_VK_CSCAN_BUDGET")) : 10; }
+    LONG64 budget = (LONG64)bms * (from_pool && !fight_recent() ? 2 : 1) * fqq / 1000;
+    int empty = ext >= 0 ? cont_range_empty(ext_hi, control, budget) : 0;
+    if (empty < 0) {                               /* the budget ran out in the steps above the interval: given up, as cont_find does */
+        InterlockedIncrement64(&g_cs_gaveup);
+        nvn_setsh_part[2] += tk() - t0; InterlockedAdd64(&g_cs_tk, tk() - t0);
+        return;
+    }
+    if (empty) {                                   /* nothing new between the proved interval and this address: the same failure */
         EnterCriticalSection(&g_sh_lock);
         if (g_negiv[ext].hi == ext_hi) g_negiv[ext].hi = control;
         g_cs_neg_ext++;
@@ -2076,11 +2143,7 @@ void nvn_vk_container_seen(uint64_t control, uint64_t prog) {
         return;
     }
     uint64_t size = 0, neg_lo = 0, base = 0;
-    {   /* the budget: 10 ms; 20 ms for a pool outside a fight (loading). SSBU_VK_CSCAN_BUDGET=<ms> (0 = none, as before session 8) */
-        static int bms = -1; static LONG64 fqq;
-        if (bms < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fqq = f.QuadPart; bms = getenv("SSBU_VK_CSCAN_BUDGET") ? atoi(getenv("SSBU_VK_CSCAN_BUDGET")) : 10; }
-        base = cont_find(control, &size, &neg_lo, (LONG64)bms * (from_pool && !fight_recent() ? 2 : 1) * fqq / 1000);
-    }
+    base = cont_find(control, &size, &neg_lo, budget);
     InterlockedIncrement64(&g_cs_search);
     nvn_setsh_part[2] += tk() - t0;
     if (g_cscan_log && (control >> 28) != 0x710) {
