@@ -761,12 +761,14 @@ int nnfs_selftest(Ctx *c) {
     return bad;
 }
 
-/* ---- nn::account: one local user.
- * Its id is {1, 0}, unless the machine plays local wireless over the internet (config\online.ini, ldn_online.inc):
- * then players must be told apart as on consoles, where every user has a random 128-bit id. The id is then read
- * from config\account.txt (32 hex digits), written there once from random bytes; SSBU_ACCOUNT_UID=<32 hex digits>
- * overrides both (two copies of the game on one PC). */
+/* ---- nn::account: one local user, id {1, 0}.
+ * In a build with local wireless over the internet (SSBU_LDN_ONLINE, ldn_online.inc) and while it is configured,
+ * players must be told apart as on consoles, where every user has a random 128-bit id (with the same id on both sides
+ * the host never offered the newcomer a place): the id is then read from config\account.txt (32 hex digits), written
+ * there once from random bytes; SSBU_ACCOUNT_UID=<32 hex digits> overrides it (two copies of the game on one PC). */
 static uint64_t g_uid[2] = {1, 0};
+#ifdef SSBU_LDN_ONLINE
+const char *ldn_online_nickname(void);                     /* ldn_online.inc: non-NULL while online is configured */
 static void account_uid_init(void) {
     static volatile LONG done;
     if (InterlockedCompareExchange(&done, 1, 0) != 0) { while (done != 2) SwitchToThread(); return; }
@@ -775,21 +777,18 @@ static void account_uid_init(void) {
     char *slash = strrchr(exe, '\\');
     if (slash) *slash = 0;
     const char *env = getenv("SSBU_ACCOUNT_UID");
+    if (!ldn_online_nickname()) { done = 2; return; }
     if (env && strlen(env) >= 32) snprintf(text, sizeof text, "%s", env);
     else {
         snprintf(path, sizeof path, "%s\\..\\config\\account.txt", exe);
         FILE *f = fopen(path, "r");
         if (f) { if (!fgets(text, sizeof text, f)) text[0] = 0; fclose(f); }
         else {
-            char ini[MAX_PATH + 64];
-            snprintf(ini, sizeof ini, "%s\\..\\config\\online.ini", exe);
-            if (GetFileAttributesA(ini) != INVALID_FILE_ATTRIBUTES) {
-                uint8_t r[16] = {0};
-                HCRYPTPROV prov;
-                if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 16, r); CryptReleaseContext(prov, 0); }
-                for (int i = 0; i < 16; i++) sprintf(text + i * 2, "%02x", r[i]);
-                if ((f = fopen(path, "w"))) { fprintf(f, "%s\n", text); fclose(f); }
-            }
+            uint8_t r[16] = {0};
+            HCRYPTPROV prov;
+            if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 16, r); CryptReleaseContext(prov, 0); }
+            for (int i = 0; i < 16; i++) sprintf(text + i * 2, "%02x", r[i]);
+            if ((f = fopen(path, "w"))) { fprintf(f, "%s\n", text); fclose(f); }
         }
     }
     if (strlen(text) >= 32) {
@@ -797,10 +796,13 @@ static void account_uid_init(void) {
         memcpy(hi, text, 16); hi[16] = 0; memcpy(lo, text + 16, 16); lo[16] = 0;
         uint64_t h = _strtoui64(hi, NULL, 16), l = _strtoui64(lo, NULL, 16);
         if (h || l) { g_uid[0] = l; g_uid[1] = h; }
-        printf("nn::account: user id %016llx%016llx\n", (unsigned long long)g_uid[1], (unsigned long long)g_uid[0]);
+        printf("nn::account: user id from %s (local wireless over the internet)\n", env && strlen(env) >= 32 ? "SSBU_ACCOUNT_UID" : "config\\account.txt");
     }
     done = 2;
 }
+#else
+static void account_uid_init(void) {}
+#endif
 void account_uid(uint64_t *lo, uint64_t *hi) { account_uid_init(); *lo = g_uid[0]; *hi = g_uid[1]; }   /* also nnmisc.c */
 static void acc_ListAllUsers(Ctx *c) { account_uid_init(); wr32(A0, 1); if ((int)A2 > 0) { wr64(A1, g_uid[0]); wr64(A1 + 8, g_uid[1]); } RET(0); }
 static volatile LONG g_acc_user_open;                    /* the one local user has been opened (there is no CloseUser import) */
@@ -808,13 +810,17 @@ int account_user_is_open(uint64_t lo, uint64_t hi) { account_uid_init(); return 
 static void acc_TryOpenPreselectedUser(Ctx *c) { account_uid_init(); wr64(A0, g_uid[0]); wr64(A0 + 8, g_uid[1]); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(1); }
 static void acc_GetUserId(Ctx *c) { account_uid_init(); wr64(A0, g_uid[0]); wr64(A0 + 8, g_uid[1]); RET(0); }
 /* The nickname of the console user is the name of the Windows user (SSBU_NICKNAME overrides): UTF-8, at most 32
- * bytes, NUL-terminated, in the 33-byte Nickname. */
+ * bytes, NUL-terminated, in the 33-byte Nickname. Local wireless over the internet uses its own, required nickname. */
 static void acc_GetNickname(Ctx *c) {
     static char name[33];
     static volatile LONG ready;
     if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
         const char *env = getenv("SSBU_NICKNAME");
         char utf8[512] = "";
+#ifdef SSBU_LDN_ONLINE
+        const char *online = ldn_online_nickname();       /* online: the explicit nickname, never the Windows user name */
+        if (online) env = online;
+#endif
         if (env && env[0]) snprintf(utf8, sizeof utf8, "%s", env);
         else {
             wchar_t wname[257] = L"";

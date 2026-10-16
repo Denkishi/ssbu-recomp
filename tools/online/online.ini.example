@@ -1,9 +1,12 @@
-# Local wireless over the internet (runtime/ldn_online.inc). Copy this file to build\config\online.ini and fill it in.
-# Without a server and a room the game behaves as before: local wireless reports "wireless off".
+# Local wireless over the internet (runtime/ldn_online.inc). Needs a build made with
+#     python scripts/setup.py ... --ldn-online on
+# Copy this file to build\config\online.ini and fill it in. Without server, room and nickname local wireless stays off
+# ("wireless off"), as in the default build. It is also refused while runahead = on in graphics.ini.
 #
-# server: the address of a room server (tools/online/ldn_room_server.py), host:port. TCP and UDP on that port must be open.
-# room:   the room password. Players with the same password see each other's rooms; anyone else does not.
-# name:   your name in the server's log (the game shows your console nickname, SSBU_NICKNAME or the Windows user name).
+# server:   a room server (tools/online/ldn_room_server.py) you or a friend run, host:port. TCP and UDP on that port must
+#           be reachable. There is no default server.
+# room:     the room password. Players with the same password see each other's rooms; anyone else does not.
+# nickname: the name the other players see (1 to 32 bytes). Required: the Windows user name is never sent.
 server = your.server.example:39010
 room = choose-a-password
-name = player
+nickname = your-nickname
