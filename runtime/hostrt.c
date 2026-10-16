@@ -232,12 +232,15 @@ void call_indirect(Ctx *c, uint64_t addr) {
 
 /* Register context of the guest code running on this host thread, for crash reports. */
 static __declspec(thread) Ctx *t_cur_ctx;
+/* not inlined: the guest call can switch fibers and resume on another host thread, and a thread variable's address
+ * kept across it would be the old thread's (os_threads.c, fiber_cur) */
+static __attribute__((noinline)) void set_cur_ctx(Ctx *c) { __asm__ volatile("" ::: "memory"); t_cur_ctx = c; }
 
 void call_guest(Ctx *c, uint64_t addr) {
     Ctx *saved = t_cur_ctx;
-    t_cur_ctx = c;
+    set_cur_ctx(c);
     call_indirect(c, addr);
-    t_cur_ctx = saved;
+    set_cur_ctx(saved);
 }
 
 static void dump_guest_registers(void) {
