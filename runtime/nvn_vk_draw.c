@@ -2382,7 +2382,7 @@ static void exec(const Cmd *m, int depth) {
 static int g_split = -1;
 static LONG64 g_split_mark, g_split_n;
 static void replay(uint64_t handle, int depth) {
-    if (g_split < 0) { const char *e = getenv("SSBU_VK_SPLIT"); g_split = e ? atoi(e) : 0; }
+    if (g_split < 0) { const char *e = getenv("SSBU_VK_SPLIT"); g_split = e ? atoi(e) : 32; }      /* measured best: 32 (16 / 8 / 64 lower) */
     size_t len = 0;
     uint8_t *data = nvn_front_list(handle, &len);
     if (!data) { static int n; if (n++ < 10) printf("nvn_vk: command handle %llx is unknown or expired\n", (unsigned long long)handle); return; }
@@ -2746,10 +2746,12 @@ swap: ;
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         cmd_submit(acq, rend);
         {   /* SSBU_PRESENT_MIN_US=<us> (EXPERIMENT): a frame is not shown sooner than that after the frame before */
-            static int min_us = -1; static LONG64 last, fq;
-            if (min_us < 0) { const char *e = getenv("SSBU_PRESENT_MIN_US"); min_us = e ? atoi(e) : 0; LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
-            if (min_us > 0 && !progress) {
-                LONG64 due = last + (LONG64)min_us * fq / 1000000, now = tk();
+            static int min_us = -2; static LONG64 last, fq;
+            if (min_us == -2) { const char *e = getenv("SSBU_PRESENT_MIN_US"); min_us = e ? atoi(e) : -1; LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
+            int hfr_rate(void);
+            LONG64 min_ticks = min_us >= 0 ? (LONG64)min_us * fq / 1000000 : hfr_rate() == 120 ? fq * 984 / 120000 : 0;      /* unset: 98.4 % of a refresh in a 120 Hz battle (8.2 ms, measured best), else none */
+            if (min_ticks > 0 && !progress) {
+                LONG64 due = last + min_ticks, now = tk();
                 if (last && now < due) {
                     if ((due - now) * 1000 > 2 * fq) Sleep((DWORD)((due - now) * 1000 / fq) - 1);
                     while (tk() < due) YieldProcessor();

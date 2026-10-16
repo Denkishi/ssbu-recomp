@@ -118,7 +118,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f; o->frame_rate = 60;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->frame_rate = 60; o->pace_early = -1;
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -153,6 +153,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     }
     if (f) fclose(f);
     { const char *e = getenv("SSBU_PACE_EARLY"); if (e && e[0]) o->pace_early = atoi(e) != 0; }
+    if (o->pace_early < 0) o->pace_early = o->frame_rate == 120;      /* no pacing key: early in the 120 Hz mode, as before at 60 */
     { const char *e = getenv("SSBU_FRAME_RATE"); if (e && e[0]) o->frame_rate = atoi(e) == 120 ? 120 : 60; }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
