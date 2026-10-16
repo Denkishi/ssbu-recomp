@@ -1,8 +1,8 @@
 """Extract the RomFS of a Switch title with an update applied.
 
-    python romfs_extract.py <base.nsp> <update.nsp> <output_dir> [--list]
+    python romfs_extract.py <base.nsp|base.xci> <update.nsp|update.xci> <output_dir> [--list]
 
-Reads the Program NCA of both packages straight from the NSP files, applies
+Reads the Program NCA of both packages straight from the NSP or XCI files, applies
 the update's relocation table (BKTR) over the base RomFS and writes the
 resulting files. Keys come from ~/.switch/prod.keys; title keys from the
 tickets inside the packages.
@@ -63,6 +63,42 @@ class Nsp:
             if n.endswith('.tik'):
                 return self.read(n, 0, self.files[n][1])
         return None
+
+
+def hfs0_files(f, off):
+    """Entries of the HFS0 partition at `off`: name -> (absolute offset, size)."""
+    f.seek(off)
+    magic, count, strings_size, _ = struct.unpack('<4sIII', f.read(16))
+    assert magic == b'HFS0', 'HFS0 partition not found at %#x' % off
+    entries = [struct.unpack('<QQII8x32s', f.read(0x40)) for _ in range(count)]
+    strings = f.read(strings_size)
+    base = off + 16 + 0x40 * count + strings_size
+    return {strings[n:strings.index(b'\0', n)].decode(): (base + o, s) for o, s, n, _, _ in entries}
+
+
+class Xci(Nsp):
+    """A cartridge image: header 'HEAD' at 0x100, the root HFS0 at the offset stored at 0x130; the game's NCAs are in its
+    'secure' partition. Cartridge NCAs use the key area (no rights id), so no ticket is needed."""
+
+    def __init__(self, path):
+        self.f = open(path, 'rb')
+        self.f.seek(0x100)
+        assert self.f.read(4) == b'HEAD', '%s is not an XCI' % path
+        self.f.seek(0x130)
+        root = hfs0_files(self.f, struct.unpack('<Q', self.f.read(8))[0])
+        assert 'secure' in root, 'the XCI has no secure partition'
+        self.files = hfs0_files(self.f, root['secure'][0])
+
+    def ticket(self):
+        return None
+
+
+def open_package(path):
+    """A title package: .xci (cartridge image) or .nsp."""
+    with open(path, 'rb') as f:
+        f.seek(0x100)
+        is_xci = f.read(4) == b'HEAD'
+    return Xci(path) if is_xci else Nsp(path)
 
 
 class Nca:
@@ -192,13 +228,18 @@ def walk(romfs, base):
 
 def main():
     base_path, update_path, out_dir = sys.argv[1:4]
-    romfs = PatchedRomfs(Nca(Nsp(base_path)), Nca(Nsp(update_path)))
+    extract(Nca(open_package(base_path)), Nca(open_package(update_path)), out_dir, '--list' in sys.argv)
+
+
+def extract(base, update, out_dir, list_only=False):
+    """Write the RomFS of `base` (Nca) with `update` (Nca) applied into out_dir (dump_folder.py uses it too)."""
+    romfs = PatchedRomfs(base, update)
     entries = sorted(walk(romfs, romfs.level6))
     total = sum(e[2] for e in entries)
     print('%d files, %.2f GB' % (len(entries), total / 2 ** 30))
     for path, _, size in entries[:40]:
         print('  %14d  %s' % (size, path))
-    if '--list' in sys.argv:
+    if list_only:
         return
     t0 = time.time()
     done = 0

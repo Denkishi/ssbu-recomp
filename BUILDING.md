@@ -60,10 +60,18 @@ nxdumptool, running on a console you own), produce a folder:
 <dump>/sysdata/fonts and <dump>/sysdata/zoneinfo      optional: the system shared fonts (.ttf) and the tz database files
 ```
 
-If you only have `.nsp` packages and your own keys, `tools/extract/romfs_extract.py <base.nsp> <update.nsp> <out>`
-(RomFS with the update applied), `tools/extract/nca_exefs.py` (ExeFS from an NCA) and `tools/extract/fw_fonts.py`
-(system fonts from a firmware dump) do the same; they read the keys from `~/.switch/prod.keys` and need
-`pip install pycryptodome`. This repository contains no keys and no link to any.
+If you only have packages (`.nsp`, or a cartridge image `.xci` of the base game) and your own keys, one command makes the
+folder:
+
+```
+python tools/extract/dump_folder.py <base.nsp|base.xci> <update.nsp> <dump> [--firmware <firmware dump folder>]
+```
+
+It writes `exefs\` (from the update) and `romfs\` (base with the update applied), and with `--firmware` the system fonts.
+The pieces are also tools of their own: `tools/extract/romfs_extract.py <base> <update> <out>` (RomFS with the update
+applied; `.nsp` or `.xci`), `tools/extract/nca_exefs.py` (ExeFS from an NCA) and `tools/extract/fw_fonts.py` (system
+fonts from a firmware dump). They read the keys from `~/.switch/prod.keys` and need `pip install pycryptodome`. This
+repository contains no keys and no link to any.
 
 ## The SDK function list
 
