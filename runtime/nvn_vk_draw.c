@@ -1664,8 +1664,26 @@ static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 /* SSBU_VK_CBKEEP: the buffer's bytes go to guest memory. With the snapshot of the fill (SSBU_VK_CBMERGE, the default) only
  * the words compute changed since the fill are written, and a word the game changed since then stays the game's. */
+/* The game can free the memory a kept buffer belongs to before the buffer lands (leaving a fight: the scene's heap is
+ * unmapped; the attract demo ending and the local-wireless waiting room going over to the match both crashed here,
+ * reading a decommitted page). Such a range is not written back: nothing can read it any more. */
+static LONG64 g_ck_unmapped;
+static int cb_guest_range_live(uint64_t addr, uint64_t size) {
+    uintptr_t p = (uintptr_t)P(addr), end = p + (uintptr_t)size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)p, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+            !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) || (mi.Protect & PAGE_GUARD)) return 0;
+        p = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    }
+    return 1;
+}
 static void cb_keep_back(CB *c, const uint8_t *src) {      /* src: the bytes in ordinary memory already (the copy of an asynchronous landing), or NULL = the buffer itself */
     if (!c->dirty && !c->stale) return;
+    if (!cb_guest_range_live(c->addr, c->size)) {
+        if (g_ck_unmapped++ < 10) printf("nvn_vk: kept compute buffer %llx+%llu not written back: the game has freed that memory\n", (unsigned long long)c->addr, (unsigned long long)c->size);
+        return;
+    }
 #ifdef R1_MARK
     { void r1_wrote(uint64_t, uint64_t); r1_wrote(c->addr, c->size); }      /* R1 (r1_state.c): compute results written back into guest memory are marked */
 #endif

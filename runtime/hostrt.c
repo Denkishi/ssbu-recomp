@@ -775,6 +775,14 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
         TerminateProcess(GetCurrentProcess(), 4);
     }
     printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
+    {   /* module + offset: stable across runs (ASLR moves the base), to look up in <exe>.map */
+        HMODULE m = NULL;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)er->ExceptionAddress, &m) && m)
+            GetModuleFileNameA(m, name, MAX_PATH);
+        const char *base = strrchr(name, '\\');
+        printf("  in %s at offset 0x%llx\n", base ? base + 1 : name, (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)m));
+    }
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
                (unsigned long long)er->ExceptionInformation[1]);
