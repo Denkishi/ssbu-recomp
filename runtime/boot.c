@@ -278,9 +278,58 @@ static DWORD WINAPI guest_main(LPVOID arg) {
     return 0;
 }
 
+/* A launch without scripts/run.py (the exe started by itself, from build\work): the paths run.py would pass are taken from
+ * the build folder. SSBU_ROMFS: the RomFS recorded by scripts/setup.py in ..\state.json ("romfs"), when that folder has
+ * data.arc (the add-on content list is found by nnmisc.c itself). A variable that is set is left alone. Without this a
+ * direct start looked for ..\romfs, found no data.arc, and the game crashed reading the file it could not open (2026-10-15). */
+static void launch_defaults(void) {
+    const char *rom = getenv("SSBU_ROMFS");
+    if (!rom || !rom[0]) {
+        char buf[16384], path[MAX_PATH] = "", probe[MAX_PATH + 16];
+        FILE *f = fopen("..\\state.json", "rb");
+        size_t n = f ? fread(buf, 1, sizeof buf - 1, f) : 0;
+        if (f) fclose(f);
+        buf[n] = 0;
+        const char *p = strstr(buf, "\"romfs\"");
+        if (p && (p = strchr(p + 7, ':')) && (p = strchr(p, '"'))) {
+            size_t k = 0;
+            for (p++; *p && *p != '"' && k < sizeof path - 1; p++) path[k++] = *p == '\\' && p[1] ? *++p : *p;   /* JSON: \\ and \" */
+            path[k] = 0;
+        }
+        snprintf(probe, sizeof probe, "%s\\data.arc", path);
+        if (path[0] && GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) { _putenv_s("SSBU_ROMFS", path); printf("SSBU_ROMFS not set: %s (from ..\\state.json)\n", path); }
+    }
+}
+/* The game cannot run without data.arc: say so instead of crashing later inside the game. */
+static void check_romfs(void) {
+    const char *rom = getenv("SSBU_ROMFS");
+    char probe[MAX_PATH + 16], msg[MAX_PATH + 600];
+    const char *dir = rom && rom[0] ? rom : "..\\romfs";
+    snprintf(probe, sizeof probe, "%s\\data.arc", dir);
+    if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) {
+        snprintf(msg, sizeof msg, "data.arc was not found (%s).\n\nStart the game with  python scripts\\run.py --userdata <folder>  from the repository, "
+                                  "or set SSBU_ROMFS to the RomFS folder of your dump (the one that holds data.arc).", probe);
+    } else {
+        /* .nrr\*.nrr beside data.arc: the lists of the script modules nn::ro may load (the game registers them at start). A
+         * RomFS without them runs to the menus, then every module is refused and the game waits for ever on the loading
+         * screen before a fight (a copy of 2026-10-15 had only data.arc). */
+        WIN32_FIND_DATAA fd;
+        snprintf(probe, sizeof probe, "%s\\.nrr\\*.nrr", dir);
+        HANDLE h = FindFirstFileA(probe, &fd);
+        if (h != INVALID_HANDLE_VALUE) { FindClose(h); return; }
+        snprintf(msg, sizeof msg, "The RomFS folder %s has data.arc but no .nrr\\*.nrr files.\n\nThe game would refuse to load its script "
+                 "modules and stop on the loading screen before the first fight. Copy the whole RomFS folder of your dump "
+                 "(the .nrr folder sits beside data.arc).", dir);
+    }
+    printf("\n%s\n", msg);
+    MessageBoxA(NULL, msg, "SSBU native", MB_OK | MB_ICONERROR);
+    exit(2);
+}
+
 int main(int argc, char **argv) {
     g_elf = argc > 1 ? argv[1] : "..\\binaries\\13.0.4\\main.elf";
     setvbuf(stdout, NULL, _IONBF, 0);
+    launch_defaults();
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);
         int tool;
@@ -297,6 +346,7 @@ int main(int argc, char **argv) {
         import_set_address(sdk_data[i].name, copy);
     }
     cxxrt_install_data();
+    check_romfs();
     runtime_init(g_elf, getenv("SSBU_TRACE") ? getenv("SSBU_TRACE") : "boot_trace.txt");
     register_imports(base_imports, (int)(sizeof base_imports / sizeof base_imports[0]));
     register_sdk_imports();
