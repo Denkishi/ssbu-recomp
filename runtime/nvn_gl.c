@@ -346,6 +346,8 @@ static GLuint g_gs_last_prog[2];
 static uint32_t g_gs_last_attr[16];
 static inline LONG64 pf_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 static inline void pf_add(int k, LONG64 t0) { InterlockedExchangeAdd64(&g_pf[k], pf_now() - t0); InterlockedIncrement64(&g_pfn[k]); }
+LONG64 nvn_pf_waits(void) { return g_pf[PF_WAIT_SUBMIT] + g_pf[PF_WAIT_PRESENT] + g_pf[PF_WAIT_OTHER]; }      /* display.c: frame-split line */
+LONG64 nvn_pf_paced(void) { return g_pf[PF_PACE]; }
 void nvn_pf_pace(LONG64 ticks) { InterlockedExchangeAdd64(&g_pf[PF_PACE], ticks); InterlockedIncrement64(&g_pfn[PF_PACE]); }     /* display.c */
 
 static void logf_limited(int *counter, int limit, const char *fmt, ...) {
@@ -5145,9 +5147,13 @@ void nvn_front_ccmp_landed(void) {
     }
     g_ccmp_npend = 0;
 }
+/* nvn_vk_draw.c present thread (SSBU_PRESENT_PACE): the frame times are taken when a frame really goes to the window, so the
+ * mark is made there (nvn_front_frame_mark) and not at the end of the render thread's present job. */
+volatile LONG g_front_mark_external;
+void nvn_front_frame_mark(long long frame) { pf_frame_mark((LONG64)frame); }
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears) {
     LONG64 frame = g_st.frames + 1;
-    pf_frame_mark(frame);
+    if (!g_front_mark_external) pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;
     if (frame <= 3 || frame % 600 == 0 || draws != 0 && g_logn < 40 && (g_logn++, 1))

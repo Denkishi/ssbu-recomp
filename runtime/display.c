@@ -207,6 +207,10 @@ void display_init(void) {
     { void nvn_vk_selftest_hook(void); nvn_vk_selftest_hook(); }      /* nvn_vk.c: SSBU_RENDERER=vk SSBU_VK_SELFTEST=<frames>, then exit (plan\phases\V1_vulkan.md, M1) */
 }
 
+/* nvn_vk_draw.c present thread: the refresh clock. display_vsync_period: QPC ticks per refresh now (0 in the lockstep test
+ * mode, where there is no free-running clock). */
+LONG64 display_vsync_period(void) { if (g_lockstep || old_pacing()) return 0; return g_freq.QuadPart / hfr_rate(); }
+
 /* Called after every presented frame (nvn_gl.c has already put it in the window): holds the caller to 60 Hz. */
 static volatile LONG g_interval = 1;         /* nvnWindowSetPresentInterval: display refreshes per presented frame (0 = do not wait) */
 void display_set_interval(int n) { InterlockedExchange(&g_interval, n < 0 ? 0 : n > 5 ? 5 : n); }
@@ -235,6 +239,28 @@ static void clock_stat(LONG64 n, LARGE_INTEGER now) {
         (long long)(g_cs_hist[0] - h_last[0]), (long long)(g_cs_hist[1] - h_last[1]), (long long)(g_cs_hist[2] - h_last[2]), (long long)(g_cs_hist[3] - h_last[3]), (long long)(late - late_last), 10);
     t_last = now; sig_last = sig; late_last = late; steps_last = g_cs_steps; memcpy(h_last, g_cs_hist, sizeof h_last);
 }
+/* SSBU_CLOCKSTAT=1, "frame-split:" line every 600 frames: the time between two queued frames split into the frame limiter's
+ * wait (pace), waits for the render thread (gl_run) and the rest (the guest thread's own work), as histograms. */
+LONG64 nvn_pf_waits(void); LONG64 nvn_pf_paced(void);
+static void frame_split(LONG64 n, LARGE_INTEGER now) {
+    static LONG64 t_last, w_last, p_last, hw[8], hr[8], hi[8];
+    static const double edge[7] = {6.0, 7.0, 8.0, 8.33, 9.0, 10.0, 12.0};
+    LONG64 w = nvn_pf_waits(), p = nvn_pf_paced();
+    if (t_last) {
+        double k = 1000.0 / (double)g_freq.QuadPart, iv = (double)(now.QuadPart - t_last) * k, wr = (double)(w - w_last) * k, pc = (double)(p - p_last) * k, work = iv - wr - pc;
+        int a = 0, b = 0, c = 0;
+        while (a < 7 && work >= edge[a]) a++;
+        while (b < 7 && wr >= edge[b] - 5.0) b++;
+        while (c < 7 && iv >= edge[c]) c++;
+        hw[a]++; hr[b]++; hi[c]++;
+    }
+    t_last = now.QuadPart; w_last = w; p_last = p;
+    if (n % 600 == 0) {
+        printf("frame-split: frames %lld-%lld | own work ms <6:%lld 6-7:%lld 7-8:%lld 8-8.33:%lld 8.33-9:%lld 9-10:%lld 10-12:%lld 12+:%lld | render waits ms <1:%lld 1-2:%lld 2-3:%lld 3-3.33:%lld 3.33-4:%lld 4-5:%lld 5-7:%lld 7+:%lld | interval ms <6:%lld 6-7:%lld 7-8:%lld 8-8.33:%lld 8.33-9:%lld 9-10:%lld 10-12:%lld 12+:%lld%c",
+               (long long)(n - 600), (long long)n, hw[0], hw[1], hw[2], hw[3], hw[4], hw[5], hw[6], hw[7], hr[0], hr[1], hr[2], hr[3], hr[4], hr[5], hr[6], hr[7], hi[0], hi[1], hi[2], hi[3], hi[4], hi[5], hi[6], hi[7], 10);
+        memset(hw, 0, sizeof hw); memset(hr, 0, sizeof hr); memset(hi, 0, sizeof hi);
+    }
+}
 /* New pacing, part 1 (nvnQueuePresentTexture, after the frame is in the window): decides the refresh that shows it. */
 static void frame_queued(void) {
     static LARGE_INTEGER second_start;
@@ -255,6 +281,7 @@ static void frame_queued(void) {
     g_latch = at;
     InterlockedExchange(&g_latch_pending, iv != 0);
     clock_stat(n, now);
+    if (g_clockstat) frame_split(n, now);
     {   /* TEST ONLY, SSBU_FRAMELOG=<k>: a line "frame-mark: <n>" every k presented frames, to place log events in game frames */
         static int every = -1;
         if (every < 0) { const char *e = getenv("SSBU_FRAMELOG"); every = e ? atoi(e) : 0; }

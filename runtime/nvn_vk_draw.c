@@ -286,7 +286,10 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (wait) { sb.waitSemaphoreCount = 1; sb.pWaitSemaphores = &wait; sb.pWaitDstStageMask = &stage; }
     if (signal) { sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &signal; }
     sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
-    VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
+    AcquireSRWLockExclusive(&g_qlock);
+    VkResult qr = vkQueueSubmit(V.queue, 1, &sb, s->fence);
+    ReleaseSRWLockExclusive(&g_qlock);
+    if (qr != VK_SUCCESS) vk_fatal("vkQueueSubmit", qr);
     s->pending = 1; s->serial = ++R.serial;
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
@@ -2549,6 +2552,85 @@ static void overlay_draw(uint32_t index) {
     }
 }
 static void vk_present2(void *arg, int progress);
+/* Present pacing (SSBU_PRESENT_PACE=1, performance / frame pacing). The frame that the render thread has finished goes to a
+ * present thread, which hands it to the window no sooner than SSBU_PRESENT_MIN_US (default 8200) after the frame before.
+ * Measured: the time between two presents follows the main thread's work, which alternates between the 120 Hz mode's
+ * logic updates and the engine's in-between pictures (hfr.c): 8.33 ms frames on average shown 6-7 ms and 9-11 ms apart.
+ * The floor makes them even; the render thread and the game do not wait for it (one frame is held at most, a second one
+ * waits for the first). The frame times of the perf lines are taken at the real present. Not in the lockstep test mode
+ * (SSBU_SPEED: no free-running refresh clock). */
+LONG64 display_vsync_period(void);                 /* display.c */
+extern volatile LONG g_front_mark_external;        /* nvn_gl.c */
+void nvn_front_frame_mark(long long frame);
+typedef struct { uint32_t index; VkSemaphore wait; VkSwapchainKHR sc; int suboptimal; LONG64 frame; } PqItem;
+static PqItem g_pq[2];
+static volatile LONG g_pq_n, g_pq_busy, g_pq_recreate;
+static SRWLOCK g_pq_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_pq_cv = CONDITION_VARIABLE_INIT;
+static int g_pq_on = -1;
+static LONG64 g_pq_min_tk, g_pq_last, g_pq_held_tk, g_pq_held_n, g_pq_full_n;
+static void frame_wall_note(LONG64 frame, LONG64 t);
+static DWORD WINAPI pq_main(void *arg) {
+    (void)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    for (;;) {
+        AcquireSRWLockExclusive(&g_pq_lock);
+        while (!g_pq_n) SleepConditionVariableSRW(&g_pq_cv, &g_pq_lock, INFINITE, 0);
+        PqItem it = g_pq[0];
+        g_pq_busy = 1;
+        ReleaseSRWLockExclusive(&g_pq_lock);
+        LONG64 due = g_pq_last ? g_pq_last + g_pq_min_tk : 0, now = tk();
+        if (now < due && display_vsync_period() > 0) {
+            LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+            if ((due - now) * 1000 > 2 * f.QuadPart) Sleep((DWORD)((due - now) * 1000 / f.QuadPart) - 1);
+            while (tk() < due) YieldProcessor();
+            g_pq_held_n++; g_pq_held_tk += tk() - now;
+        }
+        VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &it.wait; pr.swapchainCount = 1; pr.pSwapchains = &it.sc; pr.pImageIndices = &it.index;
+        LONG64 tp = tk();
+        AcquireSRWLockExclusive(&g_qlock);
+        VkResult r = vkQueuePresentKHR(V.queue, &pr);
+        ReleaseSRWLockExclusive(&g_qlock);
+        g_pq_last = tp;
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || it.suboptimal) InterlockedExchange(&g_pq_recreate, 1);
+        else vk_ok("vkQueuePresentKHR", r);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { if (g_gap_prev && tp - g_gap_prev > g_gap_max) g_gap_max = tp - g_gap_prev; g_gap_prev = tp; g_wd_beat = tp; }
+        InterlockedIncrement64(&g_vk_frames);
+        nvn_front_frame_mark(it.frame);
+        frame_wall_note(it.frame, tp);
+        AcquireSRWLockExclusive(&g_pq_lock);
+        g_pq[0] = g_pq[1]; g_pq_n--; g_pq_busy = 0;
+        ReleaseSRWLockExclusive(&g_pq_lock);
+        WakeAllConditionVariable(&g_pq_cv);
+    }
+}
+static int pq_on(void) {
+    if (g_pq_on < 0) {
+        const char *e = getenv("SSBU_PRESENT_PACE"), *m = getenv("SSBU_PRESENT_MIN_US");
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        g_pq_on = e && atoi(e) != 0 && display_vsync_period() > 0;
+        g_pq_min_tk = (LONG64)(m ? atoi(m) : 8200) * f.QuadPart / 1000000;
+        if (g_pq_on) { g_front_mark_external = 1; HANDLE h = CreateThread(NULL, 0, pq_main, NULL, 0, NULL); if (h) CloseHandle(h); }
+        printf("nvn_vk: present pacing %s (SSBU_PRESENT_PACE), at least %d us between presents\n", g_pq_on ? "ON" : "off", m ? atoi(m) : 8200);
+    }
+    return g_pq_on;
+}
+static void pq_push(uint32_t index, VkSemaphore wait, int suboptimal, LONG64 frame) {
+    AcquireSRWLockExclusive(&g_pq_lock);
+    if (g_pq_n == 2) g_pq_full_n++;
+    while (g_pq_n == 2) SleepConditionVariableSRW(&g_pq_cv, &g_pq_lock, INFINITE, 0);
+    PqItem it = {index, wait, V.swapchain, suboptimal, frame};
+    g_pq[g_pq_n++] = it;
+    ReleaseSRWLockExclusive(&g_pq_lock);
+    WakeAllConditionVariable(&g_pq_cv);
+}
+static void pq_drain(void) {                       /* render thread: every handed frame has been shown */
+    if (g_pq_on <= 0) return;
+    AcquireSRWLockExclusive(&g_pq_lock);
+    while (g_pq_n) SleepConditionVariableSRW(&g_pq_cv, &g_pq_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&g_pq_lock);
+}
 /* nvn_vk_m4.c m4_barrier, render thread, g_sh_lock NOT held: the held loading screen once more, with the bar at `frac` */
 static void present_progress(float frac) { if (!g_ovl.bar_arg) return; g_ovl.frac = frac; g_ovl.thick = 8; vk_present2(g_ovl.bar_arg, 1); g_ovl.thick = 0; }
 static void vk_present(void *arg) { vk_present2(arg, 0); }
@@ -2612,6 +2694,7 @@ swap: ;
      * path blits with FRAMEBUFFER_SRGB off). */
     VkFormat want = vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
     if (want != V.format.format) { cmd_wait_all(); swapchain_destroy(); V.format.format = want; printf("nvn_vk: swapchain format %d (the window texture's colour class)\n", (int)want); }
+    if (g_pq_recreate) { pq_drain(); InterlockedExchange(&g_pq_recreate, 0); cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
     uint32_t index = 0;
     VkResult r = VK_SUCCESS;
     /* one pair of semaphores per present, 8 in turn: a semaphore handed to vkAcquireNextImageKHR must not still be waited
@@ -2662,15 +2745,32 @@ swap: ;
         overlay_draw(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         cmd_submit(acq, rend);
+        {   /* SSBU_PRESENT_MIN_US=<us> (EXPERIMENT): a frame is not shown sooner than that after the frame before */
+            static int min_us = -1; static LONG64 last, fq;
+            if (min_us < 0) { const char *e = getenv("SSBU_PRESENT_MIN_US"); min_us = e ? atoi(e) : 0; LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; }
+            if (min_us > 0 && !progress) {
+                LONG64 due = last + (LONG64)min_us * fq / 1000000, now = tk();
+                if (last && now < due) {
+                    if ((due - now) * 1000 > 2 * fq) Sleep((DWORD)((due - now) * 1000 / fq) - 1);
+                    while (tk() < due) YieldProcessor();
+                }
+                last = tk();
+            }
+        }
+        if (!progress && pq_on()) { g_wd_where = 0; pq_push(index, rend, suboptimal, frame); goto handed; }
+        if (g_pq_on > 0) pq_drain();
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;
+        AcquireSRWLockExclusive(&g_qlock);
         r = vkQueuePresentKHR(V.queue, &pr);
+        ReleaseSRWLockExclusive(&g_qlock);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
         else vk_ok("vkQueuePresentKHR", r);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { LONG64 nowt = tk(); if (g_gap_prev && nowt - g_gap_prev > g_gap_max) g_gap_max = nowt - g_gap_prev; g_gap_prev = nowt; g_wd_beat = nowt; }      /* session 12: the watchdog's heartbeat = a frame reached the window */
         if (!progress) InterlockedIncrement64(&g_vk_frames);
     }
+handed:
     g_wd_where = 0;
     if (progress) { g_ovl_presents++; return; }
     g_tm[4] += tk() - t_present;
@@ -2691,7 +2791,7 @@ swap: ;
         if (frame >= 0 && frame < FRSTAT_N) {
             LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
             g_fr_fight[frame] = (uint8_t)battle;
-            g_fr_wall[frame] = t_prev ? (float)((double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
+            if (g_pq_on <= 0) g_fr_wall[frame] = t_prev ? (float)((double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
         }
         t_prev = t_now;
         g_cur_frame = frame + 1;
@@ -2923,6 +3023,13 @@ static void vkd_init(void) {
 static int frstat_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return x < y ? -1 : x > y; }
 /* Session 9: battle frames only (dispatches and more than 120 draws: the fight and the result screen's fighters); the first 30 are left out (their buffers were recorded
  * while the stage was still being set up). GPU ms = sum of the spans of the frame's command buffers (SSBU_VK_GPUTIME=1). */
+static void frame_wall_note(LONG64 f, LONG64 t) {      /* present thread: f = the frame number (nvn_front_frame_next at its present job) */
+    static LONG64 prev;
+
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    if (f >= 0 && f < FRSTAT_N) g_fr_wall[f] = prev ? (float)((double)(t - prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
+    prev = t;
+}
 static void frstat_report(void) {
     static float g[FRSTAT_N], w[FRSTAT_N];
     int n = 0, seen = 0, slow = 0;
