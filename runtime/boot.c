@@ -267,6 +267,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
         call_guest(&c, fn);
     }
 
+    { void hfr_init(void); hfr_init(); }                     /* hfr.c: frame_rate = 120 (graphics.ini) hooks the battle's slow step; nothing at 60 */
     { void debug_mode_init(void); debug_mode_init(); }       /* debug_mode.c: test-only fast mode, nothing without SSBU_* variables */
     printf("[phase 3] nnMain\n");
     trace_printf("=== phase 3: nnMain\n");

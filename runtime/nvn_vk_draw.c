@@ -3084,15 +3084,15 @@ static void vk_present2(void *arg, int progress) {
     }
     {   /* session 9, SSBU_SHOT_BATTLE=<n>: one picture at the n-th battle frame (dispatches and more than 120 draws), i.e. at the
          * same moment of the fight whatever the loading took: battle_<n>.bmp in SSBU_SHOT_DIR */
-        static int bshot = -2;
-        if (bshot == -2) bshot = getenv("SSBU_SHOT_BATTLE") ? atoi(getenv("SSBU_SHOT_BATTLE")) : -1;
-        if (vt && bshot > 0 && g_battle_frames == bshot) {
+        static int bshot = -2, bcount;
+        if (bshot == -2) { bshot = getenv("SSBU_SHOT_BATTLE") ? atoi(getenv("SSBU_SHOT_BATTLE")) : -1; bcount = getenv("SSBU_SHOT_BATTLE_N") ? atoi(getenv("SSBU_SHOT_BATTLE_N")) : 1; }
+        if (vt && bshot > 0 && g_battle_frames >= bshot) {      /* SSBU_SHOT_BATTLE_N=<k>: k pictures in a row from there (frame stepping, the 120 Hz mode) */
             char path[300];
             const char *dir = getenv("SSBU_SHOT_DIR");
-            snprintf(path, sizeof path, "%s%sbattle_%d.bmp", dir ? dir : "", dir ? "/" : "", bshot);
+            snprintf(path, sizeof path, "%s%sbattle_%d.bmp", dir ? dir : "", dir ? "/" : "", (int)g_battle_frames);
             save_bmp_vk(path, vt);
-            printf("nvn_vk: picture of battle frame %d saved at frame %lld: %s\n", bshot, (long long)frame, path);
-            bshot = -1;
+            { int hfr_shot_phase(void); printf("nvn_vk: picture of battle frame %d saved at frame %lld: %s (hfr phase %d)\n", (int)g_battle_frames, (long long)frame, path, hfr_shot_phase()); }
+            if (--bcount <= 0) bshot = -1;
         }
     }
 swap: ;

@@ -163,6 +163,15 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
         seq_begin(0);
     }
+    {   /* frame_rate = 120 (hfr.c): in a battle the game polls once per update, two updates per step of game time; the
+         * sequence counts the console's updates, so it does not move on the poll before an update the mode adds (read from
+         * the game's slow state, not from time) and a held key stays down for both: the same sequence drives the same game
+         * at 60 and at 120. Not with SSBU_DETERMINISTIC, whose fight counting (fight_seq_ticks) already counts fight frames. */
+        int hfr_seq_skip(void);
+        static int det = -1;
+        if (det < 0) det = getenv("SSBU_DETERMINISTIC") && atoi(getenv("SSBU_DETERMINISTIC")) != 0;
+        if (!det && hfr_seq_skip()) return;
+    }
     g_seq_polls++;
     {   /* SSBU_SEQ_LOG=<n>: the draw count every n polls, to find the ranges for @draws */
         static int every = -1;

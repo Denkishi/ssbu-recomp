@@ -8,6 +8,7 @@
 #include "hostrt.h"
 
 uint64_t hook_address(const char *name);              /* fighter_sdk\hook_host.c (included by nnro.c) */
+int hfr_setting(void);                                /* hfr.c: 60, or 120 with frame_rate = 120 */
 
 static int safe_read(uint64_t addr, void *buf, size_t n) {
     SIZE_T got = 0;
@@ -350,7 +351,7 @@ static DWORD WINAPI dump_thread(LPVOID arg) {
 
 void debug_mode_init(void) {
     const char *end = getenv("SSBU_DEBUG_END"), *list = getenv("SSBU_DEBUG_MATCH_LIST");
-    if (end && atof(end) > 0) { g_end_limit = (LONG64)(strchr(end, 's') ? atof(end) * 60.0 : atof(end)); printf("debug end: the run ends after %lld fight frames\n", (long long)g_end_limit); }
+    if (end && atof(end) > 0) { g_end_limit = (LONG64)(strchr(end, 's') ? atof(end) * (double)hfr_setting() : atof(end));      /* presented frames: 120 per second of fight with frame_rate = 120 */ printf("debug end: the run ends after %lld fight frames\n", (long long)g_end_limit); }
     if (list && !(g_dm_list = fopen(list, "r"))) printf("debug match: SSBU_DEBUG_MATCH_LIST: cannot open %s\n", list);
     if (g_dm_list && !getenv("SSBU_DEBUG_MATCH")) snprintf(g_dm.text, sizeof g_dm.text, "(list)");
     if (getenv("SSBU_DEBUG_MATCH") || g_dm_list) {
