@@ -490,6 +490,61 @@ static void *hnew(uint64_t g, uint32_t kind, size_t size) {
 
 static SRWLOCK g_pool_lock = SRWLOCK_INIT;
 static Tex *volatile g_all_tex;            /* every texture, newest first (never unlinked: host records of textures are not freed) */
+/* Flush notifications query only live texture ranges. History remains intact for renderer references and prewarming.
+ * Sorted starts plus prefix maxima include overlapping/aliased textures without scanning every historical record. */
+typedef struct { Tex *tex; uint64_t begin, end, prefix_end; } TexRange;
+static SRWLOCK g_tex_range_lock = SRWLOCK_INIT;
+static TexRange *g_tex_ranges;
+static size_t g_tex_range_count, g_tex_range_cap;
+static int g_tex_range_fallback;
+static uint64_t tex_range_end(uint64_t begin, uint64_t size) { return size > UINT64_MAX - begin ? UINT64_MAX : begin + size; }
+static size_t tex_range_lower(uint64_t addr) {
+    size_t lo = 0, hi = g_tex_range_count;
+    while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (g_tex_ranges[mid].begin < addr) lo = mid + 1; else hi = mid; }
+    return lo;
+}
+static void tex_range_prefix(size_t first) {
+    uint64_t end = first ? g_tex_ranges[first - 1].prefix_end : 0;
+    for (size_t i = first; i < g_tex_range_count; i++) {
+        if (g_tex_ranges[i].end > end) end = g_tex_ranges[i].end;
+        g_tex_ranges[i].prefix_end = end;
+    }
+}
+static void tex_range_add(Tex *t) {
+    if (!t->mem || !t->storage) return;
+    AcquireSRWLockExclusive(&g_tex_range_lock);
+    if (g_tex_range_fallback) { ReleaseSRWLockExclusive(&g_tex_range_lock); return; }
+    if (g_tex_range_count == g_tex_range_cap) {
+        size_t cap = g_tex_range_cap ? g_tex_range_cap * 2 : 256;
+        TexRange *r = realloc(g_tex_ranges, cap * sizeof *r);
+        if (!r) {                         /* Never drop invalidations because the optional index could not grow. */
+            free(g_tex_ranges); g_tex_ranges = NULL; g_tex_range_count = g_tex_range_cap = 0; g_tex_range_fallback = 1;
+            ReleaseSRWLockExclusive(&g_tex_range_lock); return;
+        }
+        g_tex_ranges = r; g_tex_range_cap = cap;
+    }
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    size_t i = tex_range_lower(begin);
+    memmove(g_tex_ranges + i + 1, g_tex_ranges + i, (g_tex_range_count - i) * sizeof *g_tex_ranges);
+    g_tex_ranges[i].tex = t; g_tex_ranges[i].begin = begin; g_tex_ranges[i].end = tex_range_end(begin, t->storage);
+    g_tex_range_count++; tex_range_prefix(i);
+    ReleaseSRWLockExclusive(&g_tex_range_lock);
+}
+static void tex_range_remove(Tex *t) {
+    if (!t->mem || !t->storage) return;
+    AcquireSRWLockExclusive(&g_tex_range_lock);
+    uint64_t begin = (uint64_t)(uintptr_t)t->mem;
+    for (size_t i = tex_range_lower(begin); i < g_tex_range_count && g_tex_ranges[i].begin == begin; i++) {
+        if (g_tex_ranges[i].tex != t) continue;
+        g_tex_range_count--;
+        memmove(g_tex_ranges + i, g_tex_ranges + i + 1, (g_tex_range_count - i) * sizeof *g_tex_ranges);
+        tex_range_prefix(i);
+        break;
+    }
+    if (!g_tex_range_count) { free(g_tex_ranges); g_tex_ranges = NULL; g_tex_range_cap = 0; }
+    ReleaseSRWLockExclusive(&g_tex_range_lock);
+}
+
 void nvn_label_set(uint64_t obj, const char *text);
 const char *nvn_label_get(uint64_t obj);
 void nvn_label_drop(uint64_t obj);
@@ -4137,6 +4192,7 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     if (t->b.pool && nvn_pool_range(t->b.pool, &mem, &size) && mem) { t->mem = (uint8_t *)P(mem) + t->b.offset; t->limit = (uint8_t *)P(mem) + size; }
     t->storage = tex_storage_size2(&t->b, &t->data_size);
     t->guest = A0;
+    tex_range_add(t);
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
     RET(1);
 }
@@ -4144,6 +4200,7 @@ static void tex_finalize(Ctx *c) {
     gl_barrier();
     Tex *t = hobj(A0, K_TEX);
     if (!t) return;
+    tex_range_remove(t);
     InterlockedExchange(&t->dead, 1);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
@@ -5509,8 +5566,19 @@ static void vk_shutdown_at_exit(void) {
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
-    for (Tex *t = g_all_tex; t; t = t->all_next)
-        if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
+    if (!size) return;
+    uint64_t end = tex_range_end(addr, size);
+    AcquireSRWLockShared(&g_tex_range_lock);
+    if (g_tex_range_fallback) {
+        for (Tex *t = g_all_tex; t; t = t->all_next)
+            if (!t->dead && t->mem && (uint64_t)(uintptr_t)t->mem < end && addr < tex_range_end((uint64_t)(uintptr_t)t->mem, t->storage)) t->dirty = 1;
+    } else {
+        size_t lo = 0, hi = g_tex_range_count;
+        while (lo < hi) { size_t mid = lo + (hi - lo) / 2; if (g_tex_ranges[mid].prefix_end <= addr) lo = mid + 1; else hi = mid; }
+        for (size_t i = lo; i < g_tex_range_count && g_tex_ranges[i].begin < end; i++)
+            if (g_tex_ranges[i].end > addr) g_tex_ranges[i].tex->dirty = 1;
+    }
+    ReleaseSRWLockShared(&g_tex_range_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {
