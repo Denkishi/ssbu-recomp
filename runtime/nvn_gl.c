@@ -614,6 +614,26 @@ static void tex_put(Tex *t, const Fmt *f, int level, int layer, int x, int y, in
     }
 }
 
+/* This renderer consumes packaged texels once, at the deferred first upload.
+ * Capture its source before publishing the texture so that later hashing and
+ * upload do not depend on the caller keeping the original storage mapped. */
+static int tex_capture_packaged(Tex *t) {
+    if (!t->b.packaged || !t->data_size) return 1;
+    t->packaged_copy = malloc(t->data_size);
+    if (!t->packaged_copy) return 0;
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), P(t->b.packaged), t->packaged_copy, t->data_size, &got) || got != t->data_size) {
+        free(t->packaged_copy); t->packaged_copy = NULL; return 0;
+    }
+    return 1;
+}
+static const uint8_t *tex_source(const Tex *t) {
+    return t->b.packaged ? t->packaged_copy : t->mem;
+}
+static void tex_release_packaged(Tex *t) {
+    free(t->packaged_copy); t->packaged_copy = NULL;
+}
+
 static uint64_t mem_hash(const uint8_t *p, size_t n, int full) {
     uint64_t h = 0x9E3779B97F4A7C15ULL ^ n, w;
     size_t words = n / 8, step = full || words <= 8192 ? 1 : words / 4096;
@@ -675,7 +695,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
     static size_t tmp_cap;
     static int nlog;
     TexBuilder *b = &t->b;
-    const uint8_t *src = b->packaged ? P(b->packaged) : t->mem;
+    const uint8_t *src = tex_source(t);
     if (b->flags & 0x10) {                         /* linear: plain rows with a stride */
         int64_t stride = b->stride ? b->stride : (int64_t)b->width * f->bpb;
         if (f->kind == 4) return;
@@ -716,7 +736,7 @@ static void tex_sync(Tex *t) {
     if (t->label_dirty && t->o.gl) { t->label_dirty = 0; if (glObjectLabel) glObjectLabel(0x1702 /* TEXTURE */, t->o.gl, -1, nvn_label_get(t->guest)); }
     if (t->checked == g_serial) return;
     t->checked = g_serial;
-    const uint8_t *src = t->b.packaged ? P(t->b.packaged) : t->mem;
+    const uint8_t *src = tex_source(t);
     if (t->gpu_written || !src || t->b.samples > 1 || !fmt_get(t->b.format, &f) || (f.kind >= 1 && f.kind <= 3)) return;
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return;
     if (t->b.packaged && t->uploaded) return;      /* packaged data is consumed once at creation */
@@ -742,6 +762,7 @@ static void tex_sync(Tex *t) {
     static int nlog;
     if (e) logf_limited(&nlog, 20, "nvn_gl: upload of texture %dx%d format 0x%x target %d failed with GL error 0x%x\n", t->b.width, t->b.height, t->b.format, t->b.target, e);
     t->hash = h; t->uploaded = 1; t->dirty = 0;
+    tex_release_packaged(t);
     g_st.tex_uploads++;
 }
 
@@ -811,6 +832,7 @@ static void tex_free_gl(Tex *t) {
     for (VNode *n = t->views, *next; n; n = next) { next = n->next; texobj_free(&n->o); free(n); }
     t->views = NULL;
     texobj_free(&t->o);
+    tex_release_packaged(t);
 }
 
 /* GL sampler objects are shared by value and never deleted. */
@@ -4136,6 +4158,10 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     memcpy(&t->b, P(A1), sizeof t->b);
     if (t->b.pool && nvn_pool_range(t->b.pool, &mem, &size) && mem) { t->mem = (uint8_t *)P(mem) + t->b.offset; t->limit = (uint8_t *)P(mem) + size; }
     t->storage = tex_storage_size2(&t->b, &t->data_size);
+    if (!tex_capture_packaged(t)) {
+        fprintf(stderr, "nvn: cannot capture packaged texture %dx%d format 0x%x source %llx size %llu\n", t->b.width, t->b.height, t->b.format, (unsigned long long)t->b.packaged, (unsigned long long)t->data_size);
+        free(t); wr64(A0, 0); wr32(A0 + 8, 0); RET(0); return;
+    }
     t->guest = A0;
     do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
     RET(1);
@@ -5336,7 +5362,7 @@ int nvn_front_tex_changed(Tex *t) {
     Fmt f;
     if (t->checked == g_serial) return 0;
     t->checked = g_serial;
-    const uint8_t *src = t->b.packaged ? P(t->b.packaged) : t->mem;
+    const uint8_t *src = tex_source(t);
     if (t->gpu_written || !src || t->b.samples > 1 || !fmt_get(t->b.format, &f) || (f.kind >= 1 && f.kind <= 3)) return 0;
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return 0;
     if (t->b.packaged && t->uploaded) return 0;
@@ -5362,13 +5388,14 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
     static size_t tmp_cap;
     Fmt f;
     TexBuilder *b = &t->b;
-    const uint8_t *src = b->packaged ? P(b->packaged) : t->mem;
+    const uint8_t *src = tex_source(t);
     if (!src || !fmt_get(b->format, &f)) return 0;
     if (b->flags & 0x10) {                         /* linear: plain rows with a stride */
         int64_t stride = b->stride ? b->stride : (int64_t)b->width * f.bpb;
         if (f.kind == 4) return 0;
         put(t, 0, 0, b->width, b->height, 1, src, (size_t)stride * (size_t)b->height, 0, stride);
         g_st.tex_bytes += stride * b->height;
+        tex_release_packaged(t);
         return 1;
     }
     TexLayout L;
@@ -5388,6 +5415,7 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
             g_st.tex_bytes += (LONG64)lin;
         }
     }
+    tex_release_packaged(t);
     return 1;
 }
 int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v, SamplerParams *p) {
@@ -5478,6 +5506,7 @@ void nvn_front_take_dead(void (*drop)(int kind, void *host)) {
     EnterCriticalSection(&g_dead_lock);
     for (int i = 0; i < g_dead_n; i++) {
         drop(g_dead[i].kind, g_dead[i].p);
+        if (g_dead[i].kind == K_TEX) tex_release_packaged(g_dead[i].p);
         if (g_dead[i].kind == K_PROG) { Prog *p = g_dead[i].p; for (int s = 0; s < 6; s++) { free(p->st[s].text); memset(&p->st[s], 0, sizeof p->st[s]); } }
     }
     g_dead_n = 0;
