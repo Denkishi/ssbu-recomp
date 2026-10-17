@@ -404,6 +404,7 @@ static int c5a_selftest(Ctx *c) {
     uint8_t ctx[0x40], ev[0x40], queue[0x80];
     uint64_t uid_bad[2] = {0, 0}, uid[2] = {1, 0}, open_handle[3];
     int count = 77;
+    { void account_uid(uint64_t *lo, uint64_t *hi); account_uid(&uid[0], &uid[1]); }     /* nnfs.c: {1, 0}, or the online id (ldn_online.inc) */
     c->x[0] = P(open_handle); h("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE")(c);      /* the user must be open for CheckUserStatus */
     memset(ctx, 0xee, sizeof ctx);
     c->x[0] = P(ctx); h("_ZN2nn7friends12AsyncContextC1Ev")(c);

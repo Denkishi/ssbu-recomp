@@ -54,7 +54,24 @@
 #define LDN_MAX_NODES LDN_RESULT(67)
 
 enum { LDN_NONE, LDN_INITIALIZED, LDN_AP_OPENED, LDN_AP_CREATED, LDN_STA_OPENED, LDN_STA_CONNECTED, LDN_ERROR };
-enum { LM_SCAN = 1, LM_SCAN_RESP, LM_CONNECT, LM_DISCONNECT, LM_DESTROY, LM_SYNC, LM_GONE = 0xff };
+enum { LM_SCAN = 1, LM_SCAN_RESP, LM_CONNECT, LM_DISCONNECT, LM_DESTROY, LM_SYNC, LM_PING, LM_GONE = 0xff };
+
+/* Ping: every second a UDP echo to the room server (kind 4 -> 6, on the socket the game's datagrams use, so it is the
+ * delay they see); the smoothed round trip is sent to the room every 2 s (LM_PING: u16 ms), so every player knows every
+ * other player's ping to the server. ldn_ping_overlay() hands them to the renderer (nvn_vk_draw.c), which draws them over
+ * the picture. online.ini ping_overlay = off (SSBU_LDN_PING=0) hides them. */
+#define LDN_PEERS 16
+static struct { uint32_t vip; int ms; DWORD at; } g_ldn_pings[LDN_PEERS];
+static volatile LONG g_ldn_my_ping = -1;                  /* ms, -1 = not measured yet */
+static int g_ldn_ping_overlay = 1;
+static void ldn_peer_ping(uint32_t vip, int ms) {          /* g_ldn.cs held */
+    int free_i = -1;
+    for (int i = 0; i < LDN_PEERS; i++) {
+        if (g_ldn_pings[i].vip == vip) { g_ldn_pings[i].ms = ms; g_ldn_pings[i].at = GetTickCount(); return; }
+        if (free_i < 0 && (!g_ldn_pings[i].vip || GetTickCount() - g_ldn_pings[i].at > 15000)) free_i = i;
+    }
+    if (free_i >= 0) { g_ldn_pings[free_i].vip = vip; g_ldn_pings[free_i].ms = ms; g_ldn_pings[free_i].at = GetTickCount(); }
+}
 
 /* NetworkInfo offsets ([eden] ldn_types.h) */
 #define NI_SIZE 0x480
@@ -143,12 +160,14 @@ static void ldn_load_config(void) {
         if (!_stricmp(k, "server")) snprintf(server, sizeof server, "%s", v);
         else if (!_stricmp(k, "room")) snprintf(g_ldn.room, sizeof g_ldn.room, "%s", v);
         else if (!_stricmp(k, "nickname")) snprintf(nick, sizeof nick, "%s", v);
+        else if (!_stricmp(k, "ping_overlay")) g_ldn_ping_overlay = _stricmp(v, "off") && strcmp(v, "0");
     }
     if (f) fclose(f);
     const char *e;
     if ((e = getenv("SSBU_LDN_SERVER")) && *e) snprintf(server, sizeof server, "%s", e);
     if ((e = getenv("SSBU_LDN_ROOM")) && *e) snprintf(g_ldn.room, sizeof g_ldn.room, "%s", e);
     if ((e = getenv("SSBU_LDN_NICKNAME")) && *e) snprintf(nick, sizeof nick, "%s", e);
+    if ((e = getenv("SSBU_LDN_PING")) && *e) g_ldn_ping_overlay = atoi(e) != 0;
     char *colon = strrchr(server, ':');
     g_ldn.port = 39010;
     if (colon) { *colon = 0; g_ldn.port = (uint16_t)atoi(colon + 1); }
@@ -320,6 +339,9 @@ static void ldn_on_message(uint32_t src, uint8_t type, const uint8_t *d, uint32_
             ldn_node_changes();
         }
         break;
+    case LM_PING:
+        if (n == 2) { uint16_t ms; memcpy(&ms, d, 2); ldn_peer_ping(src, ms > 9999 ? 9999 : ms); }
+        break;
     case LM_GONE:
         if (g_ldn.state == LDN_AP_CREATED) ldn_host_drop(src);
         if (src == g_ldn.host_vip) ldn_lost_host(6);              /* SignalLost */
@@ -422,6 +444,16 @@ static DWORD WINAPI ldn_udp_thread(LPVOID unused) {
             uint32_t src; uint16_t sport, dport;
             memcpy(&src, buf + 1, 4); memcpy(&sport, buf + 5, 2); memcpy(&dport, buf + 11, 2);
             ldn_inject(src, sport, dport, buf + 13, n - 13);
+        } else if (n == 9 && buf[0] == 6) {               /* ping echo: the QPC value we sent */
+            LARGE_INTEGER now, f;
+            int64_t sent;
+            memcpy(&sent, buf + 1, 8);
+            QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
+            int64_t us = (now.QuadPart - sent) * 1000000 / f.QuadPart;
+            if (us >= 0 && us < 10000000) {
+                LONG ms = (LONG)((us + 500) / 1000), prev = g_ldn_my_ping;
+                InterlockedExchange(&g_ldn_my_ping, prev < 0 ? ms : (prev * 3 + ms + 2) / 4);     /* smoothed */
+            }
         }
     }
     free(buf);
@@ -429,17 +461,29 @@ static DWORD WINAPI ldn_udp_thread(LPVOID unused) {
 }
 static DWORD WINAPI ldn_keepalive_thread(LPVOID unused) {
     (void)unused;
-    for (int tick = 0; !g_ldn.stop; tick++) {
+    for (int tick = 0; !g_ldn.stop; tick++) {                /* one tick a second */
         uint8_t reg[5] = {1};
         memcpy(reg + 1, &g_ldn.token, 4);
-        send(g_ldn.udp, (const char *)reg, 5, 0);
-        if (tick % 5 == 4) ldn_send_frame(3, NULL, 0, NULL, 0);
-        static LONG said_sent = -1, said_in = -1;
-        if (tick % 5 == 4 && ldn_trace() && (g_ldn_sent != said_sent || g_ldn_injected != said_in)) {
-            said_sent = g_ldn_sent; said_in = g_ldn_injected;
-            printf("nn::ldn: game datagrams so far: %ld sent, %ld received, %ld dropped\n", g_ldn_sent, g_ldn_injected, g_ldn_dropped);
+        if (tick % 2 == 0) send(g_ldn.udp, (const char *)reg, 5, 0);
+        uint8_t ping[13] = {4};                               /* ping: kind 4, token, QPC now; echoed as kind 6 + the 8 bytes */
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        memcpy(ping + 1, &g_ldn.token, 4); memcpy(ping + 5, &now.QuadPart, 8);
+        send(g_ldn.udp, (const char *)ping, 13, 0);
+        LONG mine = g_ldn_my_ping;
+        if (tick % 2 == 1 && mine >= 0) {
+            uint16_t ms = (uint16_t)(mine > 9999 ? 9999 : mine);
+            EnterCriticalSection(&g_ldn.cs);
+            ldn_send_msg(0xffffffffu, LM_PING, &ms, 2);
+            LeaveCriticalSection(&g_ldn.cs);
         }
-        for (int i = 0; i < 20 && !g_ldn.stop; i++) Sleep(100);
+        if (tick % 10 == 9) ldn_send_frame(3, NULL, 0, NULL, 0);
+        static LONG said_sent = -1, said_in = -1;
+        if (tick % 10 == 9 && ldn_trace() && (g_ldn_sent != said_sent || g_ldn_injected != said_in)) {
+            said_sent = g_ldn_sent; said_in = g_ldn_injected;
+            printf("nn::ldn: game datagrams so far: %ld sent, %ld received, %ld dropped; ping %ld ms\n", g_ldn_sent, g_ldn_injected, g_ldn_dropped, mine);
+        }
+        for (int i = 0; i < 10 && !g_ldn.stop; i++) Sleep(100);
     }
     return 0;
 }
@@ -972,7 +1016,7 @@ static int ldn_fuzz_selftest(int rounds) {
     #define FZ() ldn_fz(&r)
     static uint8_t buf[0x600];
     int bad = 0, states[3] = {LDN_AP_CREATED, LDN_STA_OPENED, LDN_STA_CONNECTED};
-    uint8_t types[8] = {LM_SCAN, LM_SCAN_RESP, LM_CONNECT, LM_DISCONNECT, LM_DESTROY, LM_SYNC, LM_GONE, 0};
+    uint8_t types[8] = {LM_SCAN, LM_SCAN_RESP, LM_CONNECT, LM_DISCONNECT, LM_DESTROY, LM_SYNC, LM_GONE, LM_PING};
     uint64_t keep_event = g_ldn.event;
     g_ldn.event = 0;
     g_ldn_fuzzing = 1;
@@ -1007,4 +1051,27 @@ static int ldn_fuzz_selftest(int rounds) {
     g_ldn.nscan = 0; g_ldn.host_vip = 0; g_ldn.state = LDN_NONE; g_ldn.event = keep_event;
     g_ldn_dropped = 0; g_ldn_fuzzing = 0;
     return !bad;
+}
+
+/* ---------------------------------------------------------------- ping for the renderer (nvn_vk_draw.c ldn_ping_draw)
+ * While in a network (host or station): one entry per node slot 0..n-1 (the game numbers the players in that order:
+ * host P1, then the stations as they joined; seen with 2 players): the ms of that player's round trip to the room
+ * server, -1 not known yet, -2 slot empty. Returns n, 0 = nothing to draw. Render thread; takes the LDN lock briefly. */
+int ldn_ping_overlay(int *ms, int max) {
+    if (!g_ldn_ping_overlay || !g_ldn.online || !g_ldn.cs_ready) return 0;
+    int n = 0;
+    EnterCriticalSection(&g_ldn.cs);
+    if (g_ldn.state == LDN_AP_CREATED || g_ldn.state == LDN_STA_CONNECTED) {
+        for (int i = 0; i < 8 && i < max; i++) {
+            const uint8_t *nd = g_ldn.info + NI_NODES + i * NODE_SIZE;
+            ms[i] = -2;
+            if (!nd[0xb]) continue;
+            uint32_t vip = ldn_rd32(nd);
+            if (vip == g_ldn.vip) ms[i] = (int)g_ldn_my_ping;
+            else { ms[i] = -1; for (int k = 0; k < LDN_PEERS; k++) if (g_ldn_pings[k].vip == vip && GetTickCount() - g_ldn_pings[k].at < 15000) ms[i] = g_ldn_pings[k].ms; }
+            n = i + 1;
+        }
+    }
+    LeaveCriticalSection(&g_ldn.cs);
+    return n;
 }
