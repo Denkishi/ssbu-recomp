@@ -740,7 +740,8 @@ static void async_GetSystemEvent(Ctx *c) { os_init_event(A1, 0); os_signal_event
 static void out_count0_at0(Ctx *c) { if (A0) wr32(A0, 0); RET(0); }               /* (int *outCount, ...) -> Result */
 
 /* ---------------------------------------------------------------- nn::account extras: the one local user, no online account */
-static void acc_ShowUserSelector(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0); }   /* (Uid *out, settings): uid as in nnfs.c */
+void account_uid(uint64_t *lo, uint64_t *hi);              /* nnfs.c */
+static void acc_ShowUserSelector(Ctx *c) { uint64_t lo, hi; account_uid(&lo, &hi); wr64(A0, lo); wr64(A0 + 8, hi); RET(0); }   /* (Uid *out, settings): uid as in nnfs.c */
 
 /* nn::ldn, nn::nifm leftovers, nn::nsd, nn::ssl, sockets and the nn::ec accessor: nnnet_c4a.inc (included by nnnet.c). */
 

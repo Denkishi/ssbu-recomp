@@ -1,0 +1,29 @@
+# Rows for tools_audit/classification.tsv (format of fake_census.py: selector || class || evidence || action || status),
+# for a build with --ldn-online on (runtime/ldn_online.inc). In the default build these imports keep their existing rows
+# (Initialize 0x2ecb, GetState 0, the others trap). EXTERNAL: the answer belongs to the ldn system module, which is not in
+# the dump; it follows Eden's LANDiscovery (yuzu LDN over a room), NOT a console's radio.
+name:_ZN2nn3ldn10InitializeEv || EXTERNAL || follows Eden lan_discovery.cpp Initialize (state Initialized); connects to the room server first, 0x2ecb (203-23) when online is not configured or the server cannot be reached || compare with a console || open
+name:_ZN2nn3ldn8FinalizeEv || EXTERNAL || Eden LANDiscovery::Finalize: destroy / disconnect, state None; leaves the room server || - || closed
+name:_ZN2nn3ldn8GetStateEv || EXTERNAL || Eden LANDiscovery::GetState || - || closed
+name:_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE || EXTERNAL || auto-clear event signalled on every state and node change (Eden signals on node changes only); not called by 13.0.4 in the tested path (the game polls GetState) || compare with a console || open
+name:_ZN2nn3ldn32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE || CBS || success, no effect: there is no radio shared with controllers || - || closed
+name:_ZN2nn3ldn15OpenAccessPointEv || EXTERNAL || Eden OpenAccessPoint: state AccessPointOpened || - || closed
+name:_ZN2nn3ldn16CloseAccessPointEv || EXTERNAL || Eden CloseAccessPoint: destroys the network, state Initialized || - || closed
+name:_ZN2nn3ldn11OpenStationEv || EXTERNAL || Eden OpenStation: state StationOpened || - || closed
+name:_ZN2nn3ldn12CloseStationEv || EXTERNAL || Eden CloseStation: disconnects, state Initialized || - || closed
+name:_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE || EXTERNAL || Eden CreateNetwork: NetworkInfo built from the config (channel 6 by default, link level Good, random session id), node 0 = the host; SSID / BSSID / auth id are this port's own (no radio) || compare NetworkInfo with a console || open
+name:_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE || EXTERNAL || as CreateNetwork with the given security parameter / session id; the address list is ignored; not reached by 13.0.4 in the tested path || - || open
+name:_ZN2nn3ldn14DestroyNetworkEv || EXTERNAL || Eden DestroyNetwork: stations told, state AccessPointOpened || - || closed
+name:_ZN2nn3ldn16SetAdvertiseDataEPKvm || EXTERNAL || Eden SetAdvertiseData (> 384 bytes = 203-10), synced to stations || - || closed
+name:_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE || EXTERNAL || stored; RejectAll refuses new stations; black / white lists not applied || implement the lists || open
+name:_ZN2nn3ldn6RejectENS0_11Ipv4AddressE || EXTERNAL || the station is told the network is destroyed and leaves its slot; not reached by 13.0.4 in the tested path || - || open
+name:_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi || EXTERNAL || Eden Scan: broadcast in the room, replies collected for 400 ms (Eden: 1 s), filter flags as Eden, received NetworkInfos sanitized || - || closed
+name:_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi || EXTERNAL || as Scan; not reached by 13.0.4 in the tested path || - || open
+name:_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE || EXTERNAL || Eden Connect: NodeInfo to the host; waits up to 5 s for the host's NetworkInfo (Eden: returns after 1 s), 203-31 otherwise; the passphrase is not checked (the room password is the access control) || compare with a console || open
+name:_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE || EXTERNAL || scan, then Connect to the network with that session id; not reached by 13.0.4 in the tested path || - || open
+name:_ZN2nn3ldn10DisconnectEv || EXTERNAL || Eden Disconnect: host told, state StationOpened, reason DisconnectedByUser || - || closed
+name:_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE || EXTERNAL || Eden GetNetworkInfo (203-32 outside AccessPointCreated / StationConnected) || - || closed
+name:_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE || EXTERNAL || rebuilt from the NetworkInfo (intent, channel, node count max, node 0's version) || compare with a console || open
+name:_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE || EXTERNAL || security parameter + session id of the NetworkInfo || - || closed
+name:_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE || EXTERNAL || the virtual address from the room server, 169.254.1.N/24 (a console's LDN addresses are not checked against this) || compare with a console || open
+name:_ZN2nn3ldn19GetDisconnectReasonEv || EXTERNAL || Eden values: DestroyedByUser when the host destroys, SignalLost when it leaves the room, DisconnectedByUser after Disconnect || - || closed

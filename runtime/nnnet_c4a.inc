@@ -178,7 +178,12 @@ static void nifm_HandleNetworkRequestErrorResult(Ctx *c) {
 /* ================================================================== nn::socket on Winsock */
 #define SO_MAX_FD 128
 #define SO_O_NONBLOCK 0x800
+#ifdef SSBU_LDN_ONLINE
+typedef struct { SOCKET s; LONG refs; int type; int bound_any; uint16_t vport, vpeer_port; uint32_t vpeer; } SoObj;   /* v*: ldn_online.inc */
+static void ldn_port_remove(uint16_t vport);
+#else
 typedef struct { SOCKET s; LONG refs; int type; int bound_any; } SoObj;
+#endif
 static struct { SoObj *o; int flags; } g_so_fd[SO_MAX_FD];
 static SRWLOCK g_so_lock = SRWLOCK_INIT;
 static int g_so_init, g_so_wsa;
@@ -250,6 +255,9 @@ static void so_put(SoObj *o) {
     AcquireSRWLockExclusive(&g_so_lock);
     last = --o->refs == 0;
     ReleaseSRWLockExclusive(&g_so_lock);
+#ifdef SSBU_LDN_ONLINE
+    if (last && o->vport) ldn_port_remove(o->vport);
+#endif
     if (last) { closesocket(o->s); free(o); }
 }
 static int so_install(SoObj *o, int flags) {             /* lowest free descriptor, or -1 */
@@ -296,6 +304,47 @@ static uint32_t so_addr_out(uint64_t p, uint32_t cap, const struct sockaddr_in *
     return 16;
 }
 
+/* ================================================================== nn::ldn
+ * Without SSBU_LDN_ONLINE (the default build): the no-radio model described at the top of this file. With it
+ * (scripts\setup.py --ldn-online on): ldn_online.inc, local wireless over a room server when config\online.ini says so. */
+#define LDN_WIRELESS_OFF 0x2ecbu
+static void ldn_no_service(Ctx *c) {
+    printf("\nnn::ldn function called although nn::ldn::Initialize failed (no local-wireless radio: Result 0x2ecb).\n"
+           "The SDK dereferences its null service pointer here; a console crashes at this point.\n");
+    guest_trap("nn::ldn call without a service (Initialize failed)", c->x[30] - 4);
+}
+#ifdef SSBU_LDN_ONLINE
+void os_init_event(uint64_t key, int autoclear);          /* os_threads.c */
+void os_signal_event(uint64_t key);
+#include "ldn_online.inc"
+#else
+static void ldn_Initialize(Ctx *c) { RET(LDN_WIRELESS_OFF); }
+static void ldn_GetState(Ctx *c) { RET(0); }
+#define ldn_Finalize ldn_no_service
+#define ldn_AttachStateChangeEvent ldn_no_service
+#define ldn_SetWirelessControllerRestriction ldn_no_service
+#define ldn_OpenStation ldn_no_service
+#define ldn_CloseStation ldn_no_service
+#define ldn_OpenAccessPoint ldn_no_service
+#define ldn_CloseAccessPoint ldn_no_service
+#define ldn_Disconnect ldn_no_service
+#define ldn_DestroyNetwork ldn_no_service
+#define ldn_GetNetworkInfo ldn_no_service
+#define ldn_GetNetworkConfig ldn_no_service
+#define ldn_GetIpv4Address ldn_no_service
+#define ldn_GetSecurityParameter ldn_no_service
+#define ldn_SetAdvertiseData ldn_no_service
+#define ldn_SetStationAcceptPolicy ldn_no_service
+#define ldn_Reject ldn_no_service
+#define ldn_Scan ldn_no_service
+#define ldn_ScanPrivate ldn_no_service
+#define ldn_CreateNetwork ldn_no_service
+#define ldn_CreateNetworkPrivate ldn_no_service
+#define ldn_Connect ldn_no_service
+#define ldn_ConnectPrivate ldn_no_service
+#define ldn_GetDisconnectReason ldn_no_service
+#endif
+
 static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t poolSize, size_t allocatorPoolSize, int concurrency) -> Result */
     uint64_t pool = A0, size = A1, alloc = A2;
     int conc = (int)A3;
@@ -340,6 +389,14 @@ static void so_bind(Ctx *c, int len_check) {              /* (fd, const sockaddr
     struct sockaddr_in a;
     int e = 0;
     if (!so_addr_in(A1, &a)) e = 97;
+#ifdef SSBU_LDN_ONLINE
+    else if (g_ldn.online && o->type == SOCK_DGRAM && (a.sin_addr.S_un.S_addr == 0 || ldn_is_virtual(a.sin_addr.S_un.S_addr))) {
+        uint16_t vp = ntohs(a.sin_port);                  /* local wireless is up: a virtual port (ldn_online.inc) */
+        int w = ldn_so_bind(o->s, &vp);
+        if (w) e = so_wsa_errno(w, 0);
+        else { o->vport = vp; o->bound_any = a.sin_addr.S_un.S_addr == 0; }
+    }
+#endif
     else if (a.sin_addr.S_un.S_addr != 0 && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 99;
     else {
         int any = a.sin_addr.S_un.S_addr == 0;
@@ -347,6 +404,11 @@ static void so_bind(Ctx *c, int len_check) {              /* (fd, const sockaddr
         if (bind(o->s, (struct sockaddr *)&a, sizeof a) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
         else o->bound_any = any;
     }
+#ifdef SSBU_LDN_ONLINE
+    if (o->type == SOCK_DGRAM && ldn_trace())
+        printf("nn::socket::Bind fd %d udp %u.%u.%u.%u:%u -> %s%d (virtual port %u)\n", (int)A0, M8(A1 + 4), M8(A1 + 5), M8(A1 + 6), M8(A1 + 7),
+               ntohs(M16(A1 + 2)), e ? "errno " : "ok ", e, o->vport);
+#endif
     so_put(o);
     if (e) so_fail(c, e); else RETI(0);
 }
@@ -360,6 +422,12 @@ static void socket_Connect(Ctx *c) {                      /* (fd, const sockaddr
     if (!o) { so_fail(c, 9); return; }
     struct sockaddr_in a;
     if (!so_addr_in(A1, &a)) e = 97;
+#ifdef SSBU_LDN_ONLINE
+    else if (o->type == SOCK_DGRAM && ldn_is_virtual(a.sin_addr.S_un.S_addr)) {     /* a UDP "connection" to a virtual address */
+        e = ldn_so_ensure_port(o);
+        if (!e) { o->vpeer = a.sin_addr.S_un.S_addr; o->vpeer_port = a.sin_port; }
+    }
+#endif
     else if (!so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                        /* no network: nothing but loopback is reachable */
     else if (connect(o->s, (struct sockaddr *)&a, sizeof a) != 0) {
         int w = WSAGetLastError();
@@ -420,6 +488,10 @@ static void so_name(Ctx *c, int peer) {                   /* (fd, sockaddr *, so
     memset(&a, 0, sizeof a);
     int e = (peer ? getpeername(o->s, (struct sockaddr *)&a, &alen) : getsockname(o->s, (struct sockaddr *)&a, &alen)) != 0 ? so_wsa_errno(WSAGetLastError(), 0) : 0;
     if (!e && !peer && o->bound_any) a.sin_addr.S_un.S_addr = 0;
+#ifdef SSBU_LDN_ONLINE
+    if (!peer && o->vport) { e = 0; a.sin_family = AF_INET; a.sin_port = htons(o->vport); a.sin_addr.S_un.S_addr = o->bound_any ? 0 : htonl(g_ldn.vip); }
+    if (peer && o->vpeer) { e = 0; a.sin_family = AF_INET; a.sin_port = o->vpeer_port; a.sin_addr.S_un.S_addr = o->vpeer; }
+#endif
     if (e == 22 && !peer) { e = 0; a.sin_family = AF_INET; }                         /* Winsock refuses an unbound socket; BSD reports 0.0.0.0:0 */
     so_put(o);
     if (e) { so_fail(c, e); return; }
@@ -443,6 +515,22 @@ static void so_recv(Ctx *c, uint64_t addr, uint64_t lenp) {   /* (fd, buf, size,
     int alen = sizeof a;
     memset(&a, 0, sizeof a);
     if (temp) so_nonblock(o, 1);
+#ifdef SSBU_LDN_ONLINE
+    if (o->vport && o->type == SOCK_DGRAM) {              /* virtual port: datagrams carry a 6-byte source header (ldn_online.inc) */
+        int cap = (int)(size > 0xffff ? 0xffff : size) + 6;
+        char *tmp = malloc(cap);
+        n = recv(o->s, tmp, cap, so_host_flags(gf));
+        if (n < 0 && WSAGetLastError() == WSAEMSGSIZE) n = cap;
+        if (n >= 6) {
+            a.sin_family = AF_INET;
+            memcpy(&a.sin_addr.S_un.S_addr, tmp, 4); memcpy(&a.sin_port, tmp + 4, 2);
+            n -= 6;
+            memcpy((void *)(uintptr_t)buf, tmp + 6, n);
+        } else if (n >= 0) n = 0;
+        free(tmp);
+    }
+    else
+#endif
     if (addr) n = recvfrom(o->s, (char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf), (struct sockaddr *)&a, &alen);
     else n = recv(o->s, (char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf));
     if (n < 0) {
@@ -471,6 +559,13 @@ static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, fla
     int temp = (gf & 0x80) && !(flags & SO_O_NONBLOCK), n = -1, e = 0;
     struct sockaddr_in a;
     if (addr && !so_addr_in(addr, &a)) e = 97;
+#ifdef SSBU_LDN_ONLINE
+    else if (o->type == SOCK_DGRAM && ((addr && ldn_is_virtual(a.sin_addr.S_un.S_addr)) || (!addr && o->vpeer))) {
+        if (!addr) { memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_addr.S_un.S_addr = o->vpeer; a.sin_port = o->vpeer_port; }
+        e = ldn_so_ensure_port(o);                        /* local wireless: through the room server (ldn_online.inc) */
+        if (!e) { n = ldn_so_sendto(o->vport, &a, (const void *)(uintptr_t)buf, (int)(size > 0xffff ? 0xffff : size)); if (n < 0) e = 101; }
+    }
+#endif
     else if (addr && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                 /* no network */
     else {
         if (temp) so_nonblock(o, 1);
@@ -925,15 +1020,6 @@ static void nsd_ResolveEx(Ctx *c) {                       /* (Fqdn *out, const F
     RET(0);
 }
 
-/* ================================================================== nn::ldn */
-#define LDN_WIRELESS_OFF 0x2ecbu
-static void ldn_Initialize(Ctx *c) { RET(LDN_WIRELESS_OFF); }
-static void ldn_GetState(Ctx *c) { RET(0); }
-static void ldn_no_service(Ctx *c) {
-    printf("\nnn::ldn function called although nn::ldn::Initialize failed (no local-wireless radio: Result 0x2ecb).\n"
-           "The SDK dereferences its null service pointer here; a console crashes at this point.\n");
-    guest_trap("nn::ldn call without a service (Initialize failed)", c->x[30] - 4);
-}
 
 /* ================================================================== nn::ec::ShopServiceAccessor */
 static uint64_t g_ec_list[2];                             /* the proxy's list of accessors ([sdk] proxy + 0x70) */
@@ -1071,21 +1157,21 @@ static void c4a_register(void) {
         {"nnsslConnectionGetConnectionId", nnssl_ConnectionGetConnectionId},
         {"_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", nsd_ResolveEx},
         {LDNK("10InitializeEv"), ldn_Initialize}, {LDNK("8GetStateEv"), ldn_GetState},
-        {LDNK("8FinalizeEv"), ldn_no_service}, {LDNK("22AttachStateChangeEventEPNS_2os15SystemEventTypeE"), ldn_no_service},
-        {LDNK("32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE"), ldn_no_service},
-        {LDNK("11OpenStationEv"), ldn_no_service}, {LDNK("12CloseStationEv"), ldn_no_service}, {LDNK("15OpenAccessPointEv"), ldn_no_service},
-        {LDNK("16CloseAccessPointEv"), ldn_no_service}, {LDNK("10DisconnectEv"), ldn_no_service}, {LDNK("14DestroyNetworkEv"), ldn_no_service},
-        {LDNK("14GetNetworkInfoEPNS0_11NetworkInfoE"), ldn_no_service}, {LDNK("16GetNetworkConfigEPNS0_13NetworkConfigE"), ldn_no_service},
-        {LDNK("14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE"), ldn_no_service},
-        {LDNK("20GetSecurityParameterEPNS0_17SecurityParameterE"), ldn_no_service}, {LDNK("16SetAdvertiseDataEPKvm"), ldn_no_service},
-        {LDNK("22SetStationAcceptPolicyENS0_12AcceptPolicyE"), ldn_no_service}, {LDNK("6RejectENS0_11Ipv4AddressE"), ldn_no_service},
-        {LDNK("4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_no_service},
-        {LDNK("11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_no_service},
-        {LDNK("13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE"), ldn_no_service},
-        {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_no_service},
-        {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_no_service},
-        {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_no_service},
-        {LDNK("19GetDisconnectReasonEv"), ldn_no_service},
+        {LDNK("8FinalizeEv"), ldn_Finalize}, {LDNK("22AttachStateChangeEventEPNS_2os15SystemEventTypeE"), ldn_AttachStateChangeEvent},
+        {LDNK("32SetWirelessControllerRestrictionENS0_29WirelessControllerRestrictionE"), ldn_SetWirelessControllerRestriction},
+        {LDNK("11OpenStationEv"), ldn_OpenStation}, {LDNK("12CloseStationEv"), ldn_CloseStation}, {LDNK("15OpenAccessPointEv"), ldn_OpenAccessPoint},
+        {LDNK("16CloseAccessPointEv"), ldn_CloseAccessPoint}, {LDNK("10DisconnectEv"), ldn_Disconnect}, {LDNK("14DestroyNetworkEv"), ldn_DestroyNetwork},
+        {LDNK("14GetNetworkInfoEPNS0_11NetworkInfoE"), ldn_GetNetworkInfo}, {LDNK("16GetNetworkConfigEPNS0_13NetworkConfigE"), ldn_GetNetworkConfig},
+        {LDNK("14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE"), ldn_GetIpv4Address},
+        {LDNK("20GetSecurityParameterEPNS0_17SecurityParameterE"), ldn_GetSecurityParameter}, {LDNK("16SetAdvertiseDataEPKvm"), ldn_SetAdvertiseData},
+        {LDNK("22SetStationAcceptPolicyENS0_12AcceptPolicyE"), ldn_SetStationAcceptPolicy}, {LDNK("6RejectENS0_11Ipv4AddressE"), ldn_Reject},
+        {LDNK("4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_Scan},
+        {LDNK("11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi"), ldn_ScanPrivate},
+        {LDNK("13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE"), ldn_CreateNetwork},
+        {LDNK("20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE"), ldn_CreateNetworkPrivate},
+        {LDNK("7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_Connect},
+        {LDNK("14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE"), ldn_ConnectPrivate},
+        {LDNK("19GetDisconnectReasonEv"), ldn_GetDisconnectReason},
         {"_ZN2nn2ec33InitializeForShopServiceAccessorsEPvm", ec_InitializeForAccessors}, {"_ZN2nn2ec31FinalizeForShopServiceAccessorsEv", ec_FinalizeForAccessors},
         {"_ZN2nn2ec19ShopServiceAccessorC1Ev", ec_Accessor_ctor}, {"_ZN2nn2ec19ShopServiceAccessorD1Ev", ec_Accessor_dtor},
         {"_ZN2nn2ec19ShopServiceAccessor10InitializeERKNS0_11ShopServiceE", ec_Accessor_Initialize},
@@ -1298,8 +1384,19 @@ static int c4a_selftest(Ctx *c) {
     ok = H("_ZN2nn3nsd9ResolveExEPNS0_4FqdnERKS1_", P(fq), P(fin)) == 0 && !strcmp(fq, fin) && fq[0xff] == 0 && fq[0x100] == 0x7e;
     C4A_CHECK("nsd: ResolveEx returns the name unchanged in a 0x100-byte Fqdn");
     /* ---- ldn */
+#ifdef SSBU_LDN_ONLINE
+    ldn_load_config();
+    if (g_ldn.configured) printf("  ldn: a room server is configured (config\\online.ini): the no-radio case is not tested\n");
+    else {
+        ok = H(LDNK("10InitializeEv"), 0) == 0x2ecb && H(LDNK("8GetStateEv"), 0) == 0;
+        C4A_CHECK("ldn: Initialize 0x2ecb (203-23, wireless communication not available), state None");
+    }
+    ok = ldn_fuzz_selftest(200000);
+    C4A_CHECK("ldn: 200000 random room messages and datagrams: every NetworkInfo / NodeInfo kept within its bounds");
+#else
     ok = H(LDNK("10InitializeEv"), 0) == 0x2ecb && H(LDNK("8GetStateEv"), 0) == 0;
     C4A_CHECK("ldn: Initialize 0x2ecb (203-23, wireless communication not available), state None");
+#endif
     /* ---- ec */
     uint64_t acc[16], acc2[16], resp[16], size = 123;
     memset(acc, 0xee, sizeof acc); memset(acc2, 0xee, sizeof acc2); memset(resp, 0xee, sizeof resp);

@@ -140,6 +140,25 @@ Options are environment variables, set with `--env NAME=VALUE` (full list: comme
 functions that are not the real behaviour), `SSBU_TRACE`, `SSBU_PAD_BACKEND=xinput`, `SSBU_FIXED_SEED=<n>`.
 Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
 
+### Local wireless over the internet (optional build)
+
+The game's own **Local Wireless** mode, carried through a room server you host (`tools/online/ldn_room_server.py`,
+Python 3, no dependencies; `tools/online/test_room_server.py` is its protocol and fuzz test). It is the game's own
+delay-based sync over a relay, not netcode of this project, and no Nintendo service is contacted. Off by default and
+absent from the default exe:
+
+- `python scripts/setup.py ... --ldn-online on` builds it into the exe (`off` removes it again; the choice is kept).
+- `build\config\online.ini` (template: `tools/online/online.ini.example`): `server = host:port`, `room = <password>`,
+  `nickname = <name others see>`. All three are needed; the nickname replaces the account nickname while online (the
+  Windows user name is never sent). Environment: `SSBU_LDN_SERVER`, `SSBU_LDN_ROOM`, `SSBU_LDN_NICKNAME`.
+- Refused while `runahead = on` in `graphics.ini`, and by the server when the other side's build differs (fingerprint
+  of `main.elf`, the game DLL, the script modules and the mods / fighter-source / new-fighter switches).
+- Each player's ping to the room server is drawn over the picture while in a room: next to the stock icons in a
+  2-player fight, a short list at the top right otherwise. `ping_overlay = off` in `online.ini` (`SSBU_LDN_PING=0`) hides it.
+- `SSBU_LDN_TRACE=1` logs every `nn::ldn` call and every game datagram.
+- `SSBU_ACCOUNT_UID=<32 hex digits>`: the account id while online (otherwise random once, in `build\config\account.txt`);
+  for two copies of the game on one PC.
+
 ## Troubleshooting
 
 - `"build_glslang.bat" is not recognised` / `vswhere.exe is not recognised`: Visual Studio Build Tools are missing or

@@ -1664,8 +1664,26 @@ static int g_ncdisp, g_cb_live, g_cb_pending, g_cb_cached = -1;
 static uint64_t g_cb_serial;                       /* the submission the pending CBs wait for */
 /* SSBU_VK_CBKEEP: the buffer's bytes go to guest memory. With the snapshot of the fill (SSBU_VK_CBMERGE, the default) only
  * the words compute changed since the fill are written, and a word the game changed since then stays the game's. */
+/* The game can free the memory a kept buffer belongs to before the buffer lands (leaving a fight: the scene's heap is
+ * unmapped; the attract demo ending and the local-wireless waiting room going over to the match both crashed here,
+ * reading a decommitted page). Such a range is not written back: nothing can read it any more. */
+static LONG64 g_ck_unmapped;
+static int cb_guest_range_live(uint64_t addr, uint64_t size) {
+    uintptr_t p = (uintptr_t)P(addr), end = p + (uintptr_t)size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void *)p, &mi, sizeof mi) || mi.State != MEM_COMMIT ||
+            !(mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) || (mi.Protect & PAGE_GUARD)) return 0;
+        p = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+    }
+    return 1;
+}
 static void cb_keep_back(CB *c, const uint8_t *src) {      /* src: the bytes in ordinary memory already (the copy of an asynchronous landing), or NULL = the buffer itself */
     if (!c->dirty && !c->stale) return;
+    if (!cb_guest_range_live(c->addr, c->size)) {
+        if (g_ck_unmapped++ < 10) printf("nvn_vk: kept compute buffer %llx+%llu not written back: the game has freed that memory\n", (unsigned long long)c->addr, (unsigned long long)c->size);
+        return;
+    }
 #ifdef R1_MARK
     { void r1_wrote(uint64_t, uint64_t); r1_wrote(c->addr, c->size); }      /* R1 (r1_state.c): compute results written back into guest memory are marked */
 #endif
@@ -3024,6 +3042,7 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; int screen; char text[4][48]; } g_ovl = {.on = -1};
 /* Session 14: text of the first-run preparation screen. A built-in 5x7 dot font (digits, capitals, % / : . -), each lit dot
  * one blit of the overlay's light layer; no game asset. */
+static int g_ovl_text_layer;                       /* 0 light dots (default), 1 dark dots (the ping text's shadow) */
 static void ovl_text(uint32_t index, int x, int y, int dot, const char *s) {
     static const char k_ch[] = "0123456789%/:.-ABCDEFGHIKLMNOPRSTUVWXY";
     static const uint8_t k_gl[][7] = {
@@ -3047,6 +3066,7 @@ static void ovl_text(uint32_t index, int x, int y, int dot, const char *s) {
             VkImageBlit b;
             memset(&b, 0, sizeof b);
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
+            b.srcSubresource.baseArrayLayer = (uint32_t)g_ovl_text_layer;
             b.srcOffsets[1].x = 8; b.srcOffsets[1].y = 8; b.srcOffsets[1].z = 1;
             b.dstOffsets[0].x = x + c * dot; b.dstOffsets[0].y = y + r * dot; b.dstOffsets[1].x = x + (c + run) * dot; b.dstOffsets[1].y = y + (r + 1) * dot; b.dstOffsets[1].z = 1;
             if (b.dstOffsets[0].x >= 0 && b.dstOffsets[0].y >= 0 && b.dstOffsets[1].x <= W && b.dstOffsets[1].y <= H)
@@ -3055,10 +3075,7 @@ static void ovl_text(uint32_t index, int x, int y, int dot, const char *s) {
         }
     }
 }
-static void overlay_draw(uint32_t index) {
-    if (g_ovl.on < 0) g_ovl.on = !(getenv("SSBU_VK_PROGRESS") && !atoi(getenv("SSBU_VK_PROGRESS")));
-    if ((!g_ovl.on && !g_ovl.screen) || g_ovl.thick <= 0) return;
-    if (g_ovl.thick < 8) g_ovl_frames++;
+static void ovl_make(void) {                       /* the 8x8 two-layer image the bar and the text are blitted from */
     VkImageSubresourceRange sr2 = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (!g_ovl.made) {
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -3078,6 +3095,12 @@ static void overlay_draw(uint32_t index) {
         image_barrier(g_ovl.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         g_ovl.made = 1;
     }
+}
+static void overlay_draw(uint32_t index) {
+    if (g_ovl.on < 0) g_ovl.on = !(getenv("SSBU_VK_PROGRESS") && !atoi(getenv("SSBU_VK_PROGRESS")));
+    if ((!g_ovl.on && !g_ovl.screen) || g_ovl.thick <= 0) return;
+    if (g_ovl.thick < 8) g_ovl_frames++;
+    ovl_make();
     int W = (int)V.extent.width, H = (int)V.extent.height, th = g_ovl.thick * H / 720, x0 = W / 10, x1 = W - W / 10, y1 = H - H / 40, y0;
     float f = g_ovl.frac < 0 ? 0 : g_ovl.frac > 1 ? 1 : g_ovl.frac;
     if (th < 2) th = 2;
@@ -3100,6 +3123,38 @@ static void overlay_draw(uint32_t index) {
         for (int i = 0; i < 4; i++) if (g_ovl.text[i][0]) { int d = i ? dot : dot * 2; ovl_text(index, (W - (int)strlen(g_ovl.text[i]) * 6 * d) / 2, H / 4 + i * dot * 22, d, g_ovl.text[i]); }
     }
 }
+#ifdef SSBU_LDN_ONLINE
+/* Local wireless over the internet (ldn_online.inc): each player's ping to the room server, drawn over the picture while
+ * in a network. In a fight with 2 players right of each player's stock icons (positions measured on the 2-player HUD,
+ * as fractions of the picture); otherwise (room, character select, 3-4 players) a short list at the top left.
+ * Dark copy one dot down-right under the light text, so it reads on any background. */
+int ldn_ping_overlay(int *ms, int max);                 /* ldn_online.inc (nnnet.c) */
+static void ldn_ping_text(uint32_t index, int x, int y, int dot, const char *t) {
+    g_ovl_text_layer = 1; ovl_text(index, x + dot, y + dot, dot, t);
+    g_ovl_text_layer = 0; ovl_text(index, x, y, dot, t);
+}
+static void ldn_ping_draw(uint32_t index) {
+    int ms[8], n = ldn_ping_overlay(ms, 8);
+    if (n <= 0) return;
+    ovl_make();
+    int W = (int)V.extent.width, H = (int)V.extent.height, dot = H / 360 > 1 ? H / 360 : 1;
+    char t[24];
+    if (g_in_fight && n == 2) {                        /* measured at 1280x720: stock icons P1 x 318-350, P2 x 812-860, row y 692-704 */
+        static const float fx[2] = {0.297f, 0.678f};
+        for (int i = 0; i < 2; i++) {
+            if (ms[i] == -2) continue;
+            if (ms[i] < 0) snprintf(t, sizeof t, "-- MS"); else snprintf(t, sizeof t, "%d MS", ms[i]);
+            ldn_ping_text(index, (int)(fx[i] * W), (int)(0.960f * H), dot, t);
+        }
+        return;
+    }
+    for (int i = 0, row = 0; i < n; i++) {             /* top right: the room / character select keep their buttons top left */
+        if (ms[i] == -2) continue;
+        if (ms[i] < 0) snprintf(t, sizeof t, "P%d --", i + 1); else snprintf(t, sizeof t, "P%d %d MS", i + 1, ms[i]);
+        ldn_ping_text(index, W - (int)strlen(t) * 6 * dot - W / 90, H / 60 + row++ * 10 * dot, dot, t);
+    }
+}
+#endif
 static void vk_present2(void *arg, int progress);
 /* Session 14: THE KEPT PRESENT. vk_present2 has blitted and submitted the frame; when display.c says the frame is to be shown
  * at the next tick, vkQueuePresentKHR is not called there: what it needs is kept here and the vsync thread posts
@@ -3338,6 +3393,9 @@ swap: ;
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         fl_capture(vt, fl_s4, frame, fl_layout);      /* session 13: 16x9 copy of what is presented, for the flash detector */
         overlay_draw(index);
+#ifdef SSBU_LDN_ONLINE
+        if (!progress) ldn_ping_draw(index);
+#endif
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         tp[3] = tk();
         cmd_submit(acq, rend);
