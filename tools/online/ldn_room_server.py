@@ -23,8 +23,10 @@ TCP frame: u32 length (of what follows, little endian), u8 type, payload. Frames
 UDP datagram:
   client -> server  REG  1: u32 token                                           (also the keep-alive, every 2 s)
   client -> server  DATA 2: u32 token, u32 dst vip, u16 dst port, u16 src port, payload
+  client -> server  PING 4: u32 token, 8 bytes (the client's clock)            (answered only to the member's own address)
   server -> client  DATA 2: u32 src vip, u16 src port, u32 dst vip, u16 dst port, payload
   server -> client  REGOK 3: no payload
+  server -> client  PONG 6: the 8 bytes of the PING
 A destination of x.x.x.255 or 255.255.255.255 goes to every other member of the room.
 """
 import argparse
@@ -202,6 +204,10 @@ class Server:
         member.last_udp = time.monotonic()
         if kind == 1:
             self.udp.sendto(b'\x03', addr)
+            return
+        if kind == 4:                                   # ping: echo the client's 8-byte timestamp
+            if len(data) == 13:
+                self.udp.sendto(b'\x06' + data[5:13], addr)
             return
         if kind != 2 or len(data) < 13 or len(data) - 13 > MAX_DATAGRAM:
             self.stats['dropped'] += 1

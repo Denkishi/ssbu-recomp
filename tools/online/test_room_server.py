@@ -110,6 +110,8 @@ def main():
         dgram = a[0].recv(2000)
         k, src, sport, dst, dport = struct.unpack_from('<BIHIH', dgram)
         check(k == 2 and src == b[1] and sport == 5555 and dport == 1234 and dgram[13:] == b'hello', 'UDP relay with the source the server saw')
+        a[0].send(bytes([4]) + struct.pack('<I', a[2]) + b'12345678')
+        check(a[0].recv(100) == bytes([6]) + b'12345678', 'ping echo')
 
         # ---- fuzz
         rnd = random.Random(1)
