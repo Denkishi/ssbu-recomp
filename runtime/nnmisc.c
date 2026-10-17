@@ -237,11 +237,9 @@ static LARGE_INTEGER g_start;
  * MessagePerformanceModeChanged (31) never occur; the enable flags are kept as the game sets them.
  * (close4: the state now follows the applet manager's table, see oe_track_focus: not in focus = 2 only while the window is
  * visible; minimised = 3 for a NoSuspend application and no change at all in the suspending modes.)
- * Differences from the console, stated: (1) in the suspending modes (0, 2, 3) the console also FREEZES the application
- * while it is in the background (mode 3: also while obscured); this port does not freeze the game's threads: a minimised
- * game keeps running (design of the freeze: plan\phases\R6_fake_audit.md, fourth round). (2) A window
- * that has never been in the foreground (the automated tests keep theirs off screen) is treated as in focus.
- * (3) Closing the window is the exit request: see oe_exit_request below.
+ * The watcher below also suspends guest threads in the suspending modes (0, 2, 3). A window that has never
+ * been in the foreground (the automated tests keep theirs off screen) is treated as in focus.
+ * Closing the window is the exit request: see oe_exit_request below.
  * SSBU_FOCUS_NOTIFY=0 turns the focus tracking off. */
 #define OE_MSG_FOCUS_STATE_CHANGED 15u
 static uint8_t g_oe_event[0x40];
@@ -276,6 +274,7 @@ static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
     if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
     return TRUE;
 }
+static void oe_track_focus(void);
 static DWORD WINAPI oe_watch(LPVOID unused) {
     const char *test = getenv("SSBU_FREEZE_TEST");
     double t_start = 0, t_len = 0;
@@ -289,16 +288,30 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
         if (test && test_phase == 0 && t >= t_start) {
             HWND w = NULL;
             EnumWindows(oe_find_window, (LPARAM)&w);
-            if (w) { g_oe_window = w; g_oe_was_foreground = 1; ShowWindow(w, SW_SHOWMINNOACTIVE); test_phase = 1; printf("nn::oe: freeze test: window minimised (handling mode %d)\n", g_oe_focus_mode); fflush(stdout); }
+            if (w) {
+                EnterCriticalSection(&g_oe_lock);
+                g_oe_window = w; g_oe_was_foreground = 1;
+                int mode = g_oe_focus_mode;
+                LeaveCriticalSection(&g_oe_lock);
+                ShowWindow(w, SW_SHOWMINNOACTIVE); test_phase = 1;
+                printf("nn::oe: freeze test: window minimised (handling mode %d)\n", mode); fflush(stdout);
+            }
         } else if (test_phase == 1 && t >= t_start + t_len) {
-            ShowWindow(g_oe_window, SW_SHOWNOACTIVATE);
+            EnterCriticalSection(&g_oe_lock);
+            HWND w = g_oe_window;
+            LeaveCriticalSection(&g_oe_lock);
+            ShowWindow(w, SW_SHOWNOACTIVATE);
             test_phase = 2;
         }
+        /* The game can stop polling oe after losing focus and wait on the notification event.
+         * Keep producing focus notifications even while every guest consumer is asleep. */
+        oe_track_focus();
+        EnterCriticalSection(&g_oe_lock);
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
         int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
         if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
-        if (!g_oe_was_foreground) continue;
+        if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); continue; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
         int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
@@ -314,6 +327,7 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
             trace_printf("     nn::oe: application resumed after %llu ms\n", (unsigned long long)(GetTickCount64() - frozen_at));
         }
         if (test_phase == 2 && !g_guest_frozen) { g_oe_was_foreground = 0; test_phase = 3; }      /* the test window was never the foreground window: back to "in focus" */
+        LeaveCriticalSection(&g_oe_lock);
     }
     return 0;
 }
@@ -321,17 +335,22 @@ static void oe_track_focus(void) {
     static int enabled = -1;
     static ULONGLONG last;
     static volatile LONG watcher;
+    /* Guest queries and the independent watcher share state and queue transitions. */
+    EnterCriticalSection(&g_oe_lock);
     ULONGLONG now = GetTickCount64();
     if (enabled < 0) { const char *e = getenv("SSBU_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
-    if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) CloseHandle(CreateThread(NULL, 0, oe_watch, NULL, 0, NULL));
-    if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
+    if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) {
+        HANDLE thread = CreateThread(NULL, 0, oe_watch, NULL, 0, NULL);
+        if (thread) CloseHandle(thread); else InterlockedExchange(&watcher, 0);
+    }
+    if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) { LeaveCriticalSection(&g_oe_lock); return; }
     last = now;
     g_oe_focus_recheck = 0;
     DWORD pid = 0;
     HWND fg = GetForegroundWindow();
     int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
     if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
-    if (!g_oe_was_foreground) return;
+    if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); return; }
     /* close4: the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
      * the window as the activity state: foreground = ForegroundVisible; visible but not the foreground window = ForegroundObscured
      * (something else has the input, as under an overlay or a library applet); minimised = Background (as behind the HOME menu).
@@ -348,6 +367,7 @@ static void oe_track_focus(void) {
         trace_printf("     nn::oe: focus state -> %d (%s; handling mode %d)\n", state, state == 1 ? "in focus" : state == 2 ? "not in focus" : "background", g_oe_focus_mode);
     }
     if (g_oe_focus_pending && (g_oe_focus_mode == 1 || g_oe_focus_mode == 2)) { g_oe_focus_pending = 0; oe_push(OE_MSG_FOCUS_STATE_CHANGED); }   /* delivered only while notification is enabled */
+    LeaveCriticalSection(&g_oe_lock);
 }
 /* Exit request. [sdk 0x32cc20 / 0x32cca0] Enter / LeaveExitRequestHandlingSection keep a nesting count under a mutex and call the
  * applet manager's ISelfController LockExit when the count goes 0 -> 1 and UnlockExit when it goes 1 -> 0. The applet manager is a
@@ -408,13 +428,22 @@ static void oe_TryPopNotificationMessage(Ctx *c) {       /* (uint32_t *out) -> b
     RET(got);
 }
 static void oe_GetNotificationMessageEvent(Ctx *c) {     /* -> nn::os::SystemEvent *, signalled while a message is pending */
+    oe_track_focus();
     EnterCriticalSection(&g_oe_lock);
     oe_event_setup();
     LeaveCriticalSection(&g_oe_lock);
     RET(g_oe_event);
 }
-static void oe_GetCurrentFocusState(Ctx *c) { oe_track_focus(); RET(g_oe_focus_state); }
-static void oe_SetFocusHandlingMode(Ctx *c) { g_oe_focus_mode = (int)(uint32_t)A0; g_oe_focus_recheck = 1; oe_track_focus(); }               /* 0 SuspendHomeSleep, 1 NoSuspend, 2 SuspendHomeSleepNotify, 3 AlwaysSuspend */
+static void oe_GetCurrentFocusState(Ctx *c) {
+    EnterCriticalSection(&g_oe_lock);
+    oe_track_focus(); RET(g_oe_focus_state);
+    LeaveCriticalSection(&g_oe_lock);
+}
+static void oe_SetFocusHandlingMode(Ctx *c) {              /* 0 SuspendHomeSleep, 1 NoSuspend, 2 SuspendHomeSleepNotify, 3 AlwaysSuspend */
+    EnterCriticalSection(&g_oe_lock);
+    g_oe_focus_mode = (int)(uint32_t)A0; g_oe_focus_recheck = 1; oe_track_focus();
+    LeaveCriticalSection(&g_oe_lock);
+}
 static void oe_SetOperationModeChangedNotificationEnabled(Ctx *c) { g_oe_opmode_notify = (int)(A0 & 1); }
 /* While the game is inside such a section the console does not dim the screen or go to sleep by itself; the same is
  * asked of Windows (display and system kept awake) for as long as at least one section is open. */
