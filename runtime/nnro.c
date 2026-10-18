@@ -477,25 +477,35 @@ static int publish_exports(NroModule *m, int on) {
 /* The SDK's LoadModule ends with BindVariables of every other loaded module against the new one: imports that nothing
  * provided when those modules were loaded get their address now (a plugin loaded at boot imports lua2cpp_common's
  * functions, which load with the first fight). Under g_ro_lock. Returns the number of symbols bound. */
+static void find_dynamic(NroModule *m, uint64_t *rela, uint64_t *relasz, uint64_t *jmprel, uint64_t *pltrelsz);
 static int rebind_others(NroModule *nm) {
     int n = 0;
     for (int i = 0; i < g_mod_count; i++) {
         NroModule *m = &g_mods[i];
         if (m == nm || !m->loaded || !m->bind_addr) continue;
+        uint8_t *fresh = NULL;
         for (int k = 1; k < m->sym_count; k++) {
             if (m->bind_addr[k] || m->syms[k].defined || !m->syms[k].name[0]) continue;
             const Export *e = exp_find(m->syms[k].name);
             if (!e || e->mod != nm) continue;
             m->bind_addr[k] = e->value;
             m->bind_fn[k] = function_at(e->value);
-            if (m->got && m->got[k]) {
-                DWORD old, o2;
-                BOOL p = VirtualProtect((void *)(uintptr_t)m->got[k], 8, PAGE_READWRITE, &old);
-                wr64(m->got[k], e->value);
-                if (p) VirtualProtect((void *)(uintptr_t)m->got[k], 8, old, &o2);
-            }
+            if (!fresh) fresh = calloc((size_t)m->sym_count, 1);
+            fresh[k] = 1;
             n++;
         }
+        if (!fresh) continue;
+        /* every relocation of those symbols: a symbol can have a PLT slot (calls) and GOT slots (its address taken) */
+        uint64_t base = m->info->base, tab[2], size[2];
+        find_dynamic(m, &tab[0], &size[0], &tab[1], &size[1]);
+        for (int t = 0; t < 2; t++)
+            for (uint64_t r = 0; r < size[t] / 24; r++) {
+                uint64_t e = base + tab[t] + r * 24, off = rd64(e), info = rd64(e + 8), addend = rd64(e + 16);
+                uint32_t type = (uint32_t)info, sym = (uint32_t)(info >> 32);
+                if ((type == 0x101 || type == 0x401 || type == 0x402) && sym < (uint32_t)m->sym_count && fresh[sym])
+                    wr64(base + off, m->bind_addr[sym] + (type == 0x101 ? addend : 0));
+            }
+        free(fresh);
     }
     return n;
 }

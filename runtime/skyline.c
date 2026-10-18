@@ -425,8 +425,9 @@ static void sky_A64HookFunction(Ctx *c) {
         state = sky_compiled(sym, 3) ? "active (mid-function callout)" : "NOT ACTIVE (mid-function: needs a midhook site, re-lift)";
     } else state = "NOT ACTIVE (not lifted code of main or a module)";
     if (out) wr64(out, orig);
-    sky_site("%s %llx    # %s repl=%llx (%s) %s", strstr(state, "mid") ? "midhook" : sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE ? "noinline" : "hook",
-             (unsigned long long)sym, where, (unsigned long long)repl, rwhere, state);
+    char from[96]; sky_where(c->x[30], from, sizeof from);
+    sky_site("%s %llx    # %s repl=%llx (%s) %s; from %s", strstr(state, "mid") ? "midhook" : sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE ? "noinline" : "hook",
+             (unsigned long long)sym, where, (unsigned long long)repl, rwhere, state, from);
     if (state[0] == 'N') sky_logf("hook at %s -> %s: %s", where, rwhere, state);
 }
 
