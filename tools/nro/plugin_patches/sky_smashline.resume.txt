@@ -1,0 +1,5 @@
+# Extra resume entries of sky_smashline (module offsets, hex), see recomp_nro.py RECOMP_EXTRA_RESUME.
+# smashline/src/interpreter.asm: __smashline_interpreter (+0x5b8, not exported) ends with ret at +0x5fc; the local label
+# __smashline_interpreter_landing_pad is the nop at +0x600 (the adr x0 at +0x5d0 hands it to set_smashline_interpreter_landing);
+# the custom personality resumes at landing pad + 4.
+604
