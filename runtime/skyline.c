@@ -647,6 +647,7 @@ static void sky_find_interpreter(NroModule *m) {
 
 /* At exit: how often the plugins' hooks and inline hooks ran (evidence that their code takes part in the game). */
 static int sky_cmp_calls(const void *a, const void *b) { LONG64 x = *(const LONG64 *)b, y = *(const LONG64 *)a; return x < y ? -1 : x > y; }
+extern void (*g_plugin_report_hook)(void);
 static void sky_report(void) {
     typedef struct { LONG64 calls; uint64_t addr, repl; } Row;
     static Row rows[4096];
@@ -676,7 +677,7 @@ static void sky_register(void) {
     register_imports(sky_imports, (int)(sizeof sky_imports / sizeof sky_imports[0]));
     if (sky_registry() <= 0) return;
     g_svc_handler = sky_svc;
-    atexit(sky_report);
+    g_plugin_report_hook = sky_report;      /* report_and_exit (ExitProcess skips atexit) */
     g_sky_mountrom_orig = import_lookup("_ZN2nn2fs8MountRomEPKcPvm");
     if (g_sky_mountrom_orig) { ImportDef d = {"_ZN2nn2fs8MountRomEPKcPvm", sky_MountRom}; register_imports(&d, 1); }
     else printf("[skyline] nn::fs::MountRom has no handler: plugins are not loaded\n");
