@@ -1,7 +1,7 @@
 """Re-lift of the play DLL for a SITE LIST: run-time code changes of Skyline plugins (HDR) compiled in.
 
     python relift_sites.py build <site file> [--tag=hdr] [--jobs=N] [--lift-only] [--force] [--base-gen=gen_fl]
-                                             [--base-obj=obj_fl23] [--min-free-gb=G]
+                                             [--base-obj=obj_fl23] [--min-free-gb=G] [--no-prune]
     python relift_sites.py check <site file>      parse, check against the binary and classify; no lift
 
 Output (nothing of the base set is written): gen_<tag>\\ (the re-lifted bucket files, funcs.h, table.c, hdr_sites.c),
@@ -15,7 +15,8 @@ SITE LIST: text, one site per line, `#` starts a comment, addresses are full gue
                                            new). A write outside .text needs no re-lift and is only reported.
   inline   <addr>   `sky_site_inline(c, addr);` before the instruction at addr (all registers are in c; the flags are
                     written back before and reloaded after, flags_local.py). At a function START (one lifted copy only,
-                    reached through its entry) no callout is compiled: the runtime uses the hook table; reported.
+                    reached through its entry) no callout is compiled: the runtime uses the hook table; reported, and
+                    the address is treated as a `noinline` site.
   midhook  <addr>   a function hook written at a non-entry address: `if (sky_site_midhook(c, addr)) return;` before the
                     instruction, and a new lifted function f_<addr> starting there (in fn_table): the runtime's "orig".
                     f_<addr> enters behind its own callout; a jump back to addr inside it meets the callout as on hardware.
@@ -26,7 +27,9 @@ SITE LIST: text, one site per line, `#` starts a comment, addresses are full gue
                     (the lifter loads the entry from guest memory and dispatches over every instruction of the
                     function, call_indirect for a target outside it).
   noinline <addr>   a function entry the hook table hooks: the bucket holding it is compiled with
-                    `__attribute__((noinline))` on f_<addr> so no caller in that translation unit inlines it.
+                    `__attribute__((noinline))` on f_<addr> so no caller in that translation unit inlines it. If no
+                    other site touches that bucket and hook_inline_check.py finds every caller in it still calling the
+                    entry in the base objects, the base object is kept (--no-prune: compile it anyway).
 
 STEPS. Every bucket file (48 KB of guest code) holding an affected lifted copy is lifted twice with recomp_eh's function
 (+ flags_local's transform): WITHOUT the sites it must reproduce the base file (gen_fl) byte for byte, WITH them it goes
@@ -484,6 +487,17 @@ def pe_fn_table_check(dll, mapfile, wanted):
 
 
 # ---------------------------------------------------------------------------------------------------- main
+def write_if_changed(path, text):
+    """keep the time stamp of an unchanged file (the compile step is incremental)"""
+    if os.path.exists(path):
+        with open(path, encoding='latin-1') as f:
+            if f.read() == text:
+                return False
+    with open(path, 'w', encoding='latin-1', newline='\n') as f:
+        f.write(text)
+    return True
+
+
 def plan_sites(rl, sites):
     """classify; returns (plan {addr: (pre, stmt, midhook)}, notes, refused, site table rows)"""
     recomp = rl.recomp
@@ -502,7 +516,8 @@ def plan_sites(rl, sites):
         table.append((a, 3, 0))
     for a in sorted(sites.inline):
         if a in rl.starts_set:
-            notes.append('inline %x: a function start (only f_%x holds it): no callout, the runtime hooks the entry' % (a, a))
+            notes.append('inline %x: a function start (only f_%x holds it): no callout, the runtime hooks the entry (noinline added)' % (a, a))
+            sites.noinline.add(a)
             continue
         if a in sites.midhook:
             continue
@@ -577,7 +592,22 @@ def main():
     for a in sites.noinline:
         if a in rl.func_set:
             noinline_by_bucket[rl.bucket_of(a)].add(a)
-    touched = collections.Counter()
+    # a noinline entry whose file no other site re-lifts: if hook_inline_check.py finds every caller in that file still
+    # calling it in the base objects, the base object is kept (the property holds there); else the file is compiled again
+    code_buckets = set(rl.bucket_of(e) for a in plan for e in rl.entries_holding(a)) | set(rl.bucket_of(a) for a in new)
+    alone = sorted(a for b, s in noinline_by_bucket.items() if b not in code_buckets for a in s)
+    if alone and 'no-prune' not in opts:
+        import hook_inline_check
+        res = hook_inline_check.check(alone, base_gen, base_obj)
+        # a file is kept only if ALL its noinline entries pass; a file compiled again gets the attribute on all of them
+        # (its new code could inline one that the base object does not)
+        keep_b = set(rl.bucket_of(a) for a in alone) - set(rl.bucket_of(a) for a in alone if res[a]['verdict'] != 'OK')
+        kept = [a for a in alone if rl.bucket_of(a) in keep_b]
+        for b in keep_b:
+            del noinline_by_bucket[b]
+        log('  noinline: %d entr%s in files no other site touches; %d verified not inlined in %s (%d object(s) kept), %d in %d file(s) compiled again for: %s'
+            % (len(alone), 'y' if len(alone) == 1 else 'ies', len(kept), os.path.basename(base_obj), len(keep_b), len(alone) - len(kept),
+               len(set(rl.bucket_of(a) for a in alone) - keep_b), ' '.join('%x(%s)' % (a, res[a]['verdict']) for a in alone if res[a]['verdict'] != 'OK') or '-'))
     pairs = collections.defaultdict(list)          # bucket -> [(entry, addr)]
     while True:
         pairs.clear()
@@ -673,8 +703,7 @@ def main():
         if 'void u_%x(Ctx *c, uint64_t rp) {' % a in open(os.path.join(gen, 'c_%04x.c' % rl.bucket_of(a)), encoding='latin-1').read():
             decl += 'void u_%x(Ctx *c, uint64_t rp);\n' % a
     funcs_h = rl.funcs_h + '/* relift_sites.py */\nvoid sky_site_inline(Ctx *c, uint64_t addr);\nint sky_site_midhook(Ctx *c, uint64_t addr);\n' + decl
-    with open(os.path.join(gen, 'funcs.h'), 'w', newline='\n') as f:
-        f.write(funcs_h)
+    write_if_changed(os.path.join(gen, 'funcs.h'), funcs_h)
     table_c = open(os.path.join(base_gen, 'table.c')).read()
     start = table_c.index('const FnEntry fn_table[] = {\n') + len('const FnEntry fn_table[] = {\n')
     stop = table_c.index('};\nconst int fn_table_count = ')
@@ -684,19 +713,16 @@ def main():
     rows = ['  { 0x%xULL, f_%x },' % (a, a) for a in allf]
     m = re.search(r'const int fn_table_count = (\d+);', table_c)
     table_c = table_c[:start] + '\n'.join(rows) + '\n' + table_c[stop:].replace(m.group(0), 'const int fn_table_count = %d;' % len(allf), 1)
-    with open(os.path.join(gen, 'table.c'), 'w', newline='\n') as f:
-        f.write(table_c)
-    with open(os.path.join(gen, 'hdr_sites.c'), 'w', newline='\n') as f:
-        f.write('/* generated by relift_sites.py from %s -- the sites compiled into this DLL (the vanilla DLL has no such export)\n'
-                ' * kind: 1 patch (word = the instruction word compiled in), 2 inline callout, 3 midhook callout + entry,\n'
-                ' * 4 dynimm (word = the word of the binary; its immediate is read at run time), 5 jtable (dynamic dispatch checked),\n'
-                ' * 6 noinline (hook-table entry no caller of its file inlines) */\n#include <stdint.h>\n'
-                'typedef struct { uint64_t addr; uint32_t kind; uint32_t word; } HdrSite;\n'
-                '__declspec(dllexport) const HdrSite hdr_site_table[] = {\n' % os.path.basename(site_file))
-        f.writelines('  { 0x%xULL, %d, 0x%08xU },\n' % r for r in table)
-        if not table:
-            f.write('  { 0, 0, 0 },\n')
-        f.write('};\n__declspec(dllexport) const int hdr_site_count = %d;\n' % len(table))
+    write_if_changed(os.path.join(gen, 'table.c'), table_c)
+    hs = ('/* generated by relift_sites.py from %s -- the sites compiled into this DLL (the vanilla DLL has no such export)\n'
+          ' * kind: 1 patch (word = the instruction word compiled in), 2 inline callout, 3 midhook callout + entry,\n'
+          ' * 4 dynimm (word = the word of the binary; its immediate is read at run time), 5 jtable (dynamic dispatch checked),\n'
+          ' * 6 noinline (hook-table entry no caller of its file inlines) */\n#include <stdint.h>\n'
+          'typedef struct { uint64_t addr; uint32_t kind; uint32_t word; } HdrSite;\n'
+          '__declspec(dllexport) const HdrSite hdr_site_table[] = {\n' % os.path.basename(site_file))
+    hs += ''.join('  { 0x%xULL, %d, 0x%08xU },\n' % r for r in table) or '  { 0, 0, 0 },\n'
+    hs += '};\n__declspec(dllexport) const int hdr_site_count = %d;\n' % len(table)
+    write_if_changed(os.path.join(gen, 'hdr_sites.c'), hs)
     keep = set(names)                                                   # files of an earlier site list that this one does not touch
     stale = [n for n in os.listdir(gen) if re.match(r'^c_[0-9a-f]+\.c$', n) and n not in keep]
     stale += [os.path.join('..', os.path.basename(obj), n) for n in os.listdir(obj) if re.match(r'^c_[0-9a-f]+\.(obj|optnone\.h)$', n) and n.split('.')[0] + '.c' not in keep]
