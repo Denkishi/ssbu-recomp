@@ -43,6 +43,10 @@ typedef struct Obj {
     Ctx *fctx;                               /* fibers: the guest context of the fiber (R1 save / restore) */
     volatile DWORD run_tid;                  /* fibers: host thread running it now, 0 = switched away (R1) */
     void *fls;                               /* fibers: the fighter runtime's per-fiber block (FLS slot g_r1_fls_idx) when it last switched away (R1) */
+    int is_pthread, detached;                /* pthread_create threads: joinable / detached */
+    uint64_t retval;                         /* pthread_create threads: start routine's result, for pthread_join */
+    DWORD rw_owner;                          /* reader/writer locks: host thread holding the write lock, 0 = none */
+    int rw_readers, rw_wcount, rw_wreads;    /* reader/writer locks: readers, write recursion, reads taken by the writer */
 } Obj;
 
 #define BUCKETS 65536
@@ -86,6 +90,7 @@ static void obj_reset(uint64_t key) {
     o->signaled = o->autoclear = o->count = o->max = 0;
     o->len = o->head = 0;
     o->holder_count = 0;
+    o->rw_owner = 0; o->rw_readers = o->rw_wcount = o->rw_wreads = 0;
     LeaveCriticalSection(&o->cs);
 }
 
@@ -189,7 +194,8 @@ static __declspec(thread) uint64_t t_tls[64];
 static uint64_t g_tls_dtor[64];                       /* guest destructor of each slot, 0 = none */
 static volatile LONG g_tls_used[64];
 static void tls_run_destructors(Ctx *c);
-static __declspec(thread) uint64_t t_fiber;           /* guest FiberType* currently running, 0 if none */
+static void pkey_run_destructors(Ctx *c);
+static __declspec(thread) uint64_t t_fiber;          /* guest FiberType* currently running, 0 if none */
 static __declspec(thread) void *t_thread_fiber;       /* host fiber of the thread itself */
 static uint8_t g_main_thread[0x400];
 uint64_t os_main_thread_type(void) { return (uint64_t)(uintptr_t)g_main_thread; }   /* boot.c: stored at thread block +0x1f8, as [sdk 0x3349dc] does */
@@ -247,6 +253,7 @@ static DWORD WINAPI thread_main(LPVOID arg) {
     trace_printf("--- thread %llx started (entry %llx, name %s)\n", (unsigned long long)o->key, (unsigned long long)o->fn,
                  o->name ? (const char *)(uintptr_t)o->name : "?");
     call_guest(c, o->fn);
+    pkey_run_destructors(c);                          /* pthread keys a plugin's Rust std made on this game thread */
     tls_run_destructors(c);
     trace_printf("--- thread %llx finished\n", (unsigned long long)o->key);
     EnterCriticalSection(&o->cs);
@@ -663,6 +670,250 @@ int g_r1_keep_fibers;                                  /* R1 (r1_state.c, SSBU_R
                                                         * restore that brings the guest fiber back finds it (resumed, it starts over) */
 static void fib_finalize(Ctx *c) { Obj *o = obj(A0); if (o->fiber && !g_r1_keep_fibers) { DeleteFiber(o->fiber); o->fiber = NULL; } }
 
+/* ---------------------------------------------------------------- reader/writer locks (nn::os::ReaderWriterLockType)
+ * The plugins (smashline, stage_alts) only acquire / release / finalize: their locks are statically initialised (all zero
+ * = free), so the object is found by address like every other one here. nn::os semantics: the write lock is recursive for
+ * its owner, and the owner may also take read locks while it holds the write lock. A reader only waits while ANOTHER
+ * thread holds the write lock (a waiting writer does not stop new readers: a thread that re-enters a read lock while a
+ * writer waits cannot deadlock). */
+static void rw_init(Ctx *c) { obj_reset(A0); }
+static int rw_try_read(Obj *o, DWORD self) {
+    if (o->rw_owner == self) { o->rw_wreads++; return 1; }
+    if (o->rw_owner) return 0;
+    o->rw_readers++;
+    return 1;
+}
+static int rw_try_write(Obj *o, DWORD self) {
+    if (o->rw_owner == self) { o->rw_wcount++; return 1; }
+    if (o->rw_owner || o->rw_readers) return 0;
+    o->rw_owner = self; o->rw_wcount = 1;
+    return 1;
+}
+static void rw_acquire_read(Ctx *c) {
+    Obj *o = obj(A0);
+    DWORD self = GetCurrentThreadId();
+    EnterCriticalSection(&o->cs);
+    while (!rw_try_read(o, self)) SleepConditionVariableCS(&o->cv, &o->cs, INFINITE);
+    LeaveCriticalSection(&o->cs);
+}
+static void rw_acquire_write(Ctx *c) {
+    Obj *o = obj(A0);
+    DWORD self = GetCurrentThreadId();
+    EnterCriticalSection(&o->cs);
+    while (!rw_try_write(o, self)) SleepConditionVariableCS(&o->cv, &o->cs, INFINITE);
+    LeaveCriticalSection(&o->cs);
+}
+static void rw_tryacquire_read(Ctx *c) { Obj *o = obj(A0); EnterCriticalSection(&o->cs); int ok = rw_try_read(o, GetCurrentThreadId()); LeaveCriticalSection(&o->cs); RET(ok); }
+static void rw_tryacquire_write(Ctx *c) { Obj *o = obj(A0); EnterCriticalSection(&o->cs); int ok = rw_try_write(o, GetCurrentThreadId()); LeaveCriticalSection(&o->cs); RET(ok); }
+static void rw_release_read(Ctx *c) {
+    Obj *o = obj(A0);
+    EnterCriticalSection(&o->cs);
+    if (o->rw_owner == GetCurrentThreadId() && o->rw_wreads > 0) o->rw_wreads--;
+    else if (o->rw_readers > 0 && --o->rw_readers == 0) WakeAllConditionVariable(&o->cv);
+    LeaveCriticalSection(&o->cs);
+}
+static void rw_release_write(Ctx *c) {
+    Obj *o = obj(A0);
+    EnterCriticalSection(&o->cs);
+    if (o->rw_owner == GetCurrentThreadId() && --o->rw_wcount <= 0) { o->rw_owner = 0; o->rw_wcount = 0; o->rw_readers += o->rw_wreads; o->rw_wreads = 0; WakeAllConditionVariable(&o->cv); }
+    LeaveCriticalSection(&o->cs);
+}
+static void rw_is_read_held(Ctx *c) { Obj *o = obj(A0); RET(o->rw_readers > 0 || o->rw_wreads > 0); }
+static void rw_is_write_held_by_me(Ctx *c) { RET(obj(A0)->rw_owner == GetCurrentThreadId()); }
+/* nn::os::CreateSystemEvent(SystemEventType *, EventClearMode, bool interProcess) -> Result: a fresh, unsignalled event */
+static void sev_create(Ctx *c) { obj_reset(A0); Obj *o = obj(A0); o->signaled = 0; o->autoclear = A1 == 1; RET(0); }
+
+/* ---------------------------------------------------------------- POSIX threads (the Skyline plugins' Rust std)
+ * nnSdk's musl implements pthreads on nn::os; the plugins (has-elf-tls false) reach it for every std::thread, Mutex,
+ * Condvar and thread_local. Errno values are musl's (Linux numbering): ESRCH 3, EAGAIN 11, ENOMEM 12, EBUSY 16, EINVAL 22,
+ * EDEADLK 35, ETIMEDOUT 110.
+ * pthread_t is the address of the thread's nn::os ThreadType: for pthread_create a zeroed block made here (nn::os::
+ * GetCurrentThread on the new thread returns it, ChangeThreadPriority / SetThreadName work on it), for every other thread
+ * the ThreadType it already has. Each new thread runs on its own guest stack (attr size, at least 256 KB, default 1 MB)
+ * with its own thread block (ThreadType pointer at +0x1f8). */
+#define P_ESRCH 3
+#define P_EAGAIN 11
+#define P_ENOMEM 12
+#define P_EINVAL 22
+#define P_EDEADLK 35
+#define P_ETIMEDOUT 110
+static __declspec(thread) int t_errno;
+static void musl_errno_location(Ctx *c) { RET(&t_errno); }      /* __nnmusl_ErrnoLocation: errno of the calling thread */
+
+/* thread-specific data: keys 1..PKEY_MAX-1 (0 is never handed out: Rust's StaticKey takes 0 for "not created yet").
+ * Values live per host thread; a generation per key makes the values of a deleted key read as null once it is reused,
+ * as musl's pthread_key_delete clears them in every thread. Destructors run at thread exit, up to 4 rounds. */
+#define PKEY_MAX 1024
+static uint64_t g_pkey_dtor[PKEY_MAX];
+static volatile LONG g_pkey_used[PKEY_MAX];
+static volatile LONG g_pkey_gen[PKEY_MAX];
+typedef struct { uint64_t value[PKEY_MAX]; LONG gen[PKEY_MAX]; } PkeyValues;
+static __declspec(thread) PkeyValues *t_pkey;
+static void pt_key_create(Ctx *c) {                   /* (pthread_key_t *key, void (*destructor)(void *)) */
+    for (int i = 1; i < PKEY_MAX; i++)
+        if (InterlockedCompareExchange(&g_pkey_used[i], 1, 0) == 0) {
+            g_pkey_dtor[i] = A1;
+            InterlockedIncrement(&g_pkey_gen[i]);
+            wr32(A0, (uint32_t)i);
+            RET(0);
+            return;
+        }
+    RET(P_EAGAIN);
+}
+static void pt_key_delete(Ctx *c) {
+    uint32_t k = (uint32_t)A0;
+    if (k == 0 || k >= PKEY_MAX || !g_pkey_used[k]) { RET(P_EINVAL); return; }
+    g_pkey_dtor[k] = 0;
+    InterlockedIncrement(&g_pkey_gen[k]);
+    InterlockedExchange(&g_pkey_used[k], 0);
+    RET(0);
+}
+static void pt_getspecific(Ctx *c) {
+    uint32_t k = (uint32_t)A0;
+    RET(k < PKEY_MAX && t_pkey && t_pkey->gen[k] == g_pkey_gen[k] ? t_pkey->value[k] : 0);
+}
+static void pt_setspecific(Ctx *c) {
+    uint32_t k = (uint32_t)A0;
+    if (k == 0 || k >= PKEY_MAX || !g_pkey_used[k]) { RET(P_EINVAL); return; }
+    if (!t_pkey && !(t_pkey = calloc(1, sizeof *t_pkey))) { RET(P_ENOMEM); return; }
+    t_pkey->value[k] = A1;
+    t_pkey->gen[k] = g_pkey_gen[k];
+    RET(0);
+}
+static void pkey_run_destructors(Ctx *c) {
+    if (!t_pkey) return;
+    for (int round = 0; round < 4; round++) {
+        int any = 0;
+        for (int k = 1; k < PKEY_MAX; k++) {
+            uint64_t v = t_pkey->value[k], fn = g_pkey_dtor[k];
+            if (!v || t_pkey->gen[k] != g_pkey_gen[k]) continue;
+            t_pkey->value[k] = 0;
+            if (fn && g_pkey_used[k]) { c->x[0] = v; call_guest(c, fn); any = 1; }
+        }
+        if (!any) break;
+    }
+    free(t_pkey);
+    t_pkey = NULL;
+}
+
+/* attributes: only the stack size is used, kept host-side by the attribute's address */
+static void pt_attr_init(Ctx *c) { obj(A0)->stack_size = 0; RET(0); }
+static void pt_attr_setstacksize(Ctx *c) { obj(A0)->stack_size = A1; RET(0); }
+static void pt_attr_getstacksize(Ctx *c) { Obj *o = obj(A0); wr64(A1, o->stack_size ? o->stack_size : 1u << 20); RET(0); }
+
+static void pthread_release(Obj *o) {                 /* after the thread ended and was joined or detached */
+    if (o->stack) { VirtualFree((void *)(uintptr_t)o->stack, 0, MEM_RELEASE); o->stack = 0; }
+    if (o->thread) { CloseHandle(o->thread); o->thread = NULL; }
+}
+static DWORD WINAPI pthread_main(LPVOID arg) {
+    Obj *o = arg;
+    t_thread = o->key;
+    Ctx *c = new_ctx(o->stack + o->stack_size);
+    wr64(c->tpidr + 0x1f8, o->key);                   /* the ThreadType pointer, as for nn::os threads */
+    LONG slot = InterlockedIncrement(&g_threads_n) - 1;
+    if (slot < 256) { g_threads[slot].o = o; g_threads[slot].c = c; }
+    c->x[0] = o->arg;
+    trace_printf("--- pthread %llx started (entry %llx)\n", (unsigned long long)o->key, (unsigned long long)o->fn);
+    call_guest(c, o->fn);
+    uint64_t ret = c->x[0];
+    pkey_run_destructors(c);
+    tls_run_destructors(c);
+    trace_printf("--- pthread %llx finished\n", (unsigned long long)o->key);
+    EnterCriticalSection(&o->cs);
+    o->retval = ret;
+    o->finished = 1;
+    int detached = o->detached;
+    WakeAllConditionVariable(&o->cv);
+    if (detached) pthread_release(o);
+    LeaveCriticalSection(&o->cs);
+    return 0;
+}
+/* (pthread_t *out, const pthread_attr_t *attr, void *(*start)(void *), void *arg) */
+static void pt_create(Ctx *c) {
+    uint64_t size = A1 ? obj(A1)->stack_size : 0;
+    if (!size) size = 1u << 20;
+    if (size < (256u << 10)) size = 256u << 10;
+    size = (size + 0xffff) & ~0xffffull;
+    uint8_t *tt = calloc(1, 0x400);                   /* the thread's ThreadType: never freed (pthread_t values stay unique) */
+    void *stack = VirtualAlloc(NULL, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!tt || !stack) { free(tt); if (stack) VirtualFree(stack, 0, MEM_RELEASE); RET(P_EAGAIN); return; }
+    Obj *o = obj((uint64_t)(uintptr_t)tt);
+    o->fn = A2; o->arg = A3; o->stack = (uint64_t)(uintptr_t)stack; o->stack_size = size;
+    o->priority = OS_DEFAULT_PRIORITY; o->ideal_core = OS_DEFAULT_CORE; o->core_mask = 1ull << OS_DEFAULT_CORE; o->core_set = 1;
+    o->is_pthread = 1; o->detached = 0; o->finished = 0; o->name = 0;
+    oslog("  pthread  entry %llx stack 0x%llx (called from %llx)\n", (unsigned long long)o->fn, (unsigned long long)size, (unsigned long long)c->x[30]);
+    InterlockedIncrement(&g_thread_count);
+    EnterCriticalSection(&o->cs);                     /* a detach before CreateThread returns must see o->thread */
+    o->thread = CreateThread(NULL, (SIZE_T)256 << 20, pthread_main, o, STACK_SIZE_PARAM_IS_A_RESERVATION | CREATE_SUSPENDED, NULL);
+    LeaveCriticalSection(&o->cs);
+    if (!o->thread) { VirtualFree(stack, 0, MEM_RELEASE); o->stack = 0; o->is_pthread = 0; RET(P_EAGAIN); return; }
+    SetThreadPriority(o->thread, host_priority(o->priority));
+    apply_sched(o->thread, o->core_mask);
+    wr64(A0, o->key);
+    ResumeThread(o->thread);
+    RET(0);
+}
+static uint64_t pt_self_id(void) { return t_thread ? t_thread : (uint64_t)(uintptr_t)g_main_thread; }
+static void pt_self(Ctx *c) { RET(pt_self_id()); }
+static void pt_equal(Ctx *c) { RET(A0 == A1); }
+/* pthread_join for nnlibc2.c too (the game's own pthread_join import): errno, or -1 when `t` is not a pthread_create thread */
+int os_pthread_join(uint64_t t, uint64_t retval_out) {
+    if (!t) return P_ESRCH;
+    Obj *o = obj(t);
+    if (!o->is_pthread) return -1;
+    if (t == pt_self_id()) return P_EDEADLK;
+    EnterCriticalSection(&o->cs);
+    if (o->detached) { LeaveCriticalSection(&o->cs); return P_EINVAL; }
+    while (!o->finished) SleepConditionVariableCS(&o->cv, &o->cs, INFINITE);
+    if (retval_out) wr64(retval_out, o->retval);
+    o->detached = 1;                                  /* joined: a second join or a detach is refused */
+    LeaveCriticalSection(&o->cs);
+    if (o->thread) WaitForSingleObject(o->thread, INFINITE);     /* the host thread has left pthread_main */
+    EnterCriticalSection(&o->cs);
+    pthread_release(o);
+    LeaveCriticalSection(&o->cs);
+    return 0;
+}
+static void pt_join(Ctx *c) { int r = os_pthread_join(A0, A1); RET(r < 0 ? P_ESRCH : r); }
+static void pt_detach(Ctx *c) {
+    Obj *o = A0 ? obj(A0) : NULL;
+    if (!o || !o->is_pthread) { RET(P_ESRCH); return; }
+    EnterCriticalSection(&o->cs);
+    int r = o->detached ? P_EINVAL : 0;
+    if (!r) { o->detached = 1; if (o->finished) pthread_release(o); }
+    LeaveCriticalSection(&o->cs);
+    RET(r);
+}
+/* (pthread_t, const char *name): kept like nn::os::SetThreadName, and given to Windows for debuggers */
+static void pt_setname(Ctx *c) {
+    const char *name = (const char *)(uintptr_t)A1;
+    if (!A0 || !name) { RET(P_EINVAL); return; }
+    Obj *o = obj(A0);
+    o->name = (uint64_t)(uintptr_t)_strdup(name);
+    typedef HRESULT (WINAPI *SetDesc)(HANDLE, PCWSTR);
+    static SetDesc set_desc;
+    static int looked;
+    if (!looked) { set_desc = (SetDesc)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadDescription"); looked = 1; }
+    HANDLE h = o->thread ? o->thread : A0 == pt_self_id() ? GetCurrentThread() : NULL;
+    if (set_desc && h) { wchar_t w[64]; MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64); w[63] = 0; set_desc(h, w); }
+    RET(0);
+}
+static void pt_sched_yield(Ctx *c) { SwitchToThread(); RET(0); }
+
+/* condition variables (statically initialised ones are all zero: found by address like the mutexes above) */
+static void pcv_wait(Ctx *c) { SleepConditionVariableCS(&obj(A0)->cv, &obj(A1)->cs, INFINITE); RET(0); }
+static void pcv_timedwait(Ctx *c) {                   /* (cond, mutex, const struct timespec *abstime): CLOCK_REALTIME deadline */
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    int64_t now = (int64_t)(((((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) - 116444736000000000ULL) * 100);
+    int64_t deadline = (int64_t)rd64(A2) * 1000000000LL + (int64_t)rd64(A2 + 8);
+    if (!SleepConditionVariableCS(&obj(A0)->cv, &obj(A1)->cs, ns_to_ms(deadline - now))) { RET(GetLastError() == ERROR_TIMEOUT ? P_ETIMEDOUT : P_EINVAL); return; }
+    RET(0);
+}
+static void pcv_signal(Ctx *c) { WakeConditionVariable(&obj(A0)->cv); RET(0); }
+static void pcv_broadcast(Ctx *c) { WakeAllConditionVariable(&obj(A0)->cv); RET(0); }
+static void pcv_init(Ctx *c) { (void)obj(A0); RET(0); }
+
 /* ---------------------------------------------------------------- misc */
 static void os_ConvertToTick(Ctx *c) { RET((uint64_t)((double)(int64_t)A0 * (double)TICK_HZ / 1e9)); }
 static void os_ConvertToTimeSpan(Ctx *c) { RET((uint64_t)((double)(int64_t)A0 * 1e9 / (double)TICK_HZ)); }
@@ -737,7 +988,7 @@ static const ImportDef thread_imports[] = {
     {"_ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE", std_cv_wait},
     {"_ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_5ratioILl1ELl1000000000EEEEEEE", std_cv_timedwait},
     {"_ZNSt3__118condition_variable10notify_oneEv", cv_signal}, {"_ZNSt3__118condition_variable10notify_allEv", cv_broadcast},
-    {"pthread_cond_broadcast", cv_broadcast}, {"pthread_cond_destroy", ret0},
+    {"pthread_cond_broadcast", pcv_broadcast}, {"pthread_cond_destroy", ret0},
     {OS("19InitializeSemaphoreEPNS0_13SemaphoreTypeEii"), sem_init}, {OS("17FinalizeSemaphoreEPNS0_13SemaphoreTypeE"), nothing},
     {OS("16AcquireSemaphoreEPNS0_13SemaphoreTypeE"), sem_acquire}, {OS("16ReleaseSemaphoreEPNS0_13SemaphoreTypeE"), sem_release},
     {OS("22InitializeMessageQueueEPNS0_16MessageQueueTypeEPmm"), mq_init}, {OS("20FinalizeMessageQueueEPNS0_16MessageQueueTypeE"), nothing},
@@ -758,6 +1009,26 @@ static const ImportDef thread_imports[] = {
     {OS("13SwitchToFiberEPNS0_9FiberTypeE"), fib_switch}, {OS("15GetCurrentFiberEv"), fib_current},
     {OS("13ConvertToTickENS_8TimeSpanE"), os_ConvertToTick}, {OS("17ConvertToTimeSpanENS0_4TickE"), os_ConvertToTimeSpan},
     {OS("19GenerateRandomBytesEPvm"), os_GenerateRandomBytes},
+    /* names only the Skyline plugins import (hostrt.c keeps them for nnro.c's binding) */
+    {OS("26InitializeReaderWriterLockEPNS0_20ReaderWriterLockTypeE"), rw_init}, {OS("24FinalizeReaderWriterLockEPNS0_20ReaderWriterLockTypeE"), nothing},
+    {OS("15AcquireReadLockEPNS0_20ReaderWriterLockTypeE"), rw_acquire_read}, {OS("15ReleaseReadLockEPNS0_20ReaderWriterLockTypeE"), rw_release_read},
+    {OS("16AcquireWriteLockEPNS0_20ReaderWriterLockTypeE"), rw_acquire_write}, {OS("16ReleaseWriteLockEPNS0_20ReaderWriterLockTypeE"), rw_release_write},
+    {OS("18TryAcquireReadLockEPNS0_20ReaderWriterLockTypeE"), rw_tryacquire_read}, {OS("19TryAcquireWriteLockEPNS0_20ReaderWriterLockTypeE"), rw_tryacquire_write},
+    {OS("14IsReadLockHeldEPKNS0_20ReaderWriterLockTypeE"), rw_is_read_held},
+    {OS("30IsWriteLockHeldByCurrentThreadEPKNS0_20ReaderWriterLockTypeE"), rw_is_write_held_by_me},
+    {OS("29IsReaderWriterLockOwnerThreadEPKNS0_20ReaderWriterLockTypeE"), rw_is_write_held_by_me},
+    {OS("17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb"), sev_create},
+    {OS("17SignalSystemEventEPNS0_15SystemEventTypeE"), ev_signal},
+    {"__nnmusl_ErrnoLocation", musl_errno_location},
+    {"pthread_create", pt_create}, {"pthread_join", pt_join}, {"__pthread_join", pt_join}, {"pthread_detach", pt_detach},
+    {"pthread_self", pt_self}, {"pthread_equal", pt_equal}, {"pthread_setname_np", pt_setname}, {"sched_yield", pt_sched_yield},
+    {"pthread_attr_init", pt_attr_init}, {"pthread_attr_destroy", ret0}, {"pthread_attr_setstacksize", pt_attr_setstacksize},
+    {"pthread_attr_getstacksize", pt_attr_getstacksize},
+    {"pthread_key_create", pt_key_create}, {"pthread_key_delete", pt_key_delete},
+    {"pthread_getspecific", pt_getspecific}, {"pthread_setspecific", pt_setspecific},
+    {"pthread_cond_init", pcv_init}, {"pthread_cond_wait", pcv_wait}, {"pthread_cond_timedwait", pcv_timedwait},
+    {"pthread_cond_signal", pcv_signal}, {"pthread_condattr_init", ret0}, {"pthread_condattr_destroy", ret0},
+    {"pthread_condattr_setclock", ret0},
 };
 
 void register_thread_imports(void) {
