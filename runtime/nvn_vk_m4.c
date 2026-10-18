@@ -24,7 +24,7 @@ typedef struct VStage {
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
 } VStage;
-#define MX_VK_VERSION 5u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change */
+#define MX_VK_VERSION 6u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)

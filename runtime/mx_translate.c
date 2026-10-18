@@ -233,7 +233,7 @@ static int mx_vk_clip(const MxIn *in) {
 static void attr_out(Mx *e, unsigned a, const char *v) {
     unsigned c = (a >> 2) & 3;
     if (e->in->stage != MX_VERTEX) { fail(e, "attribute store", "attribute store in stage %d", e->in->stage); return; }
-    if (a >= 0x70 && a < 0x80) emit(e, " gl_Position[%u] = F(%s);", c, v);
+    if (a >= 0x70 && a < 0x80) emit(e, " %s[%u] = F(%s);", e->in->target == 1 && e->in->stage == MX_VERTEX ? "mx_position" : "gl_Position", c, v);
     else if (a >= 0x80 && a < 0x280) { e->out_attr |= 1u << ((a - 0x80) >> 4); emit(e, " out_attr%u[%u] = F(%s);", (a - 0x80) >> 4, c, v); }
     else if (a == 0x6c) { e->uses_psize = 1; emit(e, e->in->target == 1 ? " mx_psize = F(%s);" : " gl_PointSize = F(%s);", v); }
     else if (a >= 0x2c0 && a < 0x2e0) { e->clip_out |= 1u << ((a - 0x2c0) >> 2); emit(e, mx_vk_clip(e->in) == 2 ? " mx_clip[%u] = F(%s);" : " gl_ClipDistance[%u] = F(%s);", (a - 0x2c0) >> 2, v); }
@@ -1554,7 +1554,12 @@ int mx_translate(const MxIn *in, MxOut *out) {
         else
         if (vk && (in->stage == MX_VERTEX || (in->stage == MX_FRAGMENT && e->uses_alpha))) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; };\n");
         if (vk && e->uses_tf) emit(&h, "ivec2 mx_tf(ivec2 p, ivec2 real, uint gw, uint gh) { ivec2 g = ivec2(int(gw), int(gh)); return (g.x <= 0 || g.y <= 0 || g == real) ? p : ivec2(floor((vec2(p) + 0.5) * vec2(real) / vec2(g))); }\n");
-        if (vk && in->stage == MX_VERTEX) emit(&h, "float mx_psize;\n");
+        if (vk && in->stage == MX_VERTEX) {
+            /* Keep position exports outside the translated loop/switch dispatcher. NVIDIA can lose a position written
+             * before a continuation, even when replaying the same arithmetic with stores gives the right values.
+             * A private value and one entry-point export preserve the program's arithmetic and all its exit paths. */
+            emit(&h, "float mx_psize;\nvec4 mx_position;\n");
+        }
         for (int k = 0; vk && k < e->nsmp; k++) emit(&h, "layout(set = 1, binding = %u) uniform %s mx_t%u_%s;\n", (unsigned)e->smp[k].binding, e->smp[k].type, (unsigned)e->smp[k].unit, e->smp[k].type);
         for (unsigned n = 0; n < 18; n++) if (e->cbufs >> n & 1) emit(&h, "layout(std430, %sbinding = %u) readonly buffer CB%u { uint c%u[]; };\n", set0, in->binding_base + n, n, n);
         if (in->stage == MX_VERTEX) {
@@ -1618,9 +1623,9 @@ int mx_translate(const MxIn *in, MxOut *out) {
             for (unsigned k = 0; k < 16; k++) if (e->ssbos >> k & 1) emit(&h, " case %uu: s%u[o] = v;%s break;\n", k + 1, k, in->track_writes ? S(e, " atomicOr(mx_wm, %uu);", 1u << k) : "");
             emit(&h, " } }\n");
         }
-        emit(&h, "void main() {\n");
+        emit(&h, "void %s() {\n", vk && in->stage == MX_VERTEX ? "mx_vertex_main" : "main");
         if (in->stage == MX_VERTEX) {
-            emit(&h, " gl_Position = vec4(0.0, 0.0, 0.0, 1.0);\n");
+            emit(&h, " %s = vec4(0.0, 0.0, 0.0, 1.0);\n", vk ? "mx_position" : "gl_Position");
             if (vk) emit(&h, " gl_PointSize = mx_point_size;\n");
             if (vk && mx_vk_clip(in) == 1) for (int k = 0; k < 8; k++) if (e->clip_out >> k & 1 || (e->clip_out >> k) > 1) emit(&h, " gl_ClipDistance[%d] = 0.0;\n", k);      /* round 17: every declared element */
             for (unsigned n = 0; n < 32; n++) if (e->out_attr >> n & 1) emit(&h, " out_attr%u = vec4(0.0, 0.0, 0.0, 1.0);\n", n);
@@ -1632,13 +1637,15 @@ int mx_translate(const MxIn *in, MxOut *out) {
         for (unsigned p = 0; p < 7; p++) if (e->preds[p]) { emit(&h, "%s p%u = false", any ? "," : " bool", p); any = 1; }
         if (any) emit(&h, ";\n");
         if (e->any_jump) emit(&h, " uint pc = 1u;\n for (;;) { switch (pc) {\n");
-        size_t need = h.len + e->len + strlen(e->exitcode) + 256;
+        const char *vertex_entry = vk && in->stage == MX_VERTEX ? "\nvoid main() { mx_vertex_main(); gl_Position = mx_position; }\n" : "";
+        size_t need = h.len + e->len + strlen(e->exitcode) + strlen(vertex_entry) + 256;
         res = malloc(need);
         memcpy(res, h.s, h.len);
         memcpy(res + h.len, e->s, e->len);
         size_t n = h.len + e->len;
         if (e->any_jump) n += (size_t)sprintf(res + n, " default: %s return;\n } }\n}\n", e->exitcode);
         else n += (size_t)sprintf(res + n, " %s\n}\n", e->exitcode);
+        n += (size_t)sprintf(res + n, "%s", vertex_entry);
         res[n] = 0;
         free(h.s);
     }
