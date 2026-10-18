@@ -753,6 +753,122 @@ static void ngc_MaskProfanityWordsInText(Ctx *c) { if (A1) wr32(A1, 0); RET(0); 
 static void socket_swap16(Ctx *c) { RET((uint16_t)(((A0 & 0xff) << 8) | ((A0 >> 8) & 0xff))); }
 static void socket_swap32(Ctx *c) { RET(bswap32((uint32_t)A0)); }
 
+/* ---------------------------------------------------------------- names only the Skyline plugins import
+ * (registered unconditionally: hostrt.c keeps handlers of names the game does not import for nnro.c's binding) */
+
+/* nn::oe::GetDisplayVersion(DisplayVersion *): char[16], the version string of the running update. ARCropolis installs
+ * nothing unless it reads "13.0.4" ([doc] nnsdk-rs oe.rs DisplayVersion { name: [u8; 16] }). */
+static void oe_GetDisplayVersion(Ctx *c) { memset((void *)(uintptr_t)A0, 0, 16); memcpy((void *)(uintptr_t)A0, "13.0.4", 6); }
+static void oe_ExitApplication(Ctx *c) {
+    printf("\na plugin asked the application to exit (nn::oe::ExitApplication, caller 0x%llx): stopping.\n", (unsigned long long)c->x[30] - 4);
+    trace_printf("nn::oe::ExitApplication (caller 0x%llx)\n", (unsigned long long)c->x[30] - 4);
+    report_and_exit(0);
+}
+
+/* nn::err::ApplicationErrorArg, 0x1014 bytes ([sdk] 0x199260 default constructor, 0x199280 the C1/C2 constructor
+ * (u32 code, const char *dialogMessage, const char *fullScreenMessage, const LanguageCode &), 0x1986d0 ShowApplicationError
+ * sends 0x1014 bytes): u16 0x102 @0 (header), u32 application error code @8, LanguageCode (8 chars) @0xc, dialog message
+ * char[0x800] @0x14, full-screen message char[0x800] @0x814 (each copied up to 0x7ff characters and terminated). */
+#define ERRARG_CODE 0x8
+#define ERRARG_LANG 0xc
+#define ERRARG_DIALOG 0x14
+#define ERRARG_FULL 0x814
+static void err_copy(uint64_t dst, uint64_t src, size_t cap) {
+    char *d = (char *)(uintptr_t)dst;
+    size_t i = 0;
+    if (src) for (const char *s = (const char *)(uintptr_t)src; i + 1 < cap && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+}
+static void err_AppErrorArg_ctor(Ctx *c) {
+    uint64_t a = A0;
+    wr16(a, 0x102);
+    wr32(a + ERRARG_CODE, (uint32_t)A1);
+    err_copy(a + ERRARG_DIALOG, A2, 0x800);
+    err_copy(a + ERRARG_FULL, A3, 0x800);
+    memset((void *)(uintptr_t)(a + ERRARG_LANG), 0, 8);
+    if (A4) err_copy(a + ERRARG_LANG, A4, 8);
+}
+static void err_AppErrorArg_default(Ctx *c) { uint64_t a = A0; wr16(a, 0x102); wr32(a + ERRARG_CODE, 0); wr8(a + ERRARG_DIALOG, 0); wr8(a + ERRARG_FULL, 0); }
+/* ShowApplicationError(const ApplicationErrorArg &): the console shows the error applet and waits for the user. A plugin
+ * panic arrives here (skyline's panic hook: the panic message is the full-screen text): this is the main diagnostic, so
+ * both messages go to stdout, the trace and <exe folder>\plugin_errors.txt (appended); nothing waits. */
+static void err_ShowApplicationError(Ctx *c) {
+    uint64_t a = A0;
+    uint32_t code = rd32(a + ERRARG_CODE);
+    const char *dialog = (const char *)(uintptr_t)(a + ERRARG_DIALOG), *full = (const char *)(uintptr_t)(a + ERRARG_FULL);
+    char lang[9] = {0};
+    memcpy(lang, (const void *)(uintptr_t)(a + ERRARG_LANG), 8);
+    printf("\n================ nn::err::ShowApplicationError (code %u, caller 0x%llx) ================\n%.2048s\n---- full screen ----\n%.2048s\n"
+           "================================================================\n", code, (unsigned long long)c->x[30] - 4, dialog, full);
+    fflush(stdout);
+    trace_printf("nn::err::ShowApplicationError code %u lang \"%s\" caller 0x%llx\n  dialog: %.2048s\n  full screen: %.2048s\n", code, lang,
+                 (unsigned long long)c->x[30] - 4, dialog, full);
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *slash = n ? strrchr(path, '\\') : NULL;
+    if (slash && (size_t)(slash - path) + 20 < sizeof path) {
+        strcpy(slash + 1, "plugin_errors.txt");
+        FILE *f = fopen(path, "ab");
+        if (f) {
+            SYSTEMTIME t;
+            GetLocalTime(&t);
+            fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u] application error %u (caller 0x%llx)\n%.2048s\n---- full screen ----\n%.2048s\n\n", t.wYear, t.wMonth, t.wDay,
+                    t.wHour, t.wMinute, t.wSecond, code, (unsigned long long)c->x[30] - 4, dialog, full);
+            fclose(f);
+        }
+    }
+}
+
+/* nn::crypto::GenerateSha256Hash(void *out, size_t outSize, const void *data, size_t size): Windows CNG (bcrypt.dll), as
+ * nnro.c checks module hashes. The SDK asserts outSize >= 32; a smaller buffer gets the first outSize bytes. */
+static int sha256_bcrypt(const void *data, size_t size, uint8_t out[32]) {
+    typedef LONG (WINAPI *open_fn)(void **, const WCHAR *, const WCHAR *, ULONG);
+    typedef LONG (WINAPI *hash_fn)(void *, UCHAR *, ULONG, UCHAR *, ULONG, UCHAR *, ULONG);
+    static void *alg;
+    static hash_fn hash;
+    if (!hash) {
+        HMODULE m = LoadLibraryA("bcrypt.dll");
+        open_fn open = m ? (open_fn)(void *)GetProcAddress(m, "BCryptOpenAlgorithmProvider") : NULL;
+        hash_fn h = m ? (hash_fn)(void *)GetProcAddress(m, "BCryptHash") : NULL;
+        if (!open || !h || open(&alg, L"SHA256", NULL, 0) != 0) return 0;
+        hash = h;
+    }
+    if (size > 0x7fffffffu) return 0;
+    return hash(alg, NULL, 0, (UCHAR *)(uintptr_t)data, (ULONG)size, out, 32) == 0;
+}
+static void crypto_Sha256(Ctx *c) {
+    uint8_t digest[32];
+    if (!sha256_bcrypt((const void *)(uintptr_t)A2, (size_t)A3, digest)) fatal(c, "nn::crypto::GenerateSha256Hash: SHA-256 is not available (bcrypt.dll)");
+    memcpy((void *)(uintptr_t)A0, digest, A1 < sizeof digest ? (size_t)A1 : sizeof digest);
+}
+
+/* nn::sm::GetServiceHandle(svc::Handle *out, const char *name, size_t length) -> Result. No service of the system can be
+ * reached from here: sm NotRegistered (module 21, description 7). HDR asks for its "hid:hdr" sysmodule this way and
+ * shows its "not connected" warning page. */
+#define RESULT_SM_NOT_REGISTERED 0xe15u
+static void sm_GetServiceHandle(Ctx *c) {
+    char name[9] = {0};
+    if (A1) memcpy(name, (const void *)(uintptr_t)A1, A2 < 8 ? (size_t)A2 : 8);
+    if (A0) wr32(A0, 0);
+    printf("nn::sm::GetServiceHandle(\"%s\"): no such service here -> 0x%x (caller 0x%llx)\n", name, RESULT_SM_NOT_REGISTERED, (unsigned long long)c->x[30] - 4);
+    RET(RESULT_SM_NOT_REGISTERED);
+}
+/* nn::hid::detail::SetSupportedNpadIdType(const NpadIdType *, int count): the inline header form of the call the game makes
+ * as nn::hid::SetSupportedNpadIdType; every id is served by nnhid.c anyway. */
+static void hid_detail_SetSupportedNpadIdType(Ctx *c) { RET(0); }
+
+static const ImportDef plugin_imports[] = {
+    {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", oe_GetDisplayVersion},
+    {"_ZN2nn2oe15ExitApplicationEv", oe_ExitApplication},
+    {"_ZN2nn3err19ApplicationErrorArgC1EjPKcS3_RKNS_8settings12LanguageCodeE", err_AppErrorArg_ctor},
+    {"_ZN2nn3err19ApplicationErrorArgC2EjPKcS3_RKNS_8settings12LanguageCodeE", err_AppErrorArg_ctor},
+    {"_ZN2nn3err19ApplicationErrorArgC1Ev", err_AppErrorArg_default}, {"_ZN2nn3err19ApplicationErrorArgC2Ev", err_AppErrorArg_default},
+    {"_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", err_ShowApplicationError},
+    {"_ZN2nn6crypto18GenerateSha256HashEPvmPKvm", crypto_Sha256},
+    {"_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm", sm_GetServiceHandle},
+    {"_ZN2nn3hid6detail22SetSupportedNpadIdTypeEPKji", hid_detail_SetSupportedNpadIdType},
+};
+
 /* ---------------------------------------------------------------- registration */
 #define OE(n) "_ZN2nn2oe" n
 #define PR(n) "_ZN2nn5prepo10PlayReport" n
@@ -949,6 +1065,7 @@ void register_misc_imports(void) {
     InitializeCriticalSection(&g_oe_lock);
     InitializeCriticalSection(&g_md5_lock);
     register_imports(replace_imports, (int)(sizeof replace_imports / sizeof replace_imports[0]));
+    register_imports(plugin_imports, (int)(sizeof plugin_imports / sizeof plugin_imports[0]));
     int n = (int)(sizeof fill_imports / sizeof fill_imports[0]), added = 0;
     for (int i = 0; i < n; i++) {
         if (!import_data(fill_imports[i].name)) { printf("nnmisc: \"%s\" is not an import of the game (typo?)\n", fill_imports[i].name); continue; }
