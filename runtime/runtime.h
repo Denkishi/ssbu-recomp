@@ -25,6 +25,8 @@ typedef struct {
     uint64_t fn;                 /* entry address of the lifted function entered most recently */
     const char *in_import;       /* name of the host import currently executing on this context, or NULL */
     uint64_t import_from;        /* guest return address of that import call */
+    uint64_t ex_val2;            /* exclusive monitor, LDXP of two X registers: the second (high) doubleword. Last field on
+                                  * purpose: the offsets of the fields above stay those code built with the older Ctx uses. */
 } Ctx;
 
 void call_indirect(Ctx *c, uint64_t addr);
@@ -74,6 +76,20 @@ void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, 
         return 1; \
     }
 DEF_STX(8) DEF_STX(16) DEF_STX(32) DEF_STX(64)
+/* STXP of two X registers after LDXP (which left the address in ex_addr and the two doublewords in ex_val / ex_val2):
+ * the same rule as STXR, on 16 bytes, with one 128-bit compare-and-swap (cmpxchg16b; the target attribute lets the
+ * header compile without -mcx16: the 16-byte __sync builtin then still becomes the instruction, not a library call).
+ * LDXP / STXP of two W registers are an 8-byte LDXR / STXR (rd64 / stx64). */
+__attribute__((target("cx16"))) static inline uint32_t stxp64(Ctx *c, uint64_t a, uint64_t lo, uint64_t hi) {
+    if (c->ex_addr != a) { stx_diag(c, a, 0, 0, lo, -128); return 1; }
+    c->ex_addr = ~0ull;
+    R1M(a, 16);
+    unsigned __int128 expected = ((unsigned __int128)c->ex_val2 << 64) | c->ex_val, v = ((unsigned __int128)hi << 64) | lo;
+    if (__sync_bool_compare_and_swap((unsigned __int128 *)(uintptr_t)a, expected, v)) { c->ex_fail = 0; return 0; }
+    uint64_t seen; memcpy(&seen, (void *)(uintptr_t)a, sizeof seen);
+    stx_diag(c, a, c->ex_val, seen, lo, 128);
+    return 1;
+}
 
 static inline V128 rdv(uint64_t a, int n) { V128 v; v.d[0] = 0; v.d[1] = 0; memcpy(&v, (void *)(uintptr_t)a, (size_t)n); return v; }
 static inline void wrv(uint64_t a, const V128 *v, int n) { R1M(a, (uint64_t)n); memcpy((void *)(uintptr_t)a, v, (size_t)n); }
@@ -135,6 +151,16 @@ static inline uint32_t cls32(uint32_t v) { return clz32(((v >> 1) ^ v) & 0x7ffff
 static inline uint64_t cls64(uint64_t v) { return clz64(((v >> 1) ^ v) & 0x7fffffffffffffffull) - 1; }
 static inline uint32_t rbit32(uint32_t v) { uint32_t r = 0; for (int i = 0; i < 32; i++) r |= ((v >> i) & 1u) << (31 - i); return r; }
 static inline uint64_t rbit64(uint64_t v) { uint64_t r = 0; for (int i = 0; i < 64; i++) r |= ((v >> i) & 1ull) << (63 - i); return r; }
+/* CRC32B/H/W/X (poly 0xedb88320) and CRC32CB/H/W/X (poly 0x82f63b78): the reflected CRC of the low `bytes` bytes of
+ * val, least significant bit first, on top of acc; no inversion before or after (the Arm instructions do none). */
+static inline uint32_t crc32_arm(uint32_t acc, uint64_t val, int bytes, uint32_t poly) {
+    for (int k = 0; k < bytes; k += 4) {
+        int n = bytes - k < 4 ? bytes - k : 4;
+        acc ^= (uint32_t)(val >> (8 * k)) & (n == 4 ? 0xffffffffu : (1u << (8 * n)) - 1);
+        for (int i = 0; i < 8 * n; i++) acc = (acc >> 1) ^ (poly & (0u - (acc & 1u)));
+    }
+    return acc;
+}
 static inline uint64_t umulh(uint64_t a, uint64_t b) { return (uint64_t)(((unsigned __int128)a * b) >> 64); }
 static inline uint64_t smulh(uint64_t a, uint64_t b) { return (uint64_t)(((__int128)(int64_t)a * (int64_t)b) >> 64); }
 static inline uint32_t sdiv32(uint32_t a, uint32_t b) {
