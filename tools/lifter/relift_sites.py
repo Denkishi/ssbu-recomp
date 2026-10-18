@@ -1,12 +1,17 @@
 """Re-lift of the play DLL for a SITE LIST: run-time code changes of Skyline plugins (HDR) compiled in.
 
-    python relift_sites.py build <site file> [--tag=hdr] [--jobs=N] [--lift-only] [--force] [--base-gen=gen_fl]
-                                             [--base-obj=obj_fl23] [--min-free-gb=G] [--no-prune]
+    python relift_sites.py build <site file> [--tag=hdr] [--jobs=N] [--lift-only] [--force] [--base-gen=gen_eh_o2]
+                                             [--base-obj=obj_eh_o1] [--flags-local] [--min-free-gb=G] [--no-prune]
+                                             [--module=<name>]
     python relift_sites.py check <site file>      parse, check against the binary and classify; no lift
+
+Base set: by default the one scripts/setup.py builds (main: gen_eh_o2 -> obj_eh_o1; --module: gen_nro_eh_o2\\<m> ->
+obj_nro_eh_o2\\<m>). --flags-local: a base set made with flags_local.py's transform (gen_fl -> obj_fl23, gen_nro_fl23 ->
+obj_nro_fl23 by default); the re-lifted files get the same transform. Only needed with that optional pass.
 
 Output (nothing of the base set is written): gen_<tag>\\ (the re-lifted bucket files, funcs.h, table.c, hdr_sites.c),
 obj_<tag>\\ (their objects, _relift_report.txt) and ssbu_game_<tag>.dll + .lib (+ .map). An exe selects the DLL by its
-import library:  RECOMP_DLL=ssbu_game_hdr.dll RECOMP_OBJ=obj_fl23 RECOMP_GEN=gen_fl ... python build.py link
+import library:  RECOMP_DLL=ssbu_game_hdr.dll RECOMP_EXE=ssbu_hdr.exe python build.py link
 (the vanilla shim and the hdr shim are the same file; build.py would only relink the DLL if an object were newer).
 
 SITE LIST: text, one site per line, `#` starts a comment, addresses are full guest addresses in hex.
@@ -14,7 +19,7 @@ SITE LIST: text, one site per line, `#` starts a comment, addresses are full gue
                                            binary; several writes to one address are a chain (each orig = the previous
                                            new). A write outside .text needs no re-lift and is only reported.
   inline   <addr>   `sky_site_inline(c, addr);` before the instruction at addr (all registers are in c; the flags are
-                    written back before and reloaded after, flags_local.py). At a function START (one lifted copy only,
+                    written back before and reloaded after when flags_local.py is used). At a function START (one lifted copy only,
                     reached through its entry) no callout is compiled: the runtime uses the hook table; reported, and
                     the address is treated as a `noinline` site.
   midhook  <addr>   a function hook written at a non-entry address: `if (sky_site_midhook(c, addr)) return;` before the
@@ -32,12 +37,13 @@ SITE LIST: text, one site per line, `#` starts a comment, addresses are full gue
                     entry in the base objects, the base object is kept (--no-prune: compile it anyway).
 
 STEPS. Every bucket file (48 KB of guest code) holding an affected lifted copy is lifted twice with recomp_eh's function
-(+ flags_local's transform): WITHOUT the sites it must reproduce the base file (gen_fl) byte for byte, WITH them it goes
+(+ flags_local's transform with --flags-local): WITHOUT the sites it must reproduce the base file byte for byte, WITH them it goes
 to gen_<tag>. The changed lines of each file are counted (multiset of lines) and compared with what the sites predict.
 Compile: the base set's compiler and flags (last header line of <base obj>\\_opt_report.txt) and the same functions
 unoptimised (<base obj>\\c_XXXX.optnone.h) so a file differs from the play build only by the sites. Memory: at most
---jobs compiles (default 2), a new one only with --min-free-gb available (default 5), the shared lock
-C:\\tmp\\ssbu\\heavy.lock held during the batch; a compile is killed (and retried alone) when free memory drops under 1 GB.
+--jobs compiles (default 2), a new one only with --min-free-gb available (default 5), the lock file RECOMP_HEAVY_LOCK (if
+set: other heavy builds that use it wait) held during the batch; a compile is killed (and retried alone) when free memory
+drops under 1 GB.
 Link: every object of the base set, the re-compiled ones replaced, table.obj from gen_<tag>\\table.c (new entries),
 hdr_sites.c (exports hdr_site_table / hdr_site_count: what this DLL has compiled in), the shim game_shim_eh.c.
 """
@@ -55,8 +61,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KINDS = {'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
-LOCK = r'C:\tmp\ssbu\heavy.lock'
-DEFAULT_CLANG = r'C:\Program Files\LLVM\bin\clang.exe'
+LOCK = os.environ.get('RECOMP_HEAVY_LOCK')      # optional: a lock file shared with other heavy builds of the machine
 
 
 def log(*a):
@@ -154,12 +159,14 @@ def module_info(name):
 class Relifter:
     """module=None: main (recomp.py + recomp_eh.py); module=<name>: a script module (ro_study/recomp_nro.py, which reads
     the module from the environment at import: RECOMP_NRO / RECOMP_NRO_BASE / RECOMP_NRO_MODULE)"""
-    def __init__(self, base_gen, module=None):
+    def __init__(self, base_gen, module=None, use_flags_local=False):
         for v in ('RECOMP_PATCHES', 'RECOMP_EXTRA_RESUME', 'RECOMP_SITES'):
             os.environ.pop(v, None)
-        import flags_local
-        self.flags_local = flags_local
-        flags_local.check_helpers()
+        self.transform = lambda text: text             # the base set is the lifter's output as it is
+        if use_flags_local:                            # a base set made with flags_local.py (optional pass): the same transform
+            import flags_local
+            flags_local.check_helpers()
+            self.transform = flags_local.transform
         self.module = module
         if module:
             nro, base, name, _ = module_info(module)
@@ -319,7 +326,7 @@ def proc_mem(p):
 
 
 def take_lock(purpose):
-    while True:
+    while LOCK:
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, ('%s\nstarted %s pid %d\n' % (purpose, time.strftime('%Y-%m-%d %H:%M:%S'), os.getpid())).encode())
@@ -340,6 +347,8 @@ def take_lock(purpose):
 
 
 def drop_lock():
+    if not LOCK:
+        return
     try:
         os.remove(LOCK)
     except OSError:
@@ -350,7 +359,8 @@ def drop_lock():
 def base_settings(base_obj, module=None):
     """compiler, -O level, extra flags and the per-file optnone limit / whole-file -O0 of the base set's report
     (a module's report is obj_nro_<suffix>/_opt_report.txt, its lines `<module>/c_XXXX.c`)"""
-    clang, opt, extra = os.environ.get('RECOMP_CLANG', DEFAULT_CLANG), '-O2', ['-ffp-contract=off', '-march=znver2']
+    import build_opt                              # no report (no fallback was needed): build_opt.py's settings (RECOMP_CLANG / _OPT / _CFLAGS)
+    clang, opt, extra = build_opt.CLANG, build_opt.OPT, list(build_opt.EXTRA)
     per_file = {}
     rep = os.path.join(os.path.dirname(base_obj) if module else base_obj, '_opt_report.txt')
     prefix = re.escape(module + '/') if module else ''
@@ -542,7 +552,7 @@ def ordering_drift(raw, base_eh, name, have_fl, rl):
         return None
     with open(path, encoding='latin-1') as f:
         old = f.read()
-    if rl.flags_local.transform(old) != have_fl:
+    if rl.transform(old) != have_fl:
         return None
     a, b = old.split('\n'), raw.split('\n')
     if len(a) != len(b):
@@ -640,21 +650,22 @@ def main():
     site_file = os.path.abspath(sys.argv[2])
     tag = opts.get('tag', 'hdr')
     module = opts.get('module')
-    if module:                                    # a script module: gen_nro_fl23\<m> / obj_nro_fl23\<m> -> nro_bin_<tag>\<m>.dll
+    fl = 'flags-local' in opts                    # base set: setup.py's (gen_eh_o2 -> obj_eh_o1), or flags_local's (gen_fl -> obj_fl23)
+    if module:                                    # a script module: gen_nro_eh_o2\<m> / obj_nro_eh_o2\<m> -> nro_bin_<tag>\<m>.dll
         mname = module_info(module)[2]
-        base_gen = os.path.join(HERE, opts.get('base-gen', os.path.join('gen_nro_fl23', mname)))
+        base_gen = os.path.join(HERE, opts.get('base-gen', os.path.join('gen_nro_fl23' if fl else 'gen_nro_eh_o2', mname)))
         base_eh = os.path.join(HERE, opts.get('base-eh', os.path.join('gen_nro_eh_o2', mname)))
-        base_obj = os.path.join(HERE, opts.get('base-obj', os.path.join('obj_nro_fl23', mname)))
+        base_obj = os.path.join(HERE, opts.get('base-obj', os.path.join('obj_nro_fl23' if fl else 'obj_nro_eh_o2', mname)))
         gen, obj = os.path.join(HERE, 'gen_nro_' + tag, mname), os.path.join(HERE, 'obj_nro_' + tag, mname)
         dll = os.path.join(HERE, 'nro_bin_' + tag, mname + '.dll')
     else:
-        base_gen = os.path.join(HERE, opts.get('base-gen', 'gen_fl'))
+        base_gen = os.path.join(HERE, opts.get('base-gen', 'gen_fl' if fl else 'gen_eh_o2'))
         base_eh = os.path.join(HERE, opts.get('base-eh', 'gen_eh_o2'))
-        base_obj = os.path.join(HERE, opts.get('base-obj', 'obj_fl23'))
+        base_obj = os.path.join(HERE, opts.get('base-obj', 'obj_fl23' if fl else 'obj_eh_o1'))
         gen, obj = os.path.join(HERE, 'gen_' + tag), os.path.join(HERE, 'obj_' + tag)
         dll = os.path.join(HERE, 'ssbu_game_%s.dll' % tag)
     t0 = time.time()
-    rl = Relifter(base_gen, module)
+    rl = Relifter(base_gen, module, fl)
     recomp = rl.recomp
     sites = parse_sites(site_file, recomp, rl.module or 'main')
     log('site list %s for %s: %d patches, %d inline, %d midhook, %d dynimm, %d jtable, %d noinline; function entries %d (%.0fs)'
@@ -731,7 +742,7 @@ def main():
         name = 'c_%04x.c' % b
         plain_entries = [e for e in by_bucket[b] if e in base_entries]
         raw = rl.bucket_text(b, plain_entries, None, None)
-        plain = rl.flags_local.transform(raw)
+        plain = rl.transform(raw)
         with open(os.path.join(base_gen, name), encoding='latin-1') as f:
             have = f.read()
         if plain != have:
@@ -741,7 +752,7 @@ def main():
                     name, base_gen, '' if 'allow-ordering-drift' in opts else ' (--allow-ordering-drift: accept a base set lifted before the ordered-access lifting)'))
                 bad += 1
                 continue
-            line = ('  %s: the base set predates the ordered-access lifting (recomp fb716c2 / recomp_nro 9d8a735): %d line(s) differ only by '
+            line = ('  %s: the base set predates the ordered-access lifting (the separate lifter ordering change): %d line(s) differ only by '
                     'lda/stl/fences; this file is compiled from the current lifter' % (name, n_drift))
             log(line)
             report.append(line)
@@ -749,11 +760,11 @@ def main():
         if raw is not None and os.path.exists(os.path.join(base_eh, name)):     # and before the flags transform, the lifter's own output
             with open(os.path.join(base_eh, name), encoding='latin-1') as f:
                 if f.read() != raw:
-                    log('  %s: the re-lift WITHOUT sites differs from %s (before flags_local), stop' % (name, base_eh))
+                    log('  %s: the re-lift WITHOUT sites differs from %s (the lifter output), stop' % (name, base_eh))
                     bad += 1
                     continue
         recomp.PATCHES = patches
-        text = rl.flags_local.transform(rl.bucket_text(b, by_bucket[b], plan, noinline_by_bucket.get(b)))
+        text = rl.transform(rl.bucket_text(b, by_bucket[b], plan, noinline_by_bucket.get(b)))
         recomp.PATCHES = {}
         a_lines, b_lines = collections.Counter(plain.split('\n')), collections.Counter(text.split('\n'))
         removed, added = sum((a_lines - b_lines).values()), sum((b_lines - a_lines).values())
@@ -766,7 +777,7 @@ def main():
         newb = [e for e in by_bucket[b] if e not in base_entries]
         for e in newb:                                               # a new function: all its lines (+ a blank separator), not per site
             recomp.PATCHES = patches
-            exp_added += len(rl.flags_local.transform(rl.lift_entry(e, plan)).split('\n')) + 1
+            exp_added += len(rl.transform(rl.lift_entry(e, plan)).split('\n')) + 1
             recomp.PATCHES = {}
             exp_added -= sum(1 + len(plan[a][0]) + (1 if e == a and plan[a][2] else 0) for ee, a in pairs[b] if ee == e)
             exp_removed -= sum(1 for ee, a in pairs[b] if ee == e)
@@ -868,7 +879,7 @@ def main():
     t1 = time.time()
     failed = []
     if todo:
-        take_lock('relift_sites.py: compiling %d files of gen_%s (clang -O2, up to %d at a time)' % (len(todo), tag, comp.jobs))
+        take_lock('relift_sites.py: compiling %d files of gen_%s (%s, up to %d at a time)' % (len(todo), tag, comp.opt, comp.jobs))
         try:
             failed = comp.compile_all(todo, set(new))
         finally:

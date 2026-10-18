@@ -1,20 +1,23 @@
 """Lift the Skyline plugins of an SD card layout into DLLs for the runtime (runtime/skyline.c).
 
-    python build_plugins.py [--sd <folder>] [--jobs N] [--only name,...] [--relift]
+    python build_plugins.py --sd <folder> [--jobs N] [--only name,...] [--relift] [--flags-local]
 
 Run in build/work/ro_study (scripts/setup.py --only stage puts it there). For every plugin NRO (plugin_map.find_plugins):
   1 name and stable guest base: plugin_map.py, plugin_map.json in build/work/plugin_bin (bases from 0x7280000000)
   2 lift: recomp_nro.py full, with RECOMP_NRO_MODULE=<name>, RECOMP_PATCHES=plugin_patches/<name>.txt and
     RECOMP_EXTRA_RESUME=plugin_patches/<name>.resume.txt when they exist -> build/work/gen_plugin/<name>
-  3 flags in locals: flags_local.py transform -> build/work/gen_plugin_fl23/<name>
-  4 compile: clang 23 -O2 -march=znver2 with build_opt.py's fallback ladder (long functions unoptimised, time limit)
-    -> build/work/obj_plugin_fl23/<name>; nro_shim.c with -DNRO_MODULE=<name>
+  3 only with --flags-local (the optional flags_local.py pass, when the game's sets are built with it):
+    flags_local.py transform -> build/work/gen_plugin_fl/<name>
+  4 compile: build_opt.py's compiler, level and flags (RECOMP_CLANG / RECOMP_OPT / RECOMP_CFLAGS, the same switches as
+    the game's modules) and its fallback ladder (long functions unoptimised, time limit)
+    -> build/work/obj_plugin[_fl]/<name>; nro_shim.c with -DNRO_MODULE=<name>
   5 link: build/work/plugin_bin/<name>.dll
 Then plugin_bin/plugins.txt (one line per plugin: name base image_size file_size build_id source) and
 plugin_bin/<name>.exports.txt.
 
-Compiles take the shared lock C:\\tmp\\ssbu\\heavy.lock (other builds on this 16 GB machine wait for it) and run at most
---jobs (default 4) clang processes at a time.
+--sd (default: SSBU_SD): the folder that stands for the SD card, with atmosphere\\contents\\01006A800016E000\\romfs\\
+skyline\\plugins\\*.nro under it. At most --jobs (default 4) clang processes at a time; with RECOMP_HEAVY_LOCK set, the
+compiles hold that lock file (other heavy builds that use it wait).
 """
 import argparse
 import concurrent.futures
@@ -29,13 +32,11 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, WORK)
 import plugin_map  # noqa: E402
 
-CLANG = os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')
-LOCK = r'C:\tmp\ssbu\heavy.lock'
-OPT_FLAGS = ['-O2', '-ffp-contract=off', '-march=znver2']
+LOCK = os.environ.get('RECOMP_HEAVY_LOCK')      # optional: a lock file shared with other heavy builds of the machine
 
 
 def take_lock(what):
-    while True:
+    while LOCK:
         try:
             fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, ('%s %s\n' % (what, time.strftime('%Y-%m-%d %H:%M:%S'))).encode())
@@ -54,6 +55,8 @@ def take_lock(what):
 
 
 def drop_lock():
+    if not LOCK:
+        return
     try:
         os.remove(LOCK)
     except OSError:
@@ -61,20 +64,18 @@ def drop_lock():
 
 
 def compile_one(job):
-    """job = (src, obj, flags). Uses build_opt's ladder: long functions optnone, bounded time."""
+    """job = (src, obj, flags). Uses build_opt's compiler settings and ladder: long functions optnone, bounded time."""
     src, obj, flags = job
     import build_opt
-    build_opt.CLANG = CLANG
-    build_opt.OPT = OPT_FLAGS[0]
-    build_opt.EXTRA = OPT_FLAGS[1:]
     code, out, secs, note = build_opt.compile_file(src, obj, flags)
     return os.path.basename(src), code, out, secs, note
 
 
-def build_one(name, nro, base, jobs, relift):
+def build_one(name, nro, base, jobs, relift, flags_local):
+    import build_opt
     gen = os.path.join(WORK, 'gen_plugin', name)
-    genfl = os.path.join(WORK, 'gen_plugin_fl23', name)
-    obj = os.path.join(WORK, 'obj_plugin_fl23', name)
+    genfl = os.path.join(WORK, 'gen_plugin_fl', name) if flags_local else gen      # the files that are compiled
+    obj = os.path.join(WORK, 'obj_plugin_fl' if flags_local else 'obj_plugin', name)
     bindir = os.path.join(WORK, 'plugin_bin')
     for d in (gen, genfl, obj, bindir):
         os.makedirs(d, exist_ok=True)
@@ -98,6 +99,7 @@ def build_one(name, nro, base, jobs, relift):
             print('%s: LIFT FAILED\n%s\n%s' % (name, r.stdout[-3000:], r.stderr[-3000:]))
             return None
         print('%s: lifted  %s' % (name, tail[-1]), flush=True)
+    if flags_local and (relift or not os.path.exists(os.path.join(genfl, 'table.c')) or os.path.getmtime(os.path.join(genfl, 'table.c')) < os.path.getmtime(stamp)):
         # 3. flags in locals (the transform rewrites only files whose result changed)
         r = subprocess.run([sys.executable, os.path.join(WORK, 'flags_local.py'), gen, genfl], capture_output=True, text=True, cwd=WORK)
         if r.returncode:
@@ -146,7 +148,7 @@ def build_one(name, nro, base, jobs, relift):
         rsp = os.path.join(obj, 'link.rsp')
         with open(rsp, 'w') as f:
             f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-        r = subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True)
+        r = subprocess.run([build_opt.CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True)
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
             print('could not link %s (is a game exe still running and holding it open?)' % dll)
@@ -163,10 +165,11 @@ def build_one(name, nro, base, jobs, relift):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--sd', default=os.environ.get('SSBU_SD', r'C:\Games\ssbu\sd'))
+    ap.add_argument('--sd', default=os.environ.get('SSBU_SD'), required=not os.environ.get('SSBU_SD'))
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--only', default='')
     ap.add_argument('--relift', action='store_true')
+    ap.add_argument('--flags-local', action='store_true', help='apply flags_local.py (only when the game is built with that pass)')
     a = ap.parse_args()
     bindir = os.path.join(WORK, 'plugin_bin')
     os.makedirs(bindir, exist_ok=True)
@@ -187,7 +190,7 @@ def main():
         if only and name not in only:
             ok.append((name, path))
             continue
-        if build_one(name, path, int(m[name]['base'], 16), a.jobs, a.relift):
+        if build_one(name, path, int(m[name]['base'], 16), a.jobs, a.relift, a.flags_local):
             ok.append((name, path))
             with open(os.path.join(bindir, name + '.exports.txt'), 'w') as f:
                 for off, kind, size, sym in plugin_map.exports(path):

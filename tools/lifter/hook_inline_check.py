@@ -1,12 +1,13 @@
 """Can the hook table hook these functions in the compiled game? (relift_sites.py `noinline`, fighter_sdk\\hook_host.c)
 
-    python hook_inline_check.py <address file | site list | addr,addr,...> [--obj=obj_fl23] [--gen=gen_fl] [--module=<name>]
+    python hook_inline_check.py <address file | site list | addr,addr,...> [--obj=obj_eh_o1] [--gen=gen_eh_o2] [--module=<name>]
                                 [--emit=<file>] [--census-all]
 
 The hook table rewrites only the ENTRY of a lifted function in the loaded DLL (5 bytes: jmp). That is complete only if
 every static caller still reaches the entry: a direct call or a tail jump to f_<addr>. Callers in other bucket files
-always do (separate translation units, no LTO); a caller in the SAME file may have had f_<addr> inlined (clang 23 -O2
-does inline: e.g. the fall-through `f_<next>(c); return;` at the end of a function), or call a clone of it.
+always do (separate translation units, no LTO); a caller in the SAME file may have had f_<addr> inlined (an optimised
+build can: clang 23 -O2 does, e.g. the fall-through `f_<next>(c); return;` at the end of a function), or call a clone of it.
+Defaults: the base set of scripts/setup.py (gen_eh_o2 / obj_eh_o1; --module: gen_nro_eh_o2\\<m> / obj_nro_eh_o2\\<m>).
 For each address:
   1. the lifted callers in its own file and how many call sites each has (`f_<addr>(c)` in the generated C: BL, B to
      another function, fall-through), from <gen>\\c_XXXX.c, split into reachable and dead sites (control flow of the
@@ -29,7 +30,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OBJDUMP = os.path.join(os.path.dirname(os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')), 'llvm-objdump.exe')
+OBJDUMP = os.environ.get('RECOMP_OBJDUMP') or os.path.join(os.path.dirname(os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')), 'llvm-objdump.exe')
 BASE, BUCKET = 0x7100000000, 0xC000
 
 
@@ -436,14 +437,14 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     opts = dict(a[2:].split('=', 1) if '=' in a else (a[2:], '1') for a in sys.argv[1:] if a.startswith('--'))
     base = BASE
-    if 'module' in opts:                        # a script module: gen_nro_fl23\<m>, obj_nro_fl23\<m>, its guest base
+    if 'module' in opts:                        # a script module: gen_nro_eh_o2\<m>, obj_nro_eh_o2\<m>, its guest base
         import relift_sites
         _, b, m, span = relift_sites.module_info(opts['module'])
         base = int(b, 16)
-        opts.setdefault('gen', os.path.join('gen_nro_fl23', m))
-        opts.setdefault('obj', os.path.join('obj_nro_fl23', m))
-    gen = os.path.join(HERE, opts.get('gen', 'gen_fl'))
-    objdir = os.path.join(HERE, opts.get('obj', 'obj_fl23'))
+        opts.setdefault('gen', os.path.join('gen_nro_eh_o2', m))
+        opts.setdefault('obj', os.path.join('obj_nro_eh_o2', m))
+    gen = os.path.join(HERE, opts.get('gen', 'gen_eh_o2'))
+    objdir = os.path.join(HERE, opts.get('obj', 'obj_eh_o1'))
     targets, labels = [], {}
     if args:
         src = args[0]
