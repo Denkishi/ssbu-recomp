@@ -39,6 +39,14 @@ typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
 int fs_dir_hidden(const char *guest_dir, const char *name);
 uint32_t fs_delete_directory(const char *guest);
+/* nnfs.c: directories of guest file systems (nn::fs::fsa::Register, ARCropolis's "mods:" / "arc:"); their handles are
+ * tagged values, never HostDir pointers, so they are recognised before dir_of() looks at memory */
+int fs_fsa_dir_handle(uint64_t h);
+uint32_t fs_fsa_open_directory(Ctx *c, const char *guest, int mode, uint64_t out, int *handled);
+uint32_t fs_fsa_dir_count(Ctx *c, uint64_t h, int64_t *count);
+uint32_t fs_fsa_dir_read(Ctx *c, uint64_t h, uint64_t entries, int64_t max, int64_t *got);
+void fs_fsa_dir_close(Ctx *c, uint64_t h);
+uint32_t fs_fsa_delete_directory(Ctx *c, const char *guest, int *handled);
 static int dir_host_path(const char *guest, char *out) {  /* superseded by fs_dir_roots (kept for the self-test's scratch folder) */
     const char *env = getenv("SSBU_ROMFS");
     const char *colon = guest ? strchr(guest, ':') : NULL;
@@ -60,6 +68,9 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     char roots[2][MAX_PATH], pattern[MAX_PATH + 4];
     uint32_t result = 0;
     if (out) wr64(out, 0);
+    {   int handled = 0;
+        uint32_t r = fs_fsa_open_directory(c, (const char *)(uintptr_t)A1, mode, out, &handled);
+        if (handled) { RET(r); return; } }
     /* the folders that make up this directory: for journaled save data the working folder, then the committed one */
     int nroots = fs_dir_roots((const char *)(uintptr_t)A1, roots, &result);
     if (result) { RET(result); return; }
@@ -114,11 +125,13 @@ static HostDir *dir_of(uint64_t handle) {
     return handle > 0x10000 && d->magic == DIR_MAGIC ? d : NULL;
 }
 static void fs_GetDirectoryEntryCount(Ctx *c) {           /* (int64_t *out, DirectoryHandle) -> Result */
+    if (fs_fsa_dir_handle(A1)) { int64_t n = 0; uint64_t out = A0; uint32_t r = fs_fsa_dir_count(c, A1, &n); if (out) wr64(out, (uint64_t)n); RET(r); return; }
     HostDir *d = dir_of(A1);
     if (A0) wr64(A0, d ? (uint64_t)d->count : 0);
     RET(d ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_ReadDirectory(Ctx *c) {                    /* (int64_t *outCount, DirectoryEntry *entries, DirectoryHandle, int64_t max) -> Result */
+    if (fs_fsa_dir_handle(A2)) { int64_t n = 0; uint64_t out = A0; uint32_t r = fs_fsa_dir_read(c, A2, A1, (int64_t)A3, &n); if (out) wr64(out, (uint64_t)n); RET(r); return; }
     HostDir *d = dir_of(A2);
     uint64_t out = A1;
     int64_t max = (int64_t)A3, n = 0;
@@ -136,10 +149,14 @@ static void fs_ReadDirectory(Ctx *c) {                    /* (int64_t *outCount,
     RET(0);
 }
 static void fs_CloseDirectory(Ctx *c) {                   /* (DirectoryHandle) */
+    if (fs_fsa_dir_handle(A0)) { fs_fsa_dir_close(c, A0); return; }
     HostDir *d = dir_of(A0);
     if (d) { d->magic = 0; free(d->entries); free(d); }
 }
 static void fs_DeleteDirectory(Ctx *c) {                  /* (const char *path) -> Result; the directory must be empty */
+    int handled = 0;
+    uint32_t r = fs_fsa_delete_directory(c, (const char *)(uintptr_t)A0, &handled);
+    if (handled) { RET(r); return; }
     RET(fs_delete_directory((const char *)(uintptr_t)A0));
 }
 
