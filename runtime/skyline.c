@@ -40,6 +40,8 @@ int sdk_image_ready(void);
 #define SKY_PROGRAM_ID 0x01006A800016E000ULL
 #define SKY_PLUGIN_DIR "atmosphere\\contents\\01006A800016E000\\romfs\\skyline\\plugins"
 
+static void sky_sites_init(void);
+static void sky_sites_add(HMODULE m, const char *what);
 static NroInfo g_sky_info[SKY_MAX_PLUGINS];
 static char g_sky_src[SKY_MAX_PLUGINS][MAX_PATH];
 static int g_sky_count;
@@ -227,6 +229,7 @@ static void sky_module_loaded(NroModule *m, uint64_t obj) {
     rtld_fill(obj, base, image_dynamic(base), m->info->image_size);
     list_push(&g_sky_manual, obj);
     m->rtld_obj = obj;
+    if (!m->plugin) { sky_sites_init(); sky_sites_add(m->dll, m->info->name); }
 }
 static void sky_module_unloaded(NroModule *m) {
     if (m->rtld_obj) list_remove(&g_sky_manual, m->rtld_obj);
@@ -297,19 +300,26 @@ static int sky_svc(Ctx *c, uint32_t n) {
 /* ---------------------------------------------------------------- sites compiled into the re-lifted game DLL
  * ssbu_game_hdr.dll exports hdr_site_table (kind 1 patch, 2 inline, 3 midhook, 4 dynimm, 5 jtable, 6 noinline). */
 typedef struct { uint64_t addr; uint32_t kind; uint32_t word; } HdrSite;
-static const HdrSite *g_hdr_sites; static int g_hdr_site_count;
+static struct { const HdrSite *t; int n; } g_hdr_tabs[16];     /* the game DLL's, then each re-lifted module DLL's */
+static volatile LONG g_hdr_ntabs;
+static void sky_sites_add(HMODULE m, const char *what) {
+    const HdrSite *t = m ? (const HdrSite *)(void *)GetProcAddress(m, "hdr_site_table") : NULL;
+    const int *n = m ? (const int *)(void *)GetProcAddress(m, "hdr_site_count") : NULL;
+    if (!t || !n) return;
+    LONG k = InterlockedIncrement(&g_hdr_ntabs) - 1;
+    if (k >= 16) return;
+    g_hdr_tabs[k].t = t; g_hdr_tabs[k].n = *n;
+    sky_logf("%s has %d plugin sites compiled in", what, *n);
+}
 static void sky_sites_init(void) {
     static volatile LONG done;
     if (InterlockedExchange(&done, 1)) return;
-    HMODULE m = GetModuleHandleA("ssbu_game_hdr.dll");
-    if (!m) return;
-    const HdrSite *t = (const HdrSite *)(void *)GetProcAddress(m, "hdr_site_table");
-    const int *n = (const int *)(void *)GetProcAddress(m, "hdr_site_count");
-    if (t && n) { g_hdr_sites = t; g_hdr_site_count = *n; }
+    sky_sites_add(GetModuleHandleA("ssbu_game_hdr.dll"), "ssbu_game_hdr.dll");
 }
 static const HdrSite *sky_compiled(uint64_t addr, uint32_t kind) {
     sky_sites_init();
-    for (int i = 0; i < g_hdr_site_count; i++) if (g_hdr_sites[i].addr == addr && g_hdr_sites[i].kind == kind) return &g_hdr_sites[i];
+    for (int k = 0; k < g_hdr_ntabs && k < 16; k++)
+        for (int i = 0; i < g_hdr_tabs[k].n; i++) if (g_hdr_tabs[k].t[i].addr == addr && g_hdr_tabs[k].t[i].kind == kind) return &g_hdr_tabs[k].t[i];
     return NULL;
 }
 

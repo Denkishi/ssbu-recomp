@@ -429,7 +429,14 @@ static int attach_dll(NroModule *m) {
     const char *bin = getenv("SSBU_NRO_BIN");               /* folder of the module DLLs next to the exe (default nro_bin) */
     if (m->plugin) bin = sky_bin_dir();                     /* skyline.c: plugin_bin (SSBU_PLUGIN_BIN) */
     snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_eh_o2", m->info->name);      /* P3 (2026-10-09): the optimised modules are the default; SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
-    HMODULE dll = LoadLibraryA(path);
+    HMODULE dll = NULL;
+    if (!m->plugin && sky_registry() > 0) {                 /* skyline.c: a module re-lifted with the plugins' sites (nro_bin_hdr) */
+        char hp[MAX_PATH * 2];
+        snprintf(hp, sizeof hp, "%.*snro_bin_hdr\\%s.dll", (int)n, path, m->info->name);
+        dll = LoadLibraryA(hp);
+        if (dll) printf("nn::ro: %s from %s\n", m->info->name, hp);
+    }
+    if (!dll) dll = LoadLibraryA(path);
     const char *python = getenv("SSBU_NRO_AUTOBUILD");       /* development aid: path of python.exe; lift a missing module on demand */
     if (!dll && python && python[0]) {
         char cmd[MAX_PATH * 4];
