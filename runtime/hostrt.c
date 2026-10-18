@@ -750,6 +750,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
                (unsigned long long)er->ExceptionInformation[1]);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[1] >= HOSTFN_BASE && er->ExceptionInformation[1] < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16)
+        printf("  (the placeholder address of the run-time host function %d, %s, +%llu, used as data)\n", (int)((er->ExceptionInformation[1] - HOSTFN_BASE) / 16),
+               g_hostfn[(er->ExceptionInformation[1] - HOSTFN_BASE) / 16].name, (unsigned long long)((er->ExceptionInformation[1] - HOSTFN_BASE) % 16));
     dump_guest_registers();
     printf("guest call stack (innermost first):\n");
     CONTEXT ctx = *ep->ContextRecord;
@@ -798,6 +801,13 @@ void runtime_init(const char *elf, const char *trace_path) {
     /* data symbols provided by other modules: zero-filled placeholders, IMPORT_SLOT bytes each */
     void *imp = VirtualAlloc((void *)IMPORT_BASE, (SIZE_T)dyn_sym_count * IMPORT_SLOT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
+    /* The placeholder addresses of the run-time host functions are readable (zeros), as code is on the console. HDR reads one
+     * of them as data: lib::L2CValue::as_integer (0x7103734b80) on 0x7400004220 (run-time host function 1058 in the HDR
+     * install; on the console the address of that function is code). There it reads instruction words, which are no
+     * L2CValue type (2, 3, 7), and gives 0; here the address was unmapped and the game died with an access
+     * violation every couple of minutes of play (2026-10-18, nine crashes, any fighters). Zeros read as type 0: also 0.
+     * Writes still fault, as they would on the console's code pages. */
+    if (!VirtualAlloc((void *)HOSTFN_BASE, (SIZE_T)MAX_HOSTFN * 16, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY)) printf("hostrt: the host function placeholders could not be mapped readable (error %lu)\n", GetLastError());
     FILE *f = fopen(elf, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", elf); exit(1); }
     fseek(f, (long)FILE_OFF, SEEK_SET);
