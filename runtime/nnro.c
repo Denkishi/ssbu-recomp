@@ -691,7 +691,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
     bind_symbols(m, &unresolved);
     for (int i = 1; i < m->sym_count; i++)
         if (m->syms[i].defined && m->syms[i].name[0]) exp_add(m->syms[i].name, m, in->base + m->syms[i].value);
-    int rebound = rebind_others(m);
+    int rebound = 0;
     uint64_t obj = mh + (int32_t)rd32(mh + 0x18);       /* the loader's RoModule object inside the image */
     wr64(obj, obj); wr64(obj + 8, obj);
     wr64(obj + 0x20, in->base);
@@ -706,6 +706,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
     for (uint64_t s = 0; s < (span + (1u << NRO_SLOT_SHIFT) - 1) >> NRO_SLOT_SHIFT; s++)
         g_slot[((in->base - NRO_BASE) >> NRO_SLOT_SHIFT) + s] = m;
     published = publish_exports(m, 1);
+    rebound = rebind_others(m);                  /* after m->loaded: exp_find skips modules not loaded */
     ReleaseSRWLockExclusive(&g_ro_lock);
     int eh = eh_register_image(in->base, in->image_size, 0);        /* its .eh_frame_hdr, for C++ exceptions (after relocation) */
     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&freq);
