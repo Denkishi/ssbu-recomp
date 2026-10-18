@@ -1,6 +1,7 @@
 """Can the hook table hook these functions in the compiled game? (relift_sites.py `noinline`, fighter_sdk\\hook_host.c)
 
-    python hook_inline_check.py <address file | addr,addr,...> [--obj=obj_fl23] [--gen=gen_fl] [--emit=<file>] [--census-all]
+    python hook_inline_check.py <address file | site list | addr,addr,...> [--obj=obj_fl23] [--gen=gen_fl] [--module=<name>]
+                                [--emit=<file>] [--census-all]
 
 The hook table rewrites only the ENTRY of a lifted function in the loaded DLL (5 bytes: jmp). That is complete only if
 every static caller still reaches the entry: a direct call or a tail jump to f_<addr>. Callers in other bucket files
@@ -17,7 +18,7 @@ For each address:
   4. the entry: hook_host.c's hk_len / hk_move (dry run) on the first bytes of f_<addr> in the object.
 Verdict INLINED when some caller in the file has fewer compiled call/jump sites than reachable lifted ones (conservative:
 two sites the compiler merged count too), CLONED when a clone exists, SUSPECT when only the address constant is found
-elsewhere; else OK. --emit writes `noinline <addr>` lines for every address that is not OK.
+elsewhere and the lifted C of that function has no such constant (a BL just before f_<addr> sets x30 = <addr>); else OK. --emit writes `noinline <addr>` lines for every address that is not OK.
 --census-all: the entry census (4) over every function of <obj> (SSBU_HOOK_SELFTEST's census, offline).
 """
 import collections
@@ -277,7 +278,15 @@ def c_calls(path, targets):
     live = collections.defaultdict(collections.Counter)
     dead = collections.defaultdict(collections.Counter)
 
+    tset = set(targets)
+    cpat = re.compile(r'0x([0-9a-f]+)ULL')
+    src_const = collections.defaultdict(set)      # target -> functions whose C holds the address as a constant (x30 = F etc.)
+
     def done(name, body):
+        for line in body:
+            for k in cpat.findall(line):
+                if int(k, 16) in tset:
+                    src_const[int(k, 16)].add(name)
         hits = [(i, callee) for i, line in enumerate(body) for callee in pat.findall(line) if callee in want]
         if not hits:
             return
@@ -308,7 +317,7 @@ def c_calls(path, targets):
     for t in set(live) | set(dead):
         for g in set(live[t]) | set(dead[t]):
             out[t][g] = (live[t].get(g, 0), dead[t].get(g, 0))
-    return out
+    return out, src_const
 
 
 FN_HDR = re.compile(r'^[0-9a-f]{16} <([^>]+)>:')
@@ -361,7 +370,7 @@ def fmt_caller(g, live, dead, compiled, const):
     return '%s %d/%d%s%s' % (g, compiled, live, ' +%d dead' % dead if dead else '', ' +const' if const else '')
 
 
-def check(targets, gen, objdir):
+def check(targets, gen, objdir, base=BASE):
     funcs = sorted(int(m, 16) for m in re.findall(r'^void f_([0-9a-f]+)\(Ctx \*c\);', open(os.path.join(gen, 'funcs.h')).read(), re.M))
     fset = set(funcs)
     by_bucket = collections.defaultdict(list)
@@ -370,11 +379,11 @@ def check(targets, gen, objdir):
         if t not in fset:
             results[t] = dict(verdict='NOT AN ENTRY', bucket=None, callers=[], entry='-')
             continue
-        by_bucket[(t - BASE) // BUCKET].append(t)
+        by_bucket[(t - base) // BUCKET].append(t)
     for b, ts in sorted(by_bucket.items()):
         src = os.path.join(gen, 'c_%04x.c' % b)
         obj = os.path.join(objdir, 'c_%04x.obj' % b)
-        calls = c_calls(src, ts)
+        calls, src_const = c_calls(src, ts)
         refs, marks = disasm_refs(obj, ts)
         data, syms, names = coff_functions(obj)
         for t in ts:
@@ -388,7 +397,7 @@ def check(targets, gen, objdir):
             clones = [n for n in names if n.startswith(fn + '.')]
             if clones:
                 verdict = 'CLONED' if verdict == 'OK' else verdict + '+CLONED'
-            sus = [g for g, k in marks[t].items() if k and g != fn and calls[t].get(g, (0, 0))[0] <= refs[t].get(g, 0)]
+            sus = [g for g, k in marks[t].items() if k and g not in (fn, 'u' + fn[1:]) and g not in src_const[t] and calls[t].get(g, (0, 0))[0] <= refs[t].get(g, 0)]
             if sus and verdict == 'OK':
                 verdict = 'SUSPECT'
             if fn in syms:
@@ -426,24 +435,34 @@ def census_all(objdir):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     opts = dict(a[2:].split('=', 1) if '=' in a else (a[2:], '1') for a in sys.argv[1:] if a.startswith('--'))
+    base = BASE
+    if 'module' in opts:                        # a script module: gen_nro_fl23\<m>, obj_nro_fl23\<m>, its guest base
+        import relift_sites
+        _, b, m, span = relift_sites.module_info(opts['module'])
+        base = int(b, 16)
+        opts.setdefault('gen', os.path.join('gen_nro_fl23', m))
+        opts.setdefault('obj', os.path.join('obj_nro_fl23', m))
     gen = os.path.join(HERE, opts.get('gen', 'gen_fl'))
     objdir = os.path.join(HERE, opts.get('obj', 'obj_fl23'))
     targets, labels = [], {}
     if args:
         src = args[0]
-        lines = open(src).read().split('\n') if os.path.exists(src) else src.split(',')
+        lines = open(src).read().split(chr(10)) if os.path.exists(src) else src.split(',')
         for line in lines:
             t = line.split('#', 1)
-            if not t[0].strip():
+            f = t[0].split()
+            if not f or (len(f) > 1 and f[0] not in ('hook', 'noinline', 'inline')):   # a site list: only the entry hooks
                 continue
-            a = int(t[0].split()[-1], 16)
-            if a < BASE:
-                a += BASE
+            a = int(f[-1], 16)
+            if a < base:
+                a += base
+            if not base <= a < base + span:
+                continue                        # another module's address
             targets.append(a)
             if len(t) > 1:
                 labels[a] = t[1].strip()
     targets = sorted(set(targets))
-    res = check(targets, gen, objdir) if targets else {}
+    res = check(targets, gen, objdir, base) if targets else {}
     bad = []
     for t in targets:
         r = res[t]

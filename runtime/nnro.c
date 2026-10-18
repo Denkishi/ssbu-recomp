@@ -60,6 +60,8 @@ typedef struct {
     void (*stx_diag)(Ctx *, uint64_t, uint64_t, uint64_t, uint64_t, int);
     void (*nro_import)(Ctx *, void *, int);
     void (*catch_call)(Ctx *, void (*)(Ctx *, uint64_t));      /* nnunwind.c: entry of functions with a catch clause */
+    void (*site_inline)(Ctx *, uint64_t);                      /* site callouts of a re-lifted module (nro_bin_hdr, relift_sites.py) */
+    int (*site_midhook)(Ctx *, uint64_t);
 } NroHost;
 typedef struct { uint64_t lp; void (*fn)(Ctx *, uint64_t); } NroResume;      /* landing pad -> resume entry (nnunwind.c) */
 /* a DLL built before the exception support fills only the first four fields: resume stays NULL */
@@ -418,7 +420,9 @@ static int cmp_host(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-static const NroHost g_host = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag, nro_import_host, nro_catch_call};
+void sky_site_inline(Ctx *c, uint64_t pc);                   /* skyline.c (included below) */
+int sky_site_midhook(Ctx *c, uint64_t pc);
+static const NroHost g_host = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag, nro_import_host, nro_catch_call, sky_site_inline, sky_site_midhook};
 
 /* Load nro_bin\<module>.dll (next to the exe) and take its tables. */
 static int attach_dll(NroModule *m) {

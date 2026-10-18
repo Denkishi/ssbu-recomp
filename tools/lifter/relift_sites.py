@@ -56,6 +56,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 KINDS = {'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
 LOCK = r'C:\tmp\ssbu\heavy.lock'
+DEFAULT_CLANG = r'C:\Program Files\LLVM\bin\clang.exe'
 
 
 def log(*a):
@@ -71,8 +72,12 @@ class Sites:
         self.ignored = []        # (line, reason)
 
 
-def parse_sites(path, recomp):
+def parse_sites(path, recomp, what='main'):
+    """the sites of one module: lines whose address is outside its .text are counted and skipped (a list recorded at run
+    time names main, the script modules and the plugins); `hook <addr>` (an entry hook the runtime installs through the
+    hook table) is a `noinline` site; `data` lines (writes outside code) are skipped"""
     s = Sites()
+    s.other = collections.Counter()
     lo, hi = recomp.BASE, recomp.BASE + recomp.TEXT_SIZE
     with open(path) as f:
         for n, line in enumerate(f, 1):
@@ -80,17 +85,22 @@ def parse_sites(path, recomp):
             if not t:
                 continue
             kind = t[0].lower()
+            if kind == 'data':
+                s.other['data'] += 1
+                continue
+            if kind == 'hook':
+                kind = 'noinline'
             if kind not in KINDS:
                 raise ValueError('%s:%d: unknown site kind %r' % (path, n, t[0]))
             want = 4 if kind == 'patch' else 2
             if len(t) != want:
                 raise ValueError('%s:%d: %s takes %d field(s)' % (path, n, kind, want - 1))
             addr = int(t[1], 16)
-            if not lo <= addr < hi or addr & 3:
-                if kind == 'patch':
-                    s.ignored.append((line.strip(), 'outside main .text (data / rodata write): no re-lift needed'))
-                    continue
-                raise ValueError('%s:%d: %x is not an instruction address of main' % (path, n, addr))
+            if not lo <= addr < hi:
+                s.other[kind] += 1
+                continue
+            if addr & 3:
+                raise ValueError('%s:%d: %x is not an instruction address of %s' % (path, n, addr, what))
             if kind == 'patch':
                 old, new = int(t[2], 16), int(t[3], 16)
                 have = s.patch.get(addr, recomp.word(addr))
@@ -132,20 +142,50 @@ def dynimm_lines(w, a, recomp):
     return check, stmt
 
 
+def module_info(name):
+    """(path of the .nro, guest base, name, text size) of a game module (ro_study/nro_map.json)"""
+    with open(os.path.join(HERE, 'ro_study', 'nro_map.json')) as f:
+        for e in json.load(f):
+            if e['name'] in (name, 'lua2cpp_' + name):
+                return os.path.join(HERE, 'ro_study', 'nro', e['file']), e['base'], e['name'], e['text_size']
+    raise SystemExit('unknown module %s (ro_study/nro_map.json)' % name)
+
+
 class Relifter:
-    def __init__(self, base_gen):
-        os.environ.pop('RECOMP_PATCHES', None)
-        import recomp
-        import recomp_eh
+    """module=None: main (recomp.py + recomp_eh.py); module=<name>: a script module (ro_study/recomp_nro.py, which reads
+    the module from the environment at import: RECOMP_NRO / RECOMP_NRO_BASE / RECOMP_NRO_MODULE)"""
+    def __init__(self, base_gen, module=None):
+        for v in ('RECOMP_PATCHES', 'RECOMP_EXTRA_RESUME', 'RECOMP_SITES'):
+            os.environ.pop(v, None)
         import flags_local
-        self.recomp, self.recomp_eh, self.flags_local = recomp, recomp_eh, flags_local
+        self.flags_local = flags_local
         flags_local.check_helpers()
+        self.module = module
+        if module:
+            nro, base, name, _ = module_info(module)
+            os.environ['RECOMP_NRO'], os.environ['RECOMP_NRO_BASE'], os.environ['RECOMP_NRO_MODULE'] = os.path.abspath(nro), base, name
+            sys.path.insert(0, os.path.join(HERE, 'ro_study'))
+            import recomp_nro as recomp
+            self.module = recomp.MODULE
+            self._lift = lambda env, e: recomp.lift_function(env, e)[0]
+            self.generator = 'recomp.py'
+            self.table_sym = 'fn_table_' + recomp.MODULE
+        else:
+            import recomp
+            import recomp_eh
+            self._lift = lambda env, e: recomp_eh.lift_function(env, e)[0]
+            self.generator = 'recomp_eh.py'
+            self.table_sym = 'fn_table'
+        self.recomp = recomp
         self.base_gen = base_gen
         env = recomp.Env()
         env.imports = set()
         env.full = True
-        _, _, eh_starts = recomp_eh.eh_info()
-        env.starts = sorted(set(env.compute_starts()) | set(eh_starts))
+        if module:
+            env.compute_starts()                       # includes the starts of the exception tables
+        else:
+            _, _, eh_starts = recomp_eh.eh_info()
+            env.starts = sorted(set(env.compute_starts()) | set(eh_starts))
         self.env = env
         self.starts_set = set(env.starts)
         self.funcs_h = open(os.path.join(base_gen, 'funcs.h')).read()
@@ -166,7 +206,7 @@ class Relifter:
 
     def lift_entry(self, e, plan):
         """lifted text of entry e; plan = None (plain) or {addr: (pre lines, statement or None, midhook)}."""
-        text, _, _, _ = self.recomp_eh.lift_function(self.env, e)
+        text = self._lift(self.env, e)
         if not plan:
             return text
         end = self.env.extent(e)
@@ -194,7 +234,7 @@ class Relifter:
 
     def bucket_text(self, b, entries, plan, noinline):
         texts = [self.lift_entry(e, plan) for e in entries]
-        head = '/* generated by recomp_eh.py -- do not edit */\n#include "runtime.h"\n#include "funcs.h"\n'
+        head = '/* generated by %s -- do not edit */\n#include "runtime.h"\n#include "funcs.h"\n' % self.generator
         if noinline:
             head += ''.join('void f_%x(Ctx *c) __attribute__((noinline));      /* relift_sites.py: hooked through the hook table */\n' % a
                             for a in sorted(noinline))
@@ -307,18 +347,20 @@ def drop_lock():
 
 
 # ---------------------------------------------------------------------------------------------------- compile
-def base_settings(base_obj):
-    """compiler, -O level, extra flags and the per-file optnone limit / whole-file -O0 of the base set's report"""
-    clang, opt, extra = os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe'), '-O2', ['-ffp-contract=off', '-march=znver2']
+def base_settings(base_obj, module=None):
+    """compiler, -O level, extra flags and the per-file optnone limit / whole-file -O0 of the base set's report
+    (a module's report is obj_nro_<suffix>/_opt_report.txt, its lines `<module>/c_XXXX.c`)"""
+    clang, opt, extra = os.environ.get('RECOMP_CLANG', DEFAULT_CLANG), '-O2', ['-ffp-contract=off', '-march=znver2']
     per_file = {}
-    rep = os.path.join(base_obj, '_opt_report.txt')
+    rep = os.path.join(os.path.dirname(base_obj) if module else base_obj, '_opt_report.txt')
+    prefix = re.escape(module + '/') if module else ''
     if os.path.exists(rep):
         for line in open(rep):
             m = re.match(r'^# \S+ \S+\s+(.+?clang\.exe) (-O\d) (.*?)\s+optnone over (\d+) statements', line)
             if m:
                 clang, opt, extra = m.group(1), m.group(2), m.group(3).split()
                 continue
-            m = re.match(r'^(c_[0-9a-f]+\.c)\s+\d+s\s*(.*)$', line)
+            m = re.match(r'^%s(c_[0-9a-f]+\.c)\s+\d+s\s*(.*)$' % prefix, line)
             if m:
                 note = m.group(2)
                 lim = re.search(r'over (\d+) statements', note)
@@ -333,11 +375,11 @@ def optnone_names(path):
 
 
 class Compiler:
-    def __init__(self, base_obj, gen, obj, jobs, min_free):
+    def __init__(self, base_obj, gen, obj, jobs, min_free, module=None):
         import build_opt
         self.build_opt = build_opt
         self.base_obj, self.gen, self.obj = base_obj, gen, obj
-        self.clang, self.opt, self.extra, self.per_file = base_settings(base_obj)
+        self.clang, self.opt, self.extra, self.per_file = base_settings(base_obj, module)
         self.jobs, self.min_free = jobs, min_free
         self.lock = threading.Lock()
         self.running = {}
@@ -438,7 +480,7 @@ class Compiler:
 
 
 # ---------------------------------------------------------------------------------------------------- PE / map checks
-def pe_fn_table_check(dll, mapfile, wanted):
+def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
     """read fn_table out of the linked DLL (address from the link map) and check that each wanted guest address is
     there and points at f_<addr>. Returns {addr: ok?}."""
     sym = {}
@@ -462,8 +504,8 @@ def pe_fn_table_check(dll, mapfile, wanted):
             if va <= rva < va + size:
                 return data[raw + rva - va: raw + rva - va + n]
         raise ValueError('rva %x not in the image' % rva)
-    tab = sym.get('fn_table') or sym.get('_fn_table')
-    cnt = sym.get('fn_table_count')
+    tab = sym.get(table_sym)
+    cnt = sym.get('fn_table_count' + table_sym[len('fn_table'):])
     n = struct.unpack('<i', at(cnt - image_base, 4))[0]
     res = {}
     lo, hi = 0, n - 1
@@ -487,6 +529,36 @@ def pe_fn_table_check(dll, mapfile, wanted):
 
 
 # ---------------------------------------------------------------------------------------------------- main
+ORDERING = [(re.compile(r'\blda(8|16|32|64)\('), r'rd\1('), (re.compile(r'\bstl(8|16|32|64)\('), r'wr\1('),
+            (re.compile(r'__atomic_(thread|signal)_fence\(__ATOMIC_\w+\);'), ';')]
+
+
+def ordering_drift(raw, base_eh, name, have_fl, rl):
+    """number of lines by which the current lifter's plain output differs from the base set's (before flags_local) when
+    every difference is the ordered-access lifting (ldar / stlr as lda / stl, dmb / isb as fences, which used to be plain
+    accesses and `;`), and the base set's flags_local file is the transform of its lifter output; else None"""
+    path = os.path.join(base_eh, name)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding='latin-1') as f:
+        old = f.read()
+    if rl.flags_local.transform(old) != have_fl:
+        return None
+    a, b = old.split('\n'), raw.split('\n')
+    if len(a) != len(b):
+        return None
+    n = 0
+    for x, y in zip(a, b):
+        if x == y:
+            continue
+        for pat, rep in ORDERING:
+            y = pat.sub(rep, y)
+        if x != y:
+            return None
+        n += 1
+    return n
+
+
 def write_if_changed(path, text):
     """keep the time stamp of an unchanged file (the compile step is incremental)"""
     if os.path.exists(path):
@@ -567,16 +639,29 @@ def main():
     opts = dict(a[2:].split('=', 1) if '=' in a else (a[2:], '1') for a in sys.argv[3:] if a.startswith('--'))
     site_file = os.path.abspath(sys.argv[2])
     tag = opts.get('tag', 'hdr')
-    base_gen = os.path.join(HERE, opts.get('base-gen', 'gen_fl'))
-    base_obj = os.path.join(HERE, opts.get('base-obj', 'obj_fl23'))
-    gen, obj = os.path.join(HERE, 'gen_' + tag), os.path.join(HERE, 'obj_' + tag)
-    dll = os.path.join(HERE, 'ssbu_game_%s.dll' % tag)
+    module = opts.get('module')
+    if module:                                    # a script module: gen_nro_fl23\<m> / obj_nro_fl23\<m> -> nro_bin_<tag>\<m>.dll
+        mname = module_info(module)[2]
+        base_gen = os.path.join(HERE, opts.get('base-gen', os.path.join('gen_nro_fl23', mname)))
+        base_eh = os.path.join(HERE, opts.get('base-eh', os.path.join('gen_nro_eh_o2', mname)))
+        base_obj = os.path.join(HERE, opts.get('base-obj', os.path.join('obj_nro_fl23', mname)))
+        gen, obj = os.path.join(HERE, 'gen_nro_' + tag, mname), os.path.join(HERE, 'obj_nro_' + tag, mname)
+        dll = os.path.join(HERE, 'nro_bin_' + tag, mname + '.dll')
+    else:
+        base_gen = os.path.join(HERE, opts.get('base-gen', 'gen_fl'))
+        base_eh = os.path.join(HERE, opts.get('base-eh', 'gen_eh_o2'))
+        base_obj = os.path.join(HERE, opts.get('base-obj', 'obj_fl23'))
+        gen, obj = os.path.join(HERE, 'gen_' + tag), os.path.join(HERE, 'obj_' + tag)
+        dll = os.path.join(HERE, 'ssbu_game_%s.dll' % tag)
     t0 = time.time()
-    rl = Relifter(base_gen)
+    rl = Relifter(base_gen, module)
     recomp = rl.recomp
-    sites = parse_sites(site_file, recomp)
-    log('site list %s: %d patches, %d inline, %d midhook, %d dynimm, %d jtable, %d noinline; function entries %d (%.0fs)'
-        % (site_file, len(sites.patch), len(sites.inline), len(sites.midhook), len(sites.dynimm), len(sites.jtable), len(sites.noinline), len(rl.env.starts), time.time() - t0))
+    sites = parse_sites(site_file, recomp, rl.module or 'main')
+    log('site list %s for %s: %d patches, %d inline, %d midhook, %d dynimm, %d jtable, %d noinline; function entries %d (%.0fs)'
+        % (site_file, rl.module or 'main', len(sites.patch), len(sites.inline), len(sites.midhook), len(sites.dynimm), len(sites.jtable),
+           len(sites.noinline), len(rl.env.starts), time.time() - t0))
+    if sites.other:
+        log('  lines for other modules / data, skipped: ' + ', '.join('%s %d' % kv for kv in sorted(sites.other.items())))
     plan, notes, refused, table = plan_sites(rl, sites)
     for n in notes:
         log('  note: ' + n)
@@ -598,7 +683,7 @@ def main():
     alone = sorted(a for b, s in noinline_by_bucket.items() if b not in code_buckets for a in s)
     if alone and 'no-prune' not in opts:
         import hook_inline_check
-        res = hook_inline_check.check(alone, base_gen, base_obj)
+        res = hook_inline_check.check(alone, base_gen, base_obj, base=recomp.BASE)
         # a file is kept only if ALL its noinline entries pass; a file compiled again gets the attribute on all of them
         # (its new code could inline one that the base object does not)
         keep_b = set(rl.bucket_of(a) for a in alone) - set(rl.bucket_of(a) for a in alone if res[a]['verdict'] != 'OK')
@@ -645,13 +730,28 @@ def main():
     for b in buckets:
         name = 'c_%04x.c' % b
         plain_entries = [e for e in by_bucket[b] if e in base_entries]
-        plain = rl.flags_local.transform(rl.bucket_text(b, plain_entries, None, None))
+        raw = rl.bucket_text(b, plain_entries, None, None)
+        plain = rl.flags_local.transform(raw)
         with open(os.path.join(base_gen, name), encoding='latin-1') as f:
             have = f.read()
         if plain != have:
-            log('  %s: the re-lift WITHOUT sites differs from %s: NOT the same lifter / function list, stop' % (name, base_gen))
-            bad += 1
-            continue
+            n_drift = ordering_drift(raw, base_eh, name, have, rl) if 'allow-ordering-drift' in opts else None
+            if n_drift is None:
+                log('  %s: the re-lift WITHOUT sites differs from %s: NOT the same lifter / function list, stop%s' % (
+                    name, base_gen, '' if 'allow-ordering-drift' in opts else ' (--allow-ordering-drift: accept a base set lifted before the ordered-access lifting)'))
+                bad += 1
+                continue
+            line = ('  %s: the base set predates the ordered-access lifting (recomp fb716c2 / recomp_nro 9d8a735): %d line(s) differ only by '
+                    'lda/stl/fences; this file is compiled from the current lifter' % (name, n_drift))
+            log(line)
+            report.append(line)
+            raw = None
+        if raw is not None and os.path.exists(os.path.join(base_eh, name)):     # and before the flags transform, the lifter's own output
+            with open(os.path.join(base_eh, name), encoding='latin-1') as f:
+                if f.read() != raw:
+                    log('  %s: the re-lift WITHOUT sites differs from %s (before flags_local), stop' % (name, base_eh))
+                    bad += 1
+                    continue
         recomp.PATCHES = patches
         text = rl.flags_local.transform(rl.bucket_text(b, by_bucket[b], plan, noinline_by_bucket.get(b)))
         recomp.PATCHES = {}
@@ -670,6 +770,26 @@ def main():
             recomp.PATCHES = {}
             exp_added -= sum(1 + len(plan[a][0]) + (1 if e == a and plan[a][2] else 0) for ee, a in pairs[b] if ee == e)
             exp_removed -= sum(1 for ee, a in pairs[b] if ee == e)
+        # a patch can change the shape of a lifted copy: a new `br` adds `uint64_t jt` and the L_dispatch switch (a line
+        # per instruction + 2), a new / removed terminator at the end changes the fall-through line
+        for e in sorted(set(e for e, _ in pairs[b]) - set(newb)):
+            p0 = rl.lift_entry(e, None)
+            recomp.PATCHES = patches
+            p1 = rl.lift_entry(e, None)
+            recomp.PATCHES = {}
+            n_ins = sum(1 for l in p0.split('\n') if l.startswith('L_') and not l.startswith('L_dispatch'))
+            j0, j1 = '  uint64_t jt = 0;' in p0, '  uint64_t jt = 0;' in p1
+            if j1 and not j0:
+                exp_added += n_ins + 3
+            elif j0 and not j1:
+                exp_removed += n_ins + 3
+            def tail(x):                                             # the line behind the last instruction
+                ls = x.split('\n')
+                end = next(i for i, l in enumerate(ls) if l == '}' or l.startswith('L_dispatch:'))
+                return ls[end - 1]
+            if tail(p0) != tail(p1):
+                exp_added += 1
+                exp_removed += 1
         ok = removed == exp_removed and added == exp_added
         desc = collections.Counter()
         for a in sorted(set(a for _, a in pairs[b])):
@@ -705,14 +825,16 @@ def main():
     funcs_h = rl.funcs_h + '/* relift_sites.py */\nvoid sky_site_inline(Ctx *c, uint64_t addr);\nint sky_site_midhook(Ctx *c, uint64_t addr);\n' + decl
     write_if_changed(os.path.join(gen, 'funcs.h'), funcs_h)
     table_c = open(os.path.join(base_gen, 'table.c')).read()
-    start = table_c.index('const FnEntry fn_table[] = {\n') + len('const FnEntry fn_table[] = {\n')
-    stop = table_c.index('};\nconst int fn_table_count = ')
+    ts = rl.table_sym                                                    # fn_table (main) / fn_table_<module>
+    start = table_c.index('const FnEntry %s[] = {\n' % ts) + len('const FnEntry %s[] = {\n' % ts)
+    cname = 'fn_table_count' + ts[len('fn_table'):]
+    stop = table_c.index('};\nconst int %s = ' % cname, start)
     rows = table_c[start:stop].split('\n')[:-1]
     allf = sorted(rl.func_set)
     assert len(rows) == len(rl.all_funcs)
     rows = ['  { 0x%xULL, f_%x },' % (a, a) for a in allf]
-    m = re.search(r'const int fn_table_count = (\d+);', table_c)
-    table_c = table_c[:start] + '\n'.join(rows) + '\n' + table_c[stop:].replace(m.group(0), 'const int fn_table_count = %d;' % len(allf), 1)
+    m = re.search(r'const int %s = (\d+);' % cname, table_c)
+    table_c = table_c[:start] + '\n'.join(rows) + '\n' + table_c[stop:].replace(m.group(0), 'const int %s = %d;' % (cname, len(allf)), 1)
     write_if_changed(os.path.join(gen, 'table.c'), table_c)
     hs = ('/* generated by relift_sites.py from %s -- the sites compiled into this DLL (the vanilla DLL has no such export)\n'
           ' * kind: 1 patch (word = the instruction word compiled in), 2 inline callout, 3 midhook callout + entry,\n'
@@ -724,10 +846,10 @@ def main():
     hs += '};\n__declspec(dllexport) const int hdr_site_count = %d;\n' % len(table)
     write_if_changed(os.path.join(gen, 'hdr_sites.c'), hs)
     keep = set(names)                                                   # files of an earlier site list that this one does not touch
-    stale = [n for n in os.listdir(gen) if re.match(r'^c_[0-9a-f]+\.c$', n) and n not in keep]
-    stale += [os.path.join('..', os.path.basename(obj), n) for n in os.listdir(obj) if re.match(r'^c_[0-9a-f]+\.(obj|optnone\.h)$', n) and n.split('.')[0] + '.c' not in keep]
+    stale = [os.path.join(gen, n) for n in os.listdir(gen) if re.match(r'^c_[0-9a-f]+\.c$', n) and n not in keep]
+    stale += [os.path.join(obj, n) for n in os.listdir(obj) if re.match(r'^c_[0-9a-f]+\.(obj|optnone\.h)$', n) and n.split('.')[0] + '.c' not in keep]
     for n in stale:
-        os.remove(os.path.join(gen, n))
+        os.remove(n)
     if stale:
         log('  removed %d file(s) of an earlier site list' % len(stale))
     t_lift = time.time() - t0
@@ -736,7 +858,7 @@ def main():
         return 0
 
     # ---- compile
-    comp = Compiler(base_obj, gen, obj, int(opts.get('jobs', '2')), float(opts.get('min-free-gb', '5')))
+    comp = Compiler(base_obj, gen, obj, int(opts.get('jobs', '2')), float(opts.get('min-free-gb', '5')), rl.module)
     todo = []
     for name in names + ['table.c']:
         s, o = os.path.join(gen, name), os.path.join(obj, name[:-2] + '.obj')
@@ -764,12 +886,27 @@ def main():
     mine = set(n[:-2] + '.obj' for n in names) | {'table.obj'}       # only this site list's files (not those of an earlier list)
     base = sorted(n for n in os.listdir(base_obj) if n.endswith('.obj'))
     objs = [os.path.join(obj if n in mine else base_obj, n) for n in base]
+    mapfile = dll[:-4] + '.map'
+    if rl.module:
+        # a module DLL: its own shim (nro_shim.c with the site callouts, -DNRO_MODULE) and the site table as objects
+        os.makedirs(os.path.dirname(dll), exist_ok=True)
+        flags = ['-c', comp.opt] + comp.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen]
+        for src, o, extra in ((os.path.join(HERE, 'nro_shim.c'), os.path.join(obj, '_shim.obj'), ['-DNRO_MODULE=' + rl.module]),
+                              (os.path.join(gen, 'hdr_sites.c'), os.path.join(obj, '_hdr_sites.obj'), [])):
+            r = subprocess.run([comp.clang] + flags + extra + [src, '-o', o], capture_output=True, text=True)
+            if r.returncode:
+                log('could not compile %s:\n%s' % (src, (r.stdout + r.stderr)[-2000:]))
+                return 1
+        objs = [os.path.join(obj, '_shim.obj') if n == '_shim.obj' else o for n, o in zip(base, objs)] + [os.path.join(obj, '_hdr_sites.obj')]
+        mine |= {'_shim.obj'}
+        cmd_head, cmd_tail = [comp.clang, '-shared'], []
+    else:
+        shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
+        cmd_head, cmd_tail = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, shim, os.path.join(gen, 'hdr_sites.c')], []
     rsp = dll + '.rsp'
     with open(rsp, 'w') as f:
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-    shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
-    mapfile = dll[:-4] + '.map'
-    cmd = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, shim, os.path.join(gen, 'hdr_sites.c'), '@' + rsp, '-o', dll, '-Wl,/MAP:' + mapfile]
+    cmd = cmd_head + ['@' + rsp, '-o', dll, '-Wl,/MAP:' + mapfile] + cmd_tail
     r = subprocess.run(cmd, capture_output=True, text=True)
     t_link = time.time() - t2
     log((r.stdout + r.stderr)[-3000:])
@@ -777,7 +914,11 @@ def main():
                                                                      os.path.getsize(dll) / 2.0 ** 20 if os.path.exists(dll) else 0, t_link))
     if r.returncode:
         return r.returncode
-    n, res = pe_fn_table_check(dll, mapfile, new)
+    if rl.module:
+        for ext in ('.lib', '.exp'):                                    # nothing links against a module DLL (build_nro.py)
+            if os.path.exists(dll[:-4] + ext):
+                os.remove(dll[:-4] + ext)
+    n, res = pe_fn_table_check(dll, mapfile, new, rl.table_sym)
     line = 'fn_table of %s: %d entries (base %d); new entries %s' % (os.path.basename(dll), n, len(rl.all_funcs),
                                                                   ', '.join('%x %s' % (a, 'present' if ok else 'MISSING') for a, ok in sorted(res.items())) or 'none')
     log(line)
