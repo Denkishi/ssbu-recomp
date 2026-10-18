@@ -474,6 +474,32 @@ static int publish_exports(NroModule *m, int on) {
     return n;
 }
 
+/* The SDK's LoadModule ends with BindVariables of every other loaded module against the new one: imports that nothing
+ * provided when those modules were loaded get their address now (a plugin loaded at boot imports lua2cpp_common's
+ * functions, which load with the first fight). Under g_ro_lock. Returns the number of symbols bound. */
+static int rebind_others(NroModule *nm) {
+    int n = 0;
+    for (int i = 0; i < g_mod_count; i++) {
+        NroModule *m = &g_mods[i];
+        if (m == nm || !m->loaded || !m->bind_addr) continue;
+        for (int k = 1; k < m->sym_count; k++) {
+            if (m->bind_addr[k] || m->syms[k].defined || !m->syms[k].name[0]) continue;
+            const Export *e = exp_find(m->syms[k].name);
+            if (!e || e->mod != nm) continue;
+            m->bind_addr[k] = e->value;
+            m->bind_fn[k] = function_at(e->value);
+            if (m->got && m->got[k]) {
+                DWORD old, o2;
+                BOOL p = VirtualProtect((void *)(uintptr_t)m->got[k], 8, PAGE_READWRITE, &old);
+                wr64(m->got[k], e->value);
+                if (p) VirtualProtect((void *)(uintptr_t)m->got[k], 8, old, &o2);
+            }
+            n++;
+        }
+    }
+    return n;
+}
+
 static NroModule *module_of_image(uint64_t nro) {
     for (int i = 0; i < g_mod_count; i++)
         if (memcmp(g_mods[i].info->build_id, (const void *)(uintptr_t)(nro + 0x40), 20) == 0) return &g_mods[i];
@@ -665,6 +691,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
     bind_symbols(m, &unresolved);
     for (int i = 1; i < m->sym_count; i++)
         if (m->syms[i].defined && m->syms[i].name[0]) exp_add(m->syms[i].name, m, in->base + m->syms[i].value);
+    int rebound = rebind_others(m);
     uint64_t obj = mh + (int32_t)rd32(mh + 0x18);       /* the loader's RoModule object inside the image */
     wr64(obj, obj); wr64(obj + 8, obj);
     wr64(obj + 0x20, in->base);
@@ -690,6 +717,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
              !eh ? " (NO unwind tables)" : m->resume ? "" : " (DLL built without resume entries: exceptions cannot be caught in it)", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
     printf("%s\n", line);
     trace_printf("%s\n", line);
+    if (rebound) printf("nn::ro::LoadModule: %d imports of other modules bound to %s\n", rebound, in->name);
     wr64(out, obj); wr32(out + 8, 1); wr64(out + 0x10, nro); wr64(out + 0x18, bss);
     fighter_attach(m);                           /* S1: fighters_bin\<name>.dll, if this module has C++ source */
     hook_module_loaded(m);                       /* S3: hooks that were waiting for a name this module exports (fighter_sdk\hook_host.c) */
