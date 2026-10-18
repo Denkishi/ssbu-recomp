@@ -909,7 +909,7 @@ class Env:
             elif (w & 0x9f000000) == 0x10000000:                     # adr
                 imm = sext((((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3), 21)
                 target = i * 4 + imm
-                if 0 <= target < TEXT_SIZE and target % 4 == 0:
+                if 0 <= target < TEXT_SIZE and target % 4 == 0 and not is_jump_table_adr(text, i):
                     starts.add(BASE + target)
         # functions other modules call by name: exported FUNC symbols
         for i in range(NSYM):
@@ -936,6 +936,22 @@ class Env:
         import bisect
         i = bisect.bisect_right(self.starts, entry)
         return self.starts[i] if i < len(self.starts) else BASE + TEXT_SIZE
+
+
+def is_jump_table_adr(text, i):
+    """True if the adr at word index i of text is the base of a jump-table dispatch (newer LLVM, e.g. the Rust plugins):
+        adr xB, Lbase ... add xD, xB, xE, lsl #2 (or xE extended, amount 2) ... br xD
+    Lbase is the lowest target of the table, a block of the function that holds the br, not a function entry. Not
+    splitting there keeps every target inside that function, where the br's L_dispatch switch finds it. The game and
+    its modules never use this form, so their lift is unchanged."""
+    rb = struct.unpack_from('<I', text, i * 4)[0] & 31
+    n = len(text) // 4
+    for k in range(i + 1, min(i + 9, n)):
+        x = struct.unpack_from('<I', text, k * 4)[0]
+        if ((x & 0xffe0fc00) == 0x8b000800 or (x & 0xffe01c00) == 0x8b200800) and (x >> 5) & 31 == rb:
+            br = 0xd61f0000 | ((x & 31) << 5)
+            return any(struct.unpack_from('<I', text, j * 4)[0] == br for j in range(k + 1, min(k + 9, n)))
+    return False
 
 
 def mangle(name):
