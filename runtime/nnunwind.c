@@ -223,6 +223,48 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     }
 }
 
+/* ---------------------------------------------------------------- smashline's ACMD interpreter (skyline.c)
+ * smashline (a Skyline plugin) runs every ACMD script through an asm stub, __smashline_interpreter, that records
+ * (landing pad, sp) for the current fiber and calls the script, often Rust code without unwind tables. On the console it
+ * hooks libunwind's step: while that record exists, the first frame stepped gets the stub's landing pad and a personality
+ * that says "handler here", so a script ended by L2CExceptionShutdown resumes in the stub, which takes its saved sp back
+ * and returns normally to the game. Here: when the stub is on the throwing stack (its call's return address in a frame
+ * record, or failing that in a stack slot), raise() enters the landing pad's resume entry; the stub then returns, and the
+ * host stack is cut back to the record unwind_interp_call() made at the stub's entry (installed with the hook table). */
+static uint64_t g_interp_ret, g_interp_lp;
+static volatile LONG g_interp_landings;
+void unwind_set_interpreter(uint64_t ret_addr, uint64_t resume_lp) { g_interp_ret = ret_addr; g_interp_lp = resume_lp; }
+void unwind_interp_call(Ctx *c, void (*orig)(Ctx *)) {
+    Ctx *volatile cc = c;
+    jmp_buf jb;
+    volatile uint64_t cfa = c->x[31];
+    const char *volatile in_import = c->in_import;
+    volatile uint64_t import_from = c->import_from;
+    catch_put(cfa, &jb);
+    if (setjmp(jb) == 0) {
+        orig(c);
+        catch_take(cfa, &jb);
+    } else {
+        cc->in_import = in_import;
+        cc->import_from = import_from;
+    }
+}
+static int interp_on_stack(Ctx *c) {
+    MEMORY_BASIC_INFORMATION mi;
+    uint64_t sp = c->x[31];
+    if (!VirtualQuery((void *)(uintptr_t)sp, &mi, sizeof mi)) return 0;
+    uint64_t top = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+    if (top - sp > 0x200000) top = sp + 0x200000;
+    for (uint64_t fp = c->x[29], n = 0; fp >= sp && fp + 16 <= top && !(fp & 7) && n < 4096; n++) {      /* frame records */
+        if (rd64(fp + 8) == g_interp_ret) return 1;
+        uint64_t next = rd64(fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    for (uint64_t a = sp & ~7ull; a + 8 <= top; a += 8) if (rd64(a) == g_interp_ret) return 1;      /* a frame without a record */
+    return 0;
+}
+
 /* ---------------------------------------------------------------- the unwinder (eh_runtime.h: EhRaiseFn) */
 static void (*resume_entry(uint64_t lp, const char **name))(Ctx *, uint64_t) {
     uint64_t base, size; const NroResume *tab = NULL; int count = 0;
@@ -268,6 +310,25 @@ static void eh_raise(Ctx *c, int reason) {
     uint64_t cfa = 0;
     const char *stop = "frame limit";
     const char *owner = "?";
+    if (g_interp_ret && interp_on_stack(c)) {            /* smashline: the interpreter stub catches it (see above) */
+        void (*fn)(Ctx *, uint64_t) = resume_entry(g_interp_lp, &owner);
+        if (fn) {
+            EhPad ip;
+            memset(&ip, 0, sizeof ip);
+            ip.kind = EH_HANDLER; ip.landing_pad = g_interp_lp; ip.exception = exc;
+            if (InterlockedIncrement(&g_interp_landings) <= 3 || g_log)
+                printf("unwind: %s thrown at 0x%llx: smashline's interpreter stub takes it (landing pad %llx)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)g_interp_lp);
+            eh_enter_pad(c, &ip);
+            c->in_import = NULL;
+            fn(c, g_interp_lp);                           /* the stub's landing code: its saved sp back, then it returns */
+            jmp_buf *jb = catch_take(c->x[31], NULL);
+            if (!jb) {
+                printf("\nunwind: smashline's interpreter stub returned to sp %llx, where no entry record is\n", (unsigned long long)c->x[31]);
+                eh_terminate(c, "no host frame to return to");
+            }
+            longjmp(*jb, 1);
+        }
+    }
     if (reason == EH_RAISE_THROW) {                       /* phase 1: is there a handler at all? (the console terminates without unwinding if not) */
         LONG seq = InterlockedIncrement(&g_throws);
         int found = 0, depth = 0;
@@ -324,6 +385,7 @@ static void eh_raise(Ctx *c, int reason) {
 
 void unwind_report(FILE *out) {
     if (g_throws) fprintf(out, "unwind: %ld exceptions thrown, %ld clean-up pads run, %ld skipped\n", (long)g_throws, (long)g_cleanups, (long)g_skipped);
+    if (g_interp_landings) fprintf(out, "unwind: %ld taken by smashline's interpreter stub\n", (long)g_interp_landings);
 }
 
 void register_unwind_imports(void) {
