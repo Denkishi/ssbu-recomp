@@ -81,7 +81,7 @@ def build_one(name, nro, base, jobs, relift):
     t = {}
     # 1+2. lift
     t0 = time.time()
-    env = dict(os.environ, RECOMP_NRO_MODULE=name)
+    env = dict(os.environ, RECOMP_NRO_MODULE=name, RECOMP_NRO=os.path.abspath(nro), RECOMP_NRO_BASE='%#x' % base)
     for key, suffix in (('RECOMP_PATCHES', '.txt'), ('RECOMP_EXTRA_RESUME', '.resume.txt')):
         p = os.path.join(HERE, 'plugin_patches', name + suffix)
         if os.path.exists(p):

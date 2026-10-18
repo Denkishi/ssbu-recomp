@@ -65,7 +65,7 @@ def _offset_list(env_name):
 #     <module offset> <original word> <new word>    # note        (hex)
 # The original word is checked against the NRO. No variable, a missing or an empty file: no patches.
 PATCHES = {}
-for _t in _offset_list('RECOMP_PATCHES'):
+for _t in (_offset_list('RECOMP_PATCHES') if IMG else []):
     _off, _old, _new = int(_t[0], 16), int(_t[1], 16), int(_t[2], 16)
     _have = struct.unpack_from('<I', IMG, FILE_OFF + _off)[0]
     if _have != _old:
