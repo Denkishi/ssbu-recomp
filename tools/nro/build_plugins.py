@@ -1,0 +1,205 @@
+"""Lift the Skyline plugins of an SD card layout into DLLs for the runtime (runtime/skyline.c).
+
+    python build_plugins.py [--sd <folder>] [--jobs N] [--only name,...] [--relift]
+
+Run in build/work/ro_study (scripts/setup.py --only stage puts it there). For every plugin NRO (plugin_map.find_plugins):
+  1 name and stable guest base: plugin_map.py, plugin_map.json in build/work/plugin_bin (bases from 0x7280000000)
+  2 lift: recomp_nro.py full, with RECOMP_NRO_MODULE=<name>, RECOMP_PATCHES=plugin_patches/<name>.txt and
+    RECOMP_EXTRA_RESUME=plugin_patches/<name>.resume.txt when they exist -> build/work/gen_plugin/<name>
+  3 flags in locals: flags_local.py transform -> build/work/gen_plugin_fl23/<name>
+  4 compile: clang 23 -O2 -march=znver2 with build_opt.py's fallback ladder (long functions unoptimised, time limit)
+    -> build/work/obj_plugin_fl23/<name>; nro_shim.c with -DNRO_MODULE=<name>
+  5 link: build/work/plugin_bin/<name>.dll
+Then plugin_bin/plugins.txt (one line per plugin: name base image_size file_size build_id source) and
+plugin_bin/<name>.exports.txt.
+
+Compiles take the shared lock C:\\tmp\\ssbu\\heavy.lock (other builds on this 16 GB machine wait for it) and run at most
+--jobs (default 4) clang processes at a time.
+"""
+import argparse
+import concurrent.futures
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))          # build/work/ro_study
+WORK = os.path.dirname(HERE)                              # build/work
+sys.path.insert(0, HERE)
+sys.path.insert(0, WORK)
+import plugin_map  # noqa: E402
+
+CLANG = os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')
+LOCK = r'C:\tmp\ssbu\heavy.lock'
+OPT_FLAGS = ['-O2', '-ffp-contract=off', '-march=znver2']
+
+
+def take_lock(what):
+    while True:
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, ('%s %s\n' % (what, time.strftime('%Y-%m-%d %H:%M:%S'))).encode())
+            os.close(fd)
+            return
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(LOCK) > 3 * 3600:
+                    os.remove(LOCK)
+                    continue
+                holder = open(LOCK).read().strip()
+            except OSError:
+                holder = '?'
+            print('waiting for %s (%s)' % (LOCK, holder), flush=True)
+            time.sleep(30)
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def compile_one(job):
+    """job = (src, obj, flags). Uses build_opt's ladder: long functions optnone, bounded time."""
+    src, obj, flags = job
+    import build_opt
+    build_opt.CLANG = CLANG
+    build_opt.OPT = OPT_FLAGS[0]
+    build_opt.EXTRA = OPT_FLAGS[1:]
+    code, out, secs, note = build_opt.compile_file(src, obj, flags)
+    return os.path.basename(src), code, out, secs, note
+
+
+def build_one(name, nro, base, jobs, relift):
+    gen = os.path.join(WORK, 'gen_plugin', name)
+    genfl = os.path.join(WORK, 'gen_plugin_fl23', name)
+    obj = os.path.join(WORK, 'obj_plugin_fl23', name)
+    bindir = os.path.join(WORK, 'plugin_bin')
+    for d in (gen, genfl, obj, bindir):
+        os.makedirs(d, exist_ok=True)
+    t = {}
+    # 1+2. lift
+    t0 = time.time()
+    env = dict(os.environ, RECOMP_NRO_MODULE=name)
+    for key, suffix in (('RECOMP_PATCHES', '.txt'), ('RECOMP_EXTRA_RESUME', '.resume.txt')):
+        p = os.path.join(HERE, 'plugin_patches', name + suffix)
+        if os.path.exists(p):
+            env[key] = p
+        else:
+            env.pop(key, None)
+    stamp = os.path.join(gen, 'table.c')
+    deps = [nro, os.path.join(HERE, 'recomp_nro.py')] + [env[k] for k in ('RECOMP_PATCHES', 'RECOMP_EXTRA_RESUME') if k in env]
+    if relift or not os.path.exists(stamp) or os.path.getmtime(stamp) < max(os.path.getmtime(p) for p in deps):
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'recomp_nro.py'), 'full', nro, gen, str(max(1, min(jobs, 8))), '%#x' % base],
+                           capture_output=True, text=True, env=env, cwd=HERE)
+        tail = [l for l in r.stdout.splitlines() if l.startswith('functions:')]
+        if r.returncode or not tail:
+            print('%s: LIFT FAILED\n%s\n%s' % (name, r.stdout[-3000:], r.stderr[-3000:]))
+            return None
+        print('%s: lifted  %s' % (name, tail[-1]), flush=True)
+        # 3. flags in locals (the transform rewrites only files whose result changed)
+        r = subprocess.run([sys.executable, os.path.join(WORK, 'flags_local.py'), gen, genfl], capture_output=True, text=True, cwd=WORK)
+        if r.returncode:
+            print('%s: flags_local FAILED\n%s\n%s' % (name, r.stdout[-3000:], r.stderr[-3000:]))
+            return None
+    t['lift'] = time.time() - t0
+    # 4. compile what changed
+    t0 = time.time()
+    sources = sorted(n for n in os.listdir(genfl) if n.endswith('.c'))
+    flags = ['-w', '-fno-strict-aliasing', '-I', WORK, '-I', genfl]
+    headers = [os.path.join(WORK, h) for h in ('runtime.h', 'neon.h', 'flags_local.h', 'fpexact.h') if os.path.exists(os.path.join(WORK, h))]
+    newest_header = max(os.path.getmtime(h) for h in headers)
+    todo = []
+    for n in sources:
+        src, o = os.path.join(genfl, n), os.path.join(obj, n[:-2] + '.obj')
+        if not os.path.exists(o) or os.path.getmtime(o) < max(os.path.getmtime(src), newest_header):
+            todo.append((src, o, flags))
+    shim, shim_obj = os.path.join(WORK, 'nro_shim.c'), os.path.join(obj, '_shim.obj')
+    if not os.path.exists(shim_obj) or os.path.getmtime(shim_obj) < max(os.path.getmtime(shim), newest_header):
+        todo.append((shim, shim_obj, flags + ['-DNRO_MODULE=' + name]))
+    wanted = set(n[:-2] + '.obj' for n in sources) | {'_shim.obj'}
+    for n in os.listdir(obj):
+        if n.endswith('.obj') and n not in wanted:
+            os.remove(os.path.join(obj, n))
+    failed = 0
+    if todo:
+        take_lock('build_plugins %s' % name)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+                for label, code, out, secs, note in pool.map(compile_one, todo):
+                    if code:
+                        failed += 1
+                        print('FAILED %s %s\n%s' % (name, label, out), flush=True)
+                    elif note or secs > 60:
+                        print('  %s %s: %.0fs %s' % (name, label, secs, note), flush=True)
+        finally:
+            drop_lock()
+    if failed:
+        return None
+    t['compile'] = time.time() - t0
+    # 5. link
+    t0 = time.time()
+    dll = os.path.join(bindir, name + '.dll')
+    objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
+    if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
+        rsp = os.path.join(obj, 'link.rsp')
+        with open(rsp, 'w') as f:
+            f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
+        r = subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True)
+        if r.returncode:
+            print((r.stdout + r.stderr)[-4000:])
+            print('could not link %s (is a game exe still running and holding it open?)' % dll)
+            return None
+        for ext in ('.lib', '.exp'):
+            p = dll[:-4] + ext
+            if os.path.exists(p):
+                os.remove(p)
+    t['link'] = time.time() - t0
+    print('%s: %d C files, %d compiled, %s %.1f MB   lift %.0fs  compile %.0fs  link %.0fs' % (
+        name, len(sources), len(todo), os.path.basename(dll), os.path.getsize(dll) / 1048576.0, t['lift'], t['compile'], t['link']), flush=True)
+    return dll
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--sd', default=os.environ.get('SSBU_SD', r'C:\Games\ssbu\sd'))
+    ap.add_argument('--jobs', type=int, default=4)
+    ap.add_argument('--only', default='')
+    ap.add_argument('--relift', action='store_true')
+    a = ap.parse_args()
+    bindir = os.path.join(WORK, 'plugin_bin')
+    os.makedirs(bindir, exist_ok=True)
+    map_path = os.path.join(bindir, 'plugin_map.json')
+    m = plugin_map.load_map(map_path)
+    plugins = []
+    for path in plugin_map.find_plugins(a.sd):
+        name = plugin_map.module_name(path)
+        image_size, _, _ = plugin_map.sizes(path)
+        note = plugin_map.assign(m, name, image_size, path)
+        if note:
+            print(note)
+        plugins.append((name, path))
+    plugin_map.save_map(map_path, m)
+    only = set(x for x in a.only.split(',') if x)
+    ok = []
+    for name, path in plugins:
+        if only and name not in only:
+            ok.append((name, path))
+            continue
+        if build_one(name, path, int(m[name]['base'], 16), a.jobs, a.relift):
+            ok.append((name, path))
+            with open(os.path.join(bindir, name + '.exports.txt'), 'w') as f:
+                for off, kind, size, sym in plugin_map.exports(path):
+                    f.write('%#010x %-7s %#8x %s\n' % (off, kind, size, sym))
+    with open(os.path.join(bindir, 'plugins.txt'), 'w') as f:
+        f.write('# name base image_size file_size build_id source   (build_plugins.py; read by runtime/skyline.c)\n')
+        for name, path in ok:
+            if os.path.exists(os.path.join(bindir, name + '.dll')):
+                f.write(plugin_map.registry_line(name, int(m[name]['base'], 16), path) + '\n')
+    print('plugins.txt: %d plugins' % len(ok))
+    return 0 if len(ok) == len(plugins) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

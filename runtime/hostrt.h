@@ -16,6 +16,9 @@ typedef struct { const char *name; ImportFn fn; } ImportDef;
 #define HOSTFN_BASE 0x7400000000ULL      /* placeholder addresses for host functions handed out at run time */
 
 uint64_t hostfn_address(const char *name, ImportFn fn);
+uint64_t hostfn_closure(const char *name, void (*fn)(Ctx *, void *), void *user);   /* a new guest-callable address that calls fn(c, user) */
+ImportFn extra_import_lookup(const char *name);
+int hostentry_hook(uint64_t addr, void (*fn)(Ctx *, void *), void *user, uint64_t *orig);   /* hook an import placeholder / host function */  /* handler registered for a name main does not import (plugins), or NULL */
 const char *hostfn_current_name(void);
 unsigned long long hostfn_current_calls(void);
 void print_hostfn_summary(FILE *out);

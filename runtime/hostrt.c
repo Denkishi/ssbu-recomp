@@ -86,8 +86,8 @@ uint64_t guest_function_of(uint64_t rip) {
 /* ---------------------------------------------------------------- host functions handed to the guest
  * Function pointers the guest obtains at run time (for example through nvnBootstrapLoader) are
  * placeholder addresses in their own range; calling one runs the registered host handler. */
-typedef struct { char name[72]; ImportFn fn; volatile LONG64 calls; LONG64 first; } HostFn;
-#define MAX_HOSTFN 4096
+typedef struct { char name[72]; ImportFn fn; volatile LONG64 calls; LONG64 first; void (*fnu)(Ctx *, void *); void *user; } HostFn;
+#define MAX_HOSTFN 16384
 static HostFn g_hostfn[MAX_HOSTFN];
 static volatile LONG g_hostfn_count;
 static volatile LONG64 g_hostfn_seq;
@@ -110,6 +110,20 @@ uint64_t hostfn_address(const char *name, ImportFn fn) {
     }
     ReleaseSRWLockExclusive(&g_hostfn_lock);
     if (fresh) audit_hostfn(name, fn);
+    return HOSTFN_BASE + (uint64_t)i * 16;
+}
+/* A host function with a user word (skyline.c: the `orig` trampolines and inline-hook callbacks handed to plugins): every call
+ * makes a new entry, names need not be unique. */
+uint64_t hostfn_closure(const char *name, void (*fn)(Ctx *, void *), void *user) {
+    AcquireSRWLockExclusive(&g_hostfn_lock);
+    int i = g_hostfn_count;
+    if (i < MAX_HOSTFN) {
+        strncpy(g_hostfn[i].name, name, sizeof g_hostfn[i].name - 1);
+        g_hostfn[i].fnu = fn; g_hostfn[i].user = user;
+        g_hostfn_count = i + 1;
+    }
+    ReleaseSRWLockExclusive(&g_hostfn_lock);
+    if (i >= MAX_HOSTFN) guest_trap("hostfn_closure: table full", 0);
     return HOSTFN_BASE + (uint64_t)i * 16;
 }
 const char *hostfn_current_name(void) { return g_hostfn[t_hostfn].name; }
@@ -214,7 +228,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
         uint64_t saved_from = c->import_from;
         c->in_import = g_hostfn[i].name;             /* so thread dumps can name the host function */
         c->import_from = c->x[30] - 4;
-        g_hostfn[i].fn(c);
+        if (g_hostfn[i].fnu) g_hostfn[i].fnu(c, g_hostfn[i].user); else g_hostfn[i].fn(c);
         c->in_import = saved_name;
         c->import_from = saved_from;
         return;
@@ -251,14 +265,86 @@ static void dump_guest_registers(void) {
 }
 
 /* ---------------------------------------------------------------- imports */
+/* Handlers for names main does not import: kept for the plugins (nnro.c resolve), which import SDK functions the game
+ * itself never calls (pthread_*, nn::web, nn::ro::LookupSymbol ...). Later registrations replace earlier ones, as for main. */
+#define EXTRA_CAP 4096u
+static struct { const char *name; ImportFn fn; } g_extra[EXTRA_CAP];
+static unsigned extra_hash(const char *s) { unsigned h = 2166136261u; while (*s) h = (h ^ (unsigned char)*s++) * 16777619u; return h; }
+static void extra_add(const char *name, ImportFn fn) {
+    unsigned i = extra_hash(name) & (EXTRA_CAP - 1);
+    while (g_extra[i].name && strcmp(g_extra[i].name, name) != 0) i = (i + 1) & (EXTRA_CAP - 1);
+    g_extra[i].name = name; g_extra[i].fn = fn;
+}
+ImportFn extra_import_lookup(const char *name) {
+    for (unsigned i = extra_hash(name) & (EXTRA_CAP - 1); g_extra[i].name; i = (i + 1) & (EXTRA_CAP - 1))
+        if (strcmp(g_extra[i].name, name) == 0) return g_extra[i].fn;
+    return NULL;
+}
 void register_imports(const ImportDef *defs, int count) {
     for (int d = 0; d < count; d++) {
         int found = 0;
         for (int i = 0; i < dyn_sym_count; i++) {
             if (!dyn_syms[i].defined && strcmp(dyn_syms[i].name, defs[d].name) == 0) { g_handlers[i] = defs[d].fn; found = 1; }
         }
-        (void)found;
+        if (!found) extra_add(defs[d].name, defs[d].fn);
     }
+}
+
+/* Function hooks on host entries (skyline.c A64HookFunction on an address that is not lifted code): an import placeholder of
+ * main (0x73..., e.g. nn::ro::LoadModule, which the game and the plugins both call) or a host function handed out at run time
+ * (0x74..., e.g. nn::ro::LoadModuleInternal, which only plugins import). The new handler is fn(c, user); *orig receives a
+ * guest-callable address that runs what the entry ran before. Returns 0 if `addr` is neither. */
+#define IMPHK_N 64
+static struct { void (*fn)(Ctx *, void *); void *user; } g_imphk[IMPHK_N];
+static volatile LONG g_imphk_n;
+#define IMPHK(k) static void imphk_##k(Ctx *c) { g_imphk[k].fn(c, g_imphk[k].user); }
+IMPHK(0) IMPHK(1) IMPHK(2) IMPHK(3) IMPHK(4) IMPHK(5) IMPHK(6) IMPHK(7)
+IMPHK(8) IMPHK(9) IMPHK(10) IMPHK(11) IMPHK(12) IMPHK(13) IMPHK(14) IMPHK(15)
+IMPHK(16) IMPHK(17) IMPHK(18) IMPHK(19) IMPHK(20) IMPHK(21) IMPHK(22) IMPHK(23)
+IMPHK(24) IMPHK(25) IMPHK(26) IMPHK(27) IMPHK(28) IMPHK(29) IMPHK(30) IMPHK(31)
+IMPHK(32) IMPHK(33) IMPHK(34) IMPHK(35) IMPHK(36) IMPHK(37) IMPHK(38) IMPHK(39)
+IMPHK(40) IMPHK(41) IMPHK(42) IMPHK(43) IMPHK(44) IMPHK(45) IMPHK(46) IMPHK(47)
+IMPHK(48) IMPHK(49) IMPHK(50) IMPHK(51) IMPHK(52) IMPHK(53) IMPHK(54) IMPHK(55)
+IMPHK(56) IMPHK(57) IMPHK(58) IMPHK(59) IMPHK(60) IMPHK(61) IMPHK(62) IMPHK(63)
+static const ImportFn g_imphk_fn[IMPHK_N] = {
+imphk_0, imphk_1, imphk_2, imphk_3, imphk_4, imphk_5, imphk_6, imphk_7,
+imphk_8, imphk_9, imphk_10, imphk_11, imphk_12, imphk_13, imphk_14, imphk_15,
+imphk_16, imphk_17, imphk_18, imphk_19, imphk_20, imphk_21, imphk_22, imphk_23,
+imphk_24, imphk_25, imphk_26, imphk_27, imphk_28, imphk_29, imphk_30, imphk_31,
+imphk_32, imphk_33, imphk_34, imphk_35, imphk_36, imphk_37, imphk_38, imphk_39,
+imphk_40, imphk_41, imphk_42, imphk_43, imphk_44, imphk_45, imphk_46, imphk_47,
+imphk_48, imphk_49, imphk_50, imphk_51, imphk_52, imphk_53, imphk_54, imphk_55,
+imphk_56, imphk_57, imphk_58, imphk_59, imphk_60, imphk_61, imphk_62, imphk_63,
+};
+static void call_import_fn(Ctx *c, void *fn) { ((ImportFn)fn)(c); }
+typedef struct { void (*fn)(Ctx *, void *); void *user; } HostPrev;
+static void call_host_prev(Ctx *c, void *p) { HostPrev *h = p; h->fn(c, h->user); }
+int hostentry_hook(uint64_t addr, void (*fn)(Ctx *, void *), void *user, uint64_t *orig) {
+    if (addr >= IMPORT_BASE && addr < IMPORT_BASE + (uint64_t)dyn_sym_count * IMPORT_SLOT && (addr - IMPORT_BASE) % IMPORT_SLOT == 0) {
+        int sym = (int)((addr - IMPORT_BASE) / IMPORT_SLOT);
+        LONG k = InterlockedIncrement(&g_imphk_n) - 1;
+        if (k >= IMPHK_N) guest_trap("hostentry_hook: too many hooks on imports", addr);
+        ImportFn prev = g_handlers[sym];
+        char name[80]; snprintf(name, sizeof name, "orig:%.70s", dyn_syms[sym].name);
+        if (orig) *orig = prev ? hostfn_closure(name, call_import_fn, (void *)prev) : 0;
+        g_imphk[k].fn = fn; g_imphk[k].user = user;
+        g_import_calls[sym] = 3;                    /* the fast path in host_import_real (no first-call trace for a hooked import) */
+        InterlockedExchangePointer((void *volatile *)&g_handlers[sym], (void *)g_imphk_fn[k]);
+        return 1;
+    }
+    if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16 && (addr - HOSTFN_BASE) % 16 == 0) {
+        int i = (int)((addr - HOSTFN_BASE) / 16);
+        HostPrev *h = malloc(sizeof *h);
+        AcquireSRWLockExclusive(&g_hostfn_lock);
+        if (g_hostfn[i].fnu) { h->fn = g_hostfn[i].fnu; h->user = g_hostfn[i].user; }
+        else { h->fn = call_import_fn; h->user = (void *)g_hostfn[i].fn; }
+        g_hostfn[i].user = user; g_hostfn[i].fnu = fn;
+        ReleaseSRWLockExclusive(&g_hostfn_lock);
+        char name[80]; snprintf(name, sizeof name, "orig:%.70s", g_hostfn[i].name);
+        if (orig) *orig = hostfn_closure(name, call_host_prev, h);
+        return 1;
+    }
+    return 0;
 }
 
 /* Handler currently registered for an imported function, or NULL (not imported / still a stub). */
@@ -456,7 +542,11 @@ void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
     RaiseException(0xE0000002, 0, 0, NULL);
     report_and_exit(3);
 }
-void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
+int (*g_svc_handler)(Ctx *, uint32_t);          /* skyline.c: the kernel calls plugin code makes (svcQueryMemory ...) */
+void guest_svc(Ctx *c, uint32_t number) {
+    if (g_svc_handler && g_svc_handler(c, number)) return;
+    guest_trap("svc (direct kernel call)", number);
+}
 
 const char *guest_thread_name_of(DWORD tid);       /* os_threads.c */
 

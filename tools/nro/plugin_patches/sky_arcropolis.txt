@@ -1,0 +1,4 @@
+# Ryujinx/yuzu code path: the plugin compares skyline getRegionAddress(Text) with the text base those emulators use;
+# this port maps main at 0x7100000000, so the constant it compares with becomes that address (movz x8,#0x71,lsl#32; nop).
+3e1e0 52880008 d2c00e28
+3e1e8 72a10008 d503201f
