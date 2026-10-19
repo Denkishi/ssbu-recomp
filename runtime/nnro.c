@@ -474,6 +474,45 @@ static int publish_exports(NroModule *m, int on) {
     return n;
 }
 
+/* The SDK's LoadModule ends with BindVariables of every other loaded module against the new one: imports that nothing
+ * provided when those modules were loaded get their address now (a plugin loaded at boot imports lua2cpp_common's
+ * functions, which load with the first fight). Every relocation of such a symbol is rewritten: a symbol can have a PLT
+ * slot (calls) and GOT slots (its address taken). Under g_ro_lock. Returns the number of symbols bound. Only with plugins
+ * (skyline.c): without them the game's modules keep the binding they had, and an import resolved late is found by
+ * nro_import_host_inner when it is called, as before. */
+static void find_dynamic(NroModule *m, uint64_t *rela, uint64_t *relasz, uint64_t *jmprel, uint64_t *pltrelsz);
+static int rebind_others(NroModule *nm) {
+    int n = 0;
+    if (sky_registry() <= 0) return 0;
+    for (int i = 0; i < g_mod_count; i++) {
+        NroModule *m = &g_mods[i];
+        if (m == nm || !m->loaded || !m->bind_addr) continue;
+        uint8_t *fresh = NULL;
+        for (int k = 1; k < m->sym_count; k++) {
+            if (m->bind_addr[k] || m->syms[k].defined || !m->syms[k].name[0]) continue;
+            const Export *e = exp_find(m->syms[k].name);
+            if (!e || e->mod != nm) continue;
+            m->bind_addr[k] = e->value;
+            m->bind_fn[k] = function_at(e->value);
+            if (!fresh) fresh = calloc((size_t)m->sym_count, 1);
+            fresh[k] = 1;
+            n++;
+        }
+        if (!fresh) continue;
+        uint64_t base = m->info->base, tab[2], size[2];
+        find_dynamic(m, &tab[0], &size[0], &tab[1], &size[1]);
+        for (int t = 0; t < 2; t++)
+            for (uint64_t r = 0; r < size[t] / 24; r++) {
+                uint64_t e = base + tab[t] + r * 24, off = rd64(e), info = rd64(e + 8), addend = rd64(e + 16);
+                uint32_t type = (uint32_t)info, sym = (uint32_t)(info >> 32);
+                if ((type == 0x101 || type == 0x401 || type == 0x402) && sym < (uint32_t)m->sym_count && fresh[sym])
+                    wr64(base + off, m->bind_addr[sym] + (type == 0x101 ? addend : 0));
+            }
+        free(fresh);
+    }
+    return n;
+}
+
 static NroModule *module_of_image(uint64_t nro) {
     for (int i = 0; i < g_mod_count; i++)
         if (memcmp(g_mods[i].info->build_id, (const void *)(uintptr_t)(nro + 0x40), 20) == 0) return &g_mods[i];
@@ -680,6 +719,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
     for (uint64_t s = 0; s < (span + (1u << NRO_SLOT_SHIFT) - 1) >> NRO_SLOT_SHIFT; s++)
         g_slot[((in->base - NRO_BASE) >> NRO_SLOT_SHIFT) + s] = m;
     published = publish_exports(m, 1);
+    int rebound = rebind_others(m);              /* after m->loaded: exp_find skips modules not loaded */
     ReleaseSRWLockExclusive(&g_ro_lock);
     int eh = eh_register_image(in->base, in->image_size, 0);        /* its .eh_frame_hdr, for C++ exceptions (after relocation) */
     QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&freq);
@@ -691,6 +731,7 @@ static void ro_LoadModule(Ctx *c) {              /* (Module *out, const void *nr
              !eh ? " (NO unwind tables)" : m->resume ? "" : " (DLL built without resume entries: exceptions cannot be caught in it)", 1000.0 * (double)(t1.QuadPart - t0.QuadPart) / (double)freq.QuadPart);
     printf("%s\n", line);
     trace_printf("%s\n", line);
+    if (rebound) printf("nn::ro::LoadModule: %d imports of other modules bound to %s\n", rebound, in->name);
     wr64(out, obj); wr32(out + 8, 1); wr64(out + 0x10, nro); wr64(out + 0x18, bss);
     fighter_attach(m);                           /* S1: fighters_bin\<name>.dll, if this module has C++ source */
     hook_module_loaded(m);                       /* S3: hooks that were waiting for a name this module exports (fighter_sdk\hook_host.c) */
