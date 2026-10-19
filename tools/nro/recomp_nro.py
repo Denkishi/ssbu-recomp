@@ -39,7 +39,7 @@ def _nro_config(path, base):
 
 
 ELF = os.environ.get('RECOMP_NRO', '')
-MODULE = ''.join(ch if ch.isalnum() else '_' for ch in os.path.splitext(os.path.basename(ELF))[0])
+MODULE = os.environ.get('RECOMP_NRO_MODULE') or ''.join(ch if ch.isalnum() else '_' for ch in os.path.splitext(os.path.basename(ELF))[0])   # C name of the module's tables (build_plugins.py sets it)
 if ELF:
     _cfg = _nro_config(ELF, int(os.environ.get('RECOMP_NRO_BASE', '0x7200000000'), 16))
     IMG, BASE, FILE_OFF, TEXT_SIZE = _cfg['IMG'], _cfg['BASE'], _cfg['FILE_OFF'], _cfg['TEXT_SIZE']
@@ -52,7 +52,34 @@ else:                                  # imported without a module selected (onl
     DYN_ENTRIES = []
 
 
+def _offset_list(env_name):
+    """Lines of the file named by an environment variable, '#' comments and blank lines dropped, split into fields."""
+    path = os.environ.get(env_name)
+    if not path or not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [t for t in (line.split('#', 1)[0].split() for line in f) if t]
+
+
+# Instruction patches (the plugin pipeline, build_plugins.py): RECOMP_PATCHES=<file>, one patch per line
+#     <module offset> <original word> <new word>    # note        (hex)
+# The original word is checked against the NRO. No variable, a missing or an empty file: no patches.
+PATCHES = {}
+for _t in (_offset_list('RECOMP_PATCHES') if IMG else []):
+    _off, _old, _new = int(_t[0], 16), int(_t[1], 16), int(_t[2], 16)
+    _have = struct.unpack_from('<I', IMG, FILE_OFF + _off)[0]
+    if _have != _old:
+        raise ValueError('patch +%x: the NRO has %08x, the patch expects %08x' % (_off, _have, _old))
+    PATCHES[BASE + _off] = _new
+
+# Extra resume entries: RECOMP_EXTRA_RESUME=<file>, one module offset per line: addresses a custom personality or
+# an asm landing pad resumes at (not described by .eh_frame); they get resume-table entries like landing pads.
+EXTRA_RESUME = sorted(BASE + int(_t[0], 16) for _t in _offset_list('RECOMP_EXTRA_RESUME'))
+
+
 def word(addr):
+    if PATCHES and addr in PATCHES:
+        return PATCHES[addr]
     return struct.unpack_from('<I', IMG, FILE_OFF + addr - BASE)[0]
 
 
@@ -987,6 +1014,7 @@ def eh_info():
                     pads.add(lp)
                     if action:
                         catchers.add(f['start'])
+        pads.update(EXTRA_RESUME)
         _eh_cache = (sorted(pads), catchers, sorted(f['start'] for f in fdes if BASE + 0x80 <= f['start'] < BASE + TEXT_SIZE and f['start'] % 4 == 0))
     return _eh_cache
 
