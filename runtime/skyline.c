@@ -582,6 +582,7 @@ static void sky_register(void) {
     register_imports(sky_imports, (int)(sizeof sky_imports / sizeof sky_imports[0]));
     if (sky_registry() <= 0) return;
     g_svc_handler = sky_svc;
+    hostfn_placeholders_readable();         /* hostrt.c: plugins read "orig" addresses as data */
     g_sky_mountrom_orig = import_lookup("_ZN2nn2fs8MountRomEPKcPvm");
     if (g_sky_mountrom_orig) { ImportDef d = {"_ZN2nn2fs8MountRomEPKcPvm", sky_MountRom}; register_imports(&d, 1); }
     else printf("[skyline] nn::fs::MountRom has no handler: plugins are not loaded\n");

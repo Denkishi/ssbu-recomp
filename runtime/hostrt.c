@@ -243,6 +243,17 @@ uint64_t hostfn_closure(const char *name, void (*fn)(Ctx *, void *), void *user)
     if (i >= MAX_HOSTFN) guest_trap("hostfn_closure: table full", 0);
     return HOSTFN_BASE + (uint64_t)i * 16;
 }
+/* skyline.c, with plugins: the placeholder addresses of the run-time host functions become readable (zeros), as code is on
+ * the console. HDR reads one of them as data: lib::L2CValue::as_integer (13.0.4: 0x7103734b80) on a Skyline "orig"
+ * address, which here is such a placeholder (0x7400004220, run-time host function 1058 in that install). On the console
+ * the address is code: the read gives instruction words, which are no L2CValue type (2, 3, 7), and the result is 0; here
+ * the range was unmapped and the game died with an access violation every few minutes of play (nine crashes in one
+ * afternoon, any fighters, always that read). Zeros read as type 0: also 0. Writes still fault, as on the console's code
+ * pages. */
+void hostfn_placeholders_readable(void) {
+    if (!VirtualAlloc((void *)HOSTFN_BASE, (SIZE_T)MAX_HOSTFN * 16, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY))
+        printf("hostrt: the host function placeholders could not be mapped readable (error %lu)\n", GetLastError());
+}
 const char *hostfn_current_name(void) { return g_hostfn[t_hostfn].name; }
 unsigned long long hostfn_current_calls(void) { return (unsigned long long)g_hostfn[t_hostfn].calls; }
 
@@ -881,6 +892,9 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
         printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
                (unsigned long long)er->ExceptionInformation[1]);
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[1] >= HOSTFN_BASE && er->ExceptionInformation[1] < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16)
+        printf("  (the placeholder address of the run-time host function %d, %s, +%llu, used as data)\n", (int)((er->ExceptionInformation[1] - HOSTFN_BASE) / 16),
+               g_hostfn[(er->ExceptionInformation[1] - HOSTFN_BASE) / 16].name, (unsigned long long)((er->ExceptionInformation[1] - HOSTFN_BASE) % 16));
     dump_guest_registers();
     printf("guest call stack (innermost first):\n");
     CONTEXT ctx = *ep->ContextRecord;
