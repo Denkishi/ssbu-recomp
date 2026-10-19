@@ -8,6 +8,9 @@ and memory must be identical.
     python difftest.py sample     collect sample instructions from the binary -> difftest_samples.json
     python difftest.py gen        generate difftest_gen.c from the samples
     python difftest.py check      run difftest.exe and Unicorn, compare
+    python difftest.py sample-nro <nro> [<nro> ...]
+                                  also sample the shapes of NRO modules (e.g. Skyline plugins) -> difftest_samples_nro.json;
+                                  `gen` then appends their shapes that the game does not have
 
 `gen` appends to the sampled shapes the instruction words of extra_words() (every valid arrangement of the instructions
 the game's code does not use but Rust-compiled modules do) and short exclusive sequences (LDXP + STXP, LDXR + STXR ...),
@@ -195,7 +198,7 @@ def build_tests():
     tests += build_special(fn, tests)
     if os.environ.get('DIFFTEST_NO_EXTRA'):
         return tests
-    return tests + build_extra(fn)
+    return tests + build_extra(fn, shapes)
 
 
 # ---- instructions the game's code does not use (Rust-compiled modules do): every valid arrangement written out here,
@@ -207,6 +210,27 @@ def _shape_key(md, w, prefix=''):
     shape = re.sub(r'#-?(0x)?[0-9a-f.e+-]+', '#', ins[0].op_str)
     shape = re.sub(r'\b([vqdshbwx])\d+\b', r'\1', shape)
     return prefix + ins[0].mnemonic + ' ' + shape
+
+
+def cmd_sample_nro(paths):
+    """Shapes of NRO modules (Skyline plugins): `gen` adds those the game does not have (key '(plugin) ...')."""
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+    md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    shapes = collections.defaultdict(list)
+    seen = set()
+    for p in paths:
+        d = open(p, 'rb').read()
+        assert d[0x10:0x14] == b'NRO0', p
+        text_off, text_size = struct.unpack_from('<II', d, 0x20)
+        for (w,) in struct.iter_unpack('<I', d[text_off + 0x80:text_off + text_size]):   # past the NRO header
+            if w in seen:
+                continue
+            seen.add(w)
+            key = _shape_key(md, w)
+            if key and len(shapes[key]) < PER_SHAPE:
+                shapes[key].append(w)
+    json.dump(shapes, open('difftest_samples_nro.json', 'w'))
+    print('NRO shapes:', len(shapes), ' sample words:', sum(len(v) for v in shapes.values()))
 
 
 def _regs(i, n, avoid=()):
@@ -340,10 +364,16 @@ def exclusive_sequences():
     return seqs
 
 
-def build_extra(fn):
+def build_extra(fn, main_shapes):
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
     md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
-    words = [(_shape_key(md, w, '(added) ') or '(added) %08x' % w, w, mode) for w, mode in extra_words()]   # (key, word, fp mode)
+    words = []                                                            # (key, word, fp mode)
+    if os.path.exists('difftest_samples_nro.json'):                       # sample-nro: shapes of modules the game does not have
+        main_words = set(w for ws in main_shapes.values() for w in ws)
+        for key, ws in sorted(json.load(open('difftest_samples_nro.json')).items()):
+            if key not in main_shapes:
+                words += [('(plugin) ' + key, w, 0) for w in ws if w not in main_words]
+    words += [(_shape_key(md, w, '(added) ') or '(added) %08x' % w, w, mode) for w, mode in extra_words()]
     tests = []
     for key, w, mode in words:
         op0 = LIFT.bits(w, 28, 25)
@@ -355,7 +385,9 @@ def build_extra(fn):
         try:
             stmt = fn.lift(w, CODE)
         except LIFT.Unimpl:
-            raise SystemExit('extra_words: %08x (%s) is not translated' % (w, key))
+            if key.startswith('(added)'):
+                raise SystemExit('extra_words: %08x (%s) is not translated' % (w, key))
+            continue                                                       # a sampled module shape the lifter does not translate
         if any(t in stmt for t in ('goto', 'return', 'call_indirect', 'guest_', 'f_7')):
             continue
         rn, rm = LIFT.bits(w, 9, 5), -1
@@ -386,9 +418,9 @@ def cmd_gen():
             f.write('  { t_%d, 0x%08xU, %d, %d, %d, %d, %d, %d },\n' % (i, t['word'], t['mem'], t['rn'], t['rm'], t['fpmode'], t['k'], t['frm']))
         f.write('};\nconst int test_count = %d;\n' % len(tests))
     json.dump(tests, open('difftest_tests.json', 'w'))
-    print('tests generated: %d (random state: %d, floating-point special operands: %d; added instructions and sequences: %d)'
+    print('tests generated: %d (random state: %d, floating-point special operands: %d; module shapes, added instructions and sequences: %d)'
           % (len(tests), sum(1 for t in tests if not t['fpmode']), sum(1 for t in tests if t['fpmode']),
-             sum(1 for t in tests if t['key'].startswith(('(added)', '(sequence)')))))
+             sum(1 for t in tests if t['key'].startswith(('(plugin)', '(added)', '(sequence)')))))
 
 
 def cmd_check():
@@ -447,7 +479,7 @@ def cmd_check():
     print('tests: %d   identical: %d   different: %d   (reference faults: %d)' % (len(tests), ok, len(tests) - ok, errors))
     print('  random-state tests: %d identical of %d   floating-point special-operand tests: %d identical of %d'
           % (ok - ok_special, len(tests) - n_special, ok_special, n_special))
-    for cat in ('(added)', '(sequence)'):
+    for cat in ('(plugin)', '(added)', '(sequence)'):
         if n_cat[cat]:
             print('  %-10s tests: %d identical of %d' % (cat, ok_cat[cat], n_cat[cat]))
     for key, idxs in sorted(bad.items(), key=lambda kv: -len(kv[1]))[:60]:
@@ -511,5 +543,7 @@ if __name__ == '__main__':
         cmd_gen()
     elif cmd == 'check':
         cmd_check()
+    elif cmd == 'sample-nro':
+        cmd_sample_nro(sys.argv[2:])
     else:
         cmd_show(int(sys.argv[2]))
