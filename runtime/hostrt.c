@@ -775,6 +775,23 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+/* A host stack overflow reaches the top-level filter only when the thread has stack left to run it: every thread keeps
+ * 256 KB for that (hostrt_thread_start), and this first-chance handler says where it happened before anything else runs
+ * (a play session ended without any report on 2026-10-18; a stack overflow without room for the handler is one way). */
+static LONG CALLBACK fatal_veh(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_STACK_OVERFLOW || code == 0xC0000374 /* heap corruption */) {
+        static volatile LONG once;
+        if (!InterlockedExchange(&once, 1)) {
+            printf("\nHOST %s at host address %p (thread %lu), guest function f_%llx\n", code == EXCEPTION_STACK_OVERFLOW ? "STACK OVERFLOW" : "HEAP CORRUPTION",
+                   ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId(), (unsigned long long)guest_function_of((uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress));
+            fflush(stdout);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+void hostrt_thread_start(void) { ULONG g = 256 << 10; SetThreadStackGuarantee(&g); }
+
 /* ---------------------------------------------------------------- loader */
 void runtime_init(const char *elf, const char *trace_path) {
     g_handlers = calloc((size_t)dyn_sym_count, sizeof *g_handlers);
@@ -795,6 +812,8 @@ void runtime_init(const char *elf, const char *trace_path) {
     g_trace = fopen(trace_path, "w");
     SetUnhandledExceptionFilter(crash_filter);
     (void)minidump_mode();                          /* read SSBU_MINIDUMP now: the crash path should not have to */
+    AddVectoredExceptionHandler(1, fatal_veh);
+    hostrt_thread_start();
 
     void *mem = VirtualAlloc((void *)GUEST_BASE, IMAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (mem != (void *)GUEST_BASE) { fprintf(stderr, "cannot map guest image at 0x%llx\n", GUEST_BASE); exit(1); }

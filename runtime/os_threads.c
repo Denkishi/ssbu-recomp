@@ -242,6 +242,7 @@ const char *guest_thread_name_of(DWORD tid) {
 }
 
 static DWORD WINAPI thread_main(LPVOID arg) {
+    { void hostrt_thread_start(void); hostrt_thread_start(); }        /* hostrt.c: stack kept for the crash report */
     Obj *o = arg;
     t_thread = o->key;
     { void display_perf_thread(void); display_perf_thread(); }      /* track V session 14: the game's threads on the performance cores of a hybrid CPU (display.c; SSBU_PCORES=0 off) */
@@ -806,6 +807,7 @@ static void pthread_release(Obj *o) {                 /* after the thread ended 
     if (o->thread) { CloseHandle(o->thread); o->thread = NULL; }
 }
 static DWORD WINAPI pthread_main(LPVOID arg) {
+    { void hostrt_thread_start(void); hostrt_thread_start(); }        /* hostrt.c: stack kept for the crash report */
     Obj *o = arg;
     t_thread = o->key;
     Ctx *c = new_ctx(o->stack + o->stack_size);

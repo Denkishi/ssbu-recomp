@@ -29,6 +29,7 @@ ecomp_nro.py) gives
  * Environment: SSBU_UNWIND_LOG=1 prints every frame of every throw (the first 3 throws are always summarised). */
 #include <windows.h>
 #include <setjmp.h>
+#include <intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -206,6 +207,19 @@ static jmp_buf *catch_take(uint64_t cfa, jmp_buf *only) {                     /*
     return jb;
 }
 
+/* A record's host frame must still be on this stack (a fiber's stack is the TEB's while it runs) and above the current
+ * frame: a longjmp to a frame that is gone makes Windows end the process at once, without any report (one candidate for
+ * play sessions that ended silently); this turns that case into a report. */
+static void catch_check(Ctx *c, jmp_buf *jb, uint64_t cfa) {
+    _JUMP_BUFFER *b = (_JUMP_BUFFER *)jb;
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    uint64_t now = (uint64_t)(uintptr_t)_AddressOfReturnAddress();
+    if (b->Rsp > now && b->Rsp < (uint64_t)(uintptr_t)tib->StackBase) return;
+    printf("\nunwind: the host frame recorded for guest frame %llx is not on this stack (its rsp %llx, this stack %p..%p, now %llx)\n",
+           (unsigned long long)cfa, (unsigned long long)b->Rsp, tib->StackLimit, tib->StackBase, (unsigned long long)now);
+    eh_terminate(c, "stale host frame record");
+}
+
 /* Entry of every lifted function whose LSDA has a catch clause (generated code: `nro_catch_call(c, u_<fn>)`). */
 void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     Ctx *volatile cc = c;
@@ -318,14 +332,17 @@ static void eh_raise(Ctx *c, int reason) {
             ip.kind = EH_HANDLER; ip.landing_pad = g_interp_lp; ip.exception = exc;
             if (InterlockedIncrement(&g_interp_landings) <= 3 || g_log)
                 printf("unwind: %s thrown at 0x%llx: smashline's interpreter stub takes it (landing pad %llx)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)g_interp_lp);
+            int uncaught_before = eh_uncaught_count(c);
             eh_enter_pad(c, &ip);
             c->in_import = NULL;
             fn(c, g_interp_lp);                           /* the stub's landing code: its saved sp back, then it returns */
+            eh_stub_done(c, exc, uncaught_before);        /* nncxxrt.c: the exception is over for this context */
             jmp_buf *jb = catch_take(c->x[31], NULL);
             if (!jb) {
                 printf("\nunwind: smashline's interpreter stub returned to sp %llx, where no entry record is\n", (unsigned long long)c->x[31]);
                 eh_terminate(c, "no host frame to return to");
             }
+            catch_check(c, jb, c->x[31]);
             longjmp(*jb, 1);
         }
     }
@@ -377,6 +394,7 @@ static void eh_raise(Ctx *c, int reason) {
             printf("\nunwind: f_%llx handled an exception but was not entered through nro_catch_call (frame %llx)\n", (unsigned long long)pad.function.start, (unsigned long long)cfa);
             eh_terminate(c, "no host frame to return to");
         }
+        catch_check(c, jb, cfa);
         longjmp(*jb, 1);
     }
     printf("\nunwind: ran out of frames while unwinding (%s)\n", stop);

@@ -400,6 +400,17 @@ static EhState *eh_state(Ctx *c) {
     return s;
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
+/* nnunwind.c, smashline's interpreter stub took exception `exc` (its landing code ran and returns to the interpreter's
+ * caller): the exception is over for this context. The stub's code never calls __cxa_begin_catch / __cxa_end_catch, so the
+ * context stayed "with an exception" for good (uncaught 1, never idle again, so never reused): HDR's script fibers throw
+ * L2CExceptionShutdown this way many times a minute. `uncaught_before` = the count before the landing code ran. */
+void eh_stub_done(Ctx *c, uint64_t exc, int uncaught_before) {
+    EhState *st = eh_state(c);
+    st->in_flight = 0;
+    if (st->uncaught == uncaught_before && st->uncaught > 0) st->uncaught--;
+    if (st->caught == exc) { ExcHeader *h = exc_header(exc); st->caught = h ? h->next : 0; }
+}
+int eh_uncaught_count(Ctx *c) { return eh_state(c)->uncaught; }
 
 /* ---- loaded images */
 typedef struct { uint64_t base, size, hdr, table; uint32_t count; } EhImage;

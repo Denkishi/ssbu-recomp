@@ -83,6 +83,9 @@ const char *eh_type_name(uint64_t exception);        /* mangled type name, e.g. 
 /* Commit to a pad returned by eh_personality: sets x0 and x1, records the adjusted pointer for __cxa_begin_catch,
  * clears the in-flight state. The caller then restores the frame's registers and jumps to pad->landing_pad. */
 void eh_enter_pad(Ctx *c, const EhPad *pad);
+/* smashline's interpreter stub took the exception (nnunwind.c): its context no longer has one. */
+int eh_uncaught_count(Ctx *c);
+void eh_stub_done(Ctx *c, uint64_t exc, int uncaught_before);
 
 /* ---- the unwinder's entry point */
 enum { EH_RAISE_THROW = 0, EH_RAISE_RESUME = 1 };
