@@ -169,6 +169,7 @@ Options are environment variables, set with `--env NAME=VALUE` (full list: comme
 `SSBU_RENDERER=vk|gl`, `SSBU_SHOW=1` (show the window of a test exe), `SSBU_STRICT=1|report|path` (list the host
 functions that are not the real behaviour), `SSBU_TRACE`, `SSBU_PAD_BACKEND=xinput`, `SSBU_FIXED_SEED=<n>`.
 Pad mapping file and tools: `ssbu_native.exe --pad-test`, `--pad-map <n>`.
+Skyline plugins (ARCropolis, smashline and the mods built on them) that you install yourself: [docs/SKYLINE.md](docs/SKYLINE.md).
 
 ## Troubleshooting
 
