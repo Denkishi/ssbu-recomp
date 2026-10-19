@@ -17,6 +17,9 @@ typedef struct { const char *name; ImportFn fn; } ImportDef;
 
 uint64_t hostfn_address(const char *name, ImportFn fn);
 uint64_t main_export(const char *name);   /* guest address of a symbol main defines (malloc ...), 0 if none */
+uint64_t hostfn_closure(const char *name, void (*fn)(Ctx *, void *), void *user);   /* a new guest-callable address that calls fn(c, user) */
+ImportFn extra_import_lookup(const char *name);     /* handler registered for a name main does not import (plugins), or NULL */
+int hostentry_hook(uint64_t addr, void (*fn)(Ctx *, void *), void *user, uint64_t *orig);   /* hook an import placeholder / host function */
 const char *hostfn_current_name(void);
 unsigned long long hostfn_current_calls(void);
 void print_hostfn_summary(FILE *out);

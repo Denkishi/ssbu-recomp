@@ -131,7 +131,8 @@ def cmd_link():
     for n in HOST_SOURCES + ['gamedll.c']:
         src, obj = os.path.join(HERE, n), os.path.join(objdir, n[:-2] + '.obj')
         objs.append(obj)
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0):
+        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
+                                                                  os.path.getmtime(os.path.join(HERE, 'skyline.c')) if n == 'nnro.c' else 0):   # nnro.c includes skyline.c
             jobs.append((src, obj))
     failed = 0
     with concurrent.futures.ThreadPoolExecutor(16) as pool:
