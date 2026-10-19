@@ -6,6 +6,8 @@
                                 its slot (then it goes to the end and assign() says so)
     registry_line(...)          one line of plugins.txt (NroInfo of nro_registry.c: name base image_size file_size build_id)
     exports(path)               the module's defined dynamic symbols with their offsets
+    auto_patches(path)          instruction patches and extra resume entries found by the shape of the code (no lists of
+                                offsets of particular plugin builds: those would be part of the plugins)
 """
 import glob
 import json
@@ -87,3 +89,53 @@ def exports(path):
     kinds = {0: 'NOTYPE', 1: 'OBJECT', 2: 'FUNC', 3: 'SECTION', 4: 'FILE', 6: 'TLS'}
     out = [(value, kinds.get(t, str(t)), size, name) for name, t, bind, shndx, value, size in n.syms if shndx and name]
     return sorted(out)
+
+
+# ---------------------------------------------------------------------------------------------------- automatic patches
+# Two things this port needs changed in plugin code, both found by the shape of the code, so that no offsets of particular
+# plugin builds are kept here. build_plugins.py passes the result to recomp_nro.py (RECOMP_PATCHES / RECOMP_EXTRA_RESUME);
+# lists of your own (build_plugins.py --patches) are added to them.
+#
+# 1. The emulator check. skyline-rs plugins compare getRegionAddress(Text) with the text bases of Ryujinx and yuzu
+#    (0x8004000, 0x8504000) and take a code path of their own for those emulators. This port is treated like them: main is
+#    at 0x7100000000 here, and the comparison is changed to hold for that address. The constant is built as
+#        movz wN, #0x4000 ; [one or two other instructions] ; movk wN, #0x0800 or #0x0850, lsl #16
+#    which becomes  movz xN, #0x71, lsl #32 ; ... ; nop  (the comparison then holds here).
+# 2. smashline's interpreter stub (smashline src/interpreter.asm, the same shape that runtime/skyline.c looks for): its
+#    landing pad is a nop that a custom personality resumes at + 4, which .eh_frame does not describe. That address gets a
+#    resume entry like a landing pad.
+EMU_MOVZ = 0x52880000           # movz wN, #0x4000
+EMU_MOVK = (0x72a10000, 0x72a10a00)     # movk wN, #0x0800 / #0x0850, lsl #16
+MAIN_MOVZ = 0xd2c00e20          # movz xN, #0x71, lsl #32
+NOP = 0xd503201f
+SMASHLINE_STUB = (0xa9bf7bfd, 0xa9bf53f3, 0xf81f0ff5, 0xaa0003f3, 0xaa0103f4, 0xaa0203f5)
+
+
+def auto_patches(path):
+    """([(module offset, original word, new word, note)], [resume module offset]) for the plugin at path."""
+    n = nro_info.Nro(path)
+    count = n.text_size // 4
+    w = struct.unpack_from('<%dI' % count, n.d, n.text_off)
+    patches, resume = [], []
+    for i in range(count):
+        x = w[i]
+        if (x & 0xffffffe0) == EMU_MOVZ:
+            r = x & 31
+            for k in range(i + 1, min(i + 4, count)):
+                if (w[k] & 0xffffffe0) in EMU_MOVK and (w[k] & 31) == r:
+                    base = 0x8004000 if (w[k] & 0xffffffe0) == EMU_MOVK[0] else 0x8504000
+                    note = 'emulator check: compares with %#x' % base
+                    patches.append((n.text_off + 4 * i, x, MAIN_MOVZ | r, note + ', here with 0x7100000000'))
+                    patches.append((n.text_off + 4 * k, w[k], NOP, note))
+                    break
+        if w[i:i + 6] == SMASHLINE_STUB and i + 7 < count:
+            adr = w[i + 6]
+            if (adr & 0x9f00001f) != 0x10000000:                    # adr x0, <landing pad>
+                continue
+            imm = ((adr >> 5) & 0x7ffff) << 2 | (adr >> 29) & 3
+            if imm & (1 << 20):
+                imm -= 1 << 21
+            lp = 4 * (i + 6) + imm
+            if 0 <= lp < 4 * count and w[lp // 4] == NOP:
+                resume.append(n.text_off + lp + 4)
+    return patches, resume
