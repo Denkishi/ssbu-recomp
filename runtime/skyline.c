@@ -306,7 +306,7 @@ static void sky_where(uint64_t a, char *out, size_t n) {
 }
 
 /* ---------------------------------------------------------------- inline hooks */
-typedef struct SkyInline { uint64_t addr; int n; uint64_t cb[16]; struct SkyInline *next; ImportFn orig; int entry; } SkyInline;
+typedef struct SkyInline { uint64_t addr; int n; uint64_t cb[16]; struct SkyInline *next; ImportFn orig; int entry; volatile LONG64 calls; } SkyInline;
 #define SKY_IH_HASH 1024
 static SkyInline *g_sky_ih[SKY_IH_HASH];
 static SkyInline *sky_ih_find(uint64_t addr) {
@@ -318,6 +318,7 @@ static SkyInline *sky_ih_find(uint64_t addr) {
  * address in x0, and x0..x30 / q0..q31 are reloaded from it afterwards (sp is not; x16/x17 keep their values here, on the
  * console they hold the stub's scratch values). The condition flags are kept (the console's stub does not save them). */
 static void sky_run_inline(Ctx *c, SkyInline *e) {
+    InterlockedIncrement64(&e->calls);
     for (int k = e->n - 1; k >= 0; k--) {                  /* the newest hook runs first */
         uint64_t sp = c->x[31], ctx = sp - 0x300, x16 = c->x[16], x17 = c->x[17];
         uint32_t f[4] = {c->N, c->Z, c->C, c->V};
@@ -357,8 +358,9 @@ static void sky_A64InlineHook(Ctx *c) {
 }
 
 /* ---------------------------------------------------------------- function hooks */
-typedef struct SkyHook { uint64_t target, repl; ImportFn orig; } SkyHook;
-static void sky_hook_thunk(Ctx *c, void *user) { call_indirect(c, ((SkyHook *)user)->repl); }
+typedef struct SkyHook { uint64_t target, repl; ImportFn orig; volatile LONG64 calls; struct SkyHook *all; } SkyHook;
+static SkyHook *volatile g_sky_hooks;      /* every hook, for the report at exit */
+static void sky_hook_thunk(Ctx *c, void *user) { InterlockedIncrement64(&((SkyHook *)user)->calls); call_indirect(c, ((SkyHook *)user)->repl); }
 static void sky_hook_orig(Ctx *c, void *user) { ((SkyHook *)user)->orig(c); }
 
 static void sky_A64HookFunction(Ctx *c) {
@@ -366,6 +368,7 @@ static void sky_A64HookFunction(Ctx *c) {
     char where[96], rwhere[96]; sky_where(sym, where, sizeof where); sky_where(repl, rwhere, sizeof rwhere);
     SkyHook *h = calloc(1, sizeof *h);
     h->target = sym; h->repl = repl;
+    do h->all = g_sky_hooks; while (InterlockedCompareExchangePointer((void *volatile *)&g_sky_hooks, h, h->all) != h->all);
     const char *state = "active";
     uint64_t orig = 0;
     if (function_at(sym)) {
@@ -425,7 +428,10 @@ static void sky_tcp_send_raw(Ctx *c) {           /* (const char *data, u64 size)
     const char *p = (const char *)(uintptr_t)c->x[0];
     if (!p || !n) return;
     while (n && (p[n - 1] == '\n' || p[n - 1] == '\r')) n--;
-    if (n) { printf("[plugin] %.*s\n", (int)n, p); trace_printf("[plugin] %.*s\n", (int)n, p); }
+    static ULONGLONG t0;
+    if (!t0) t0 = GetTickCount64();
+    double t = (double)(GetTickCount64() - t0) / 1000.0;      /* seconds since the first plugin line */
+    if (n) { printf("[plugin %6.1f] %.*s\n", t, (int)n, p); trace_printf("[plugin %6.1f] %.*s\n", t, (int)n, p); }
 }
 static void sky_get_plugin_addresses(Ctx *c) { if (c->x[1]) wr64(c->x[1], 0); if (c->x[2]) wr64(c->x[2], 0); }
 static void sky_nothing(Ctx *c) { (void)c; }
@@ -576,6 +582,32 @@ static void sky_find_interpreter(NroModule *m) {
     sky_logf("smashline: interpreter stub NOT found: a script ended by an exception will stop the game");
 }
 
+/* At exit: how often the plugins' hooks and inline hooks ran (evidence that their code takes part in the game). */
+static int sky_cmp_calls(const void *a, const void *b) { LONG64 x = *(const LONG64 *)b, y = *(const LONG64 *)a; return x < y ? -1 : x > y; }
+extern void (*g_plugin_report_hook)(void);
+static void sky_report(void) {
+    typedef struct { LONG64 calls; uint64_t addr, repl; } Row;
+    static Row rows[4096];
+    int n = 0; LONG64 total = 0; int used = 0;
+    for (SkyHook *h = g_sky_hooks; h && n < 4096; h = h->all) { rows[n].calls = h->calls; rows[n].addr = h->target; rows[n].repl = h->repl; total += h->calls; used += h->calls > 0; n++; }
+    qsort(rows, (size_t)n, sizeof rows[0], sky_cmp_calls);
+    printf("[skyline] function hooks: %d installed, %d called, %lld calls in all; most called:\n", n, used, (long long)total);
+    for (int i = 0; i < n && i < 12 && rows[i].calls; i++) {
+        char w[96], r[96]; sky_where(rows[i].addr, w, sizeof w); sky_where(rows[i].repl, r, sizeof r);
+        printf("  %12lld  %s -> %s\n", (long long)rows[i].calls, w, r);
+    }
+    n = 0; total = 0; used = 0;
+    for (int b = 0; b < SKY_IH_HASH; b++)
+        for (SkyInline *e = g_sky_ih[b]; e && n < 4096; e = e->next) { rows[n].calls = e->calls; rows[n].addr = e->addr; rows[n].repl = e->cb[0]; total += e->calls; used += e->calls > 0; n++; }
+    qsort(rows, (size_t)n, sizeof rows[0], sky_cmp_calls);
+    printf("[skyline] inline hooks: %d installed, %d reached, %lld times in all; most reached:\n", n, used, (long long)total);
+    for (int i = 0; i < n && i < 12 && rows[i].calls; i++) {
+        char w[96], r[96]; sky_where(rows[i].addr, w, sizeof w); sky_where(rows[i].repl, r, sizeof r);
+        printf("  %12lld  %s -> %s\n", (long long)rows[i].calls, w, r);
+    }
+    fflush(stdout);
+}
+
 /* nnro.c register_ro_imports (after nnfs.c registered MountRom) */
 static void sky_register(void) {
     extern int (*g_svc_handler)(Ctx *, uint32_t);        /* hostrt.c guest_svc */
@@ -583,6 +615,7 @@ static void sky_register(void) {
     if (sky_registry() <= 0) return;
     g_svc_handler = sky_svc;
     hostfn_placeholders_readable();         /* hostrt.c: plugins read "orig" addresses as data */
+    g_plugin_report_hook = sky_report;      /* report_and_exit (ExitProcess skips atexit) */
     g_sky_mountrom_orig = import_lookup("_ZN2nn2fs8MountRomEPKcPvm");
     if (g_sky_mountrom_orig) { ImportDef d = {"_ZN2nn2fs8MountRomEPKcPvm", sky_MountRom}; register_imports(&d, 1); }
     else printf("[skyline] nn::fs::MountRom has no handler: plugins are not loaded\n");
