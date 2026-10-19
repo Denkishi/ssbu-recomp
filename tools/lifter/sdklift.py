@@ -178,40 +178,6 @@ def mul_by_element(w):
             % (rn, typ, rm, fld, idx, n, fld, typ, fld, rd))
 
 
-def addv(w):
-    """ADDV Bd/Hd/Sd, Vn.T (0 Q 0 01110 size 11000 11011 10 Rn Rd): sum of the elements, upper bits of Vd cleared.
-    nlib's nnmem_nlib_memchr / memrchr / memchr_not (nn::mem::StandardAllocator) use it. Returns C or None."""
-    if (w & 0xbf3ffc00) != 0x0e31b800: return None
-    q, size, rn, rd = (w >> 30) & 1, (w >> 22) & 3, (w >> 5) & 31, w & 31
-    if size == 0: fld, n, typ = 'b', 16 if q else 8, 'uint8_t'
-    elif size == 1: fld, n, typ = 'h', 8 if q else 4, 'uint16_t'
-    elif size == 2 and q: fld, n, typ = 'w', 4, 'uint32_t'
-    else: return None
-    return ('{ V128 a_ = c->v[%d]; %s s_ = 0; for (int i_ = 0; i_ < %d; i_++) s_ = (%s)(s_ + a_.%s[i_]); c->v[%d].d[0] = s_; c->v[%d].d[1] = 0; }'
-            % (rn, typ, n, typ, fld, rd, rd))
-
-
-def ushl_vec(w):
-    """USHL / SSHL Vd.T, Vn.T, Vm.T (0 Q U 01110 size 1 Rm 010001 Rn Rd): each element shifted by the signed low
-    byte of the matching element of Vm: left when positive, right (logical for USHL, arithmetic for SSHL) when
-    negative, no rounding, no saturation; a shift of the element size or more gives 0 (or the sign for SSHL right).
-    NVN's kind attributes [sdk 0x4204b8] use it. Returns C or None."""
-    if (w & 0x9f20fc00) != 0x0e204400: return None
-    q, u, size, rm, rn, rd = (w >> 30) & 1, (w >> 29) & 1, (w >> 22) & 3, (w >> 16) & 31, (w >> 5) & 31, w & 31
-    fld, bits, ut, st = [('b', 8, 'uint8_t', 'int8_t'), ('h', 16, 'uint16_t', 'int16_t'), ('w', 32, 'uint32_t', 'int32_t'), ('d', 64, 'uint64_t', 'int64_t')][size]
-    if size == 3 and not q: return None
-    n = (128 if q else 64) // bits
-    if u:
-        body = 'r_.%s[i_] = s_ >= %d || s_ <= -%d ? 0 : s_ >= 0 ? (%s)(x_ << s_) : (%s)(x_ >> -s_);' % (fld, bits, bits, ut, ut)
-        decl = '%s x_ = a_.%s[i_];' % (ut, fld)
-    else:
-        body = ('r_.%s[i_] = (%s)(s_ >= %d ? 0 : s_ >= 0 ? (%s)((%s)x_ << s_) : s_ <= -%d ? (x_ < 0 ? -1 : 0) : (%s)(x_ >> -s_));'
-                % (fld, ut, bits, st, ut, bits, st))
-        decl = '%s x_ = (%s)a_.%s[i_];' % (st, st, fld)
-    return ('{ V128 a_ = c->v[%d], b_ = c->v[%d], r_; r_.d[0] = 0; r_.d[1] = 0; for (int i_ = 0; i_ < %d; i_++) { int s_ = (int8_t)b_.%s[i_]; %s %s } c->v[%d] = r_; }'
-            % (rn, rm, n, fld, decl, body, rd))
-
-
 def lift_function(env, entry):
     end = env.extent(entry)
     env.cur = entry
@@ -226,8 +192,6 @@ def lift_function(env, entry):
             stmt = fn.lift(w, pc)
         except R.Unimpl as e:
             stmt = mul_by_element(w)                         # the shared lifter has no MUL (vector, by element): musl's __floatscan / printf_core use it
-            if stmt is None: stmt = addv(w)
-            if stmt is None: stmt = ushl_vec(w)
             if stmt is None:
                 stmt = 'guest_unimpl(0x%xULL, 0x%08xU, "%s");' % (pc, w, e)
                 bad.append((pc, w, str(e)))
