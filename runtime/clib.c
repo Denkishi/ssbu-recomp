@@ -476,6 +476,34 @@ static void m_erfcf(Ctx *c) { float r = erfcf(c->v[0].f[0]); vzero(&c->v[0]); c-
 static void m_modff(Ctx *c) { float ip, r = modff(c->v[0].f[0], &ip); memcpy((void *)(uintptr_t)A0, &ip, 4); vzero(&c->v[0]); c->v[0].f[0] = r; }
 static void m_frexpf(Ctx *c) { int e; float r = frexpf(c->v[0].f[0], &e); wr32(A0, (uint32_t)e); vzero(&c->v[0]); c->v[0].f[0] = r; }
 
+/* ---------------------------------------------------------------- aligned allocation for the Skyline plugins
+ * The game DEFINES malloc / free / realloc / calloc / aligned_alloc itself (13.0.4: [game] 0x710353be80 malloc, 0x710353bf00
+ * free, 0x710353c0b0 aligned_alloc: lifted code over the game's own heap, f_710392dce0(align, size) / f_710392e590(ptr)),
+ * and nnro.c binds a plugin's malloc / free to those. The plugins free game buffers and the game frees theirs, so their
+ * memalign / posix_memalign (names the game does not have; boot.c's host _aligned_malloc versions would hand out blocks
+ * that the game's free cannot release) are the game's aligned_alloc too, found by its name in main's symbol table (any
+ * game build). Nested guest call: x0..x30 saved around it. */
+static uint64_t game_aligned_alloc(Ctx *c, uint64_t align, uint64_t size) {
+    static uint64_t fn;
+    if (!fn && !(fn = main_export("aligned_alloc"))) guest_trap("memalign: main defines no aligned_alloc", c->x[30] - 4);
+    uint64_t saved[31];
+    memcpy(saved, c->x, sizeof saved);
+    c->x[0] = align; c->x[1] = size;
+    call_guest(c, fn);
+    uint64_t p = c->x[0];
+    memcpy(c->x, saved, sizeof saved);
+    return p;
+}
+static void c_memalign(Ctx *c) { RET(game_aligned_alloc(c, A0, A1)); }           /* (size_t align, size_t size) */
+static void c_posix_memalign(Ctx *c) {                                            /* (void **out, size_t align, size_t size) -> errno */
+    uint64_t out = A0, align = A1;
+    if (align < 8 || (align & (align - 1))) { RET(22); return; }                    /* EINVAL: not a power of two multiple of sizeof(void *) */
+    uint64_t p = game_aligned_alloc(c, align, A2);
+    if (!p) { RET(12); return; }                                                    /* ENOMEM, *out untouched */
+    wr64(out, p);
+    RET(0);
+}
+
 static const ImportDef clib_imports[] = {
     {"sprintf", c_sprintf}, {"snprintf", c_snprintf}, {"vsnprintf", c_vsnprintf}, {"printf", c_printf}, {"fprintf", c_fprintf},
     {"_ZN2nn4util8SNPrintfEPcmPKcz", c_snprintf}, {"_ZN2nn4util9VSNPrintfEPcmPKcSt9__va_list", c_vsnprintf},
@@ -489,6 +517,7 @@ static const ImportDef clib_imports[] = {
     {"memset_s", c_memset_s}, {"rand", c_rand}, {"srand", c_srand}, {"time", c_time}, {"clock", c_clock},
     {"getenv", c_getenv}, {"atexit", c_atexit},
     {"exp2", m_exp2}, {"erfcf", m_erfcf}, {"modff", m_modff}, {"frexpf", m_frexpf},
+    {"memalign", c_memalign}, {"posix_memalign", c_posix_memalign},     /* plugins only: replace boot.c's host-heap versions */
 };
 
 void register_clib_imports(void) {

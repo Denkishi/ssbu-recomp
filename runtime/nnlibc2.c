@@ -416,8 +416,13 @@ static void c_gmtime_r(Ctx *c) {
  * 0x710399f994, is the thread-pool teardown of a statically linked library (it joins pool->threads[i] after
  * broadcasting two condition variables), and that pool can never have started a thread. No pthread_t can therefore
  * exist; a call with a non-null handle is reported in the trace and answered with ESRCH. */
+/* Since the Skyline plugins (nnro.c) the process can hold threads of their pthread_create (os_threads.c): those are joined
+ * there; any other handle is still answered ESRCH. */
+int os_pthread_join(uint64_t t, uint64_t retval_out);    /* os_threads.c: errno, or -1 when t is not a pthread_create thread */
 static void c_pthread_join(Ctx *c) {
-    if (A0) trace_printf("     pthread_join(%llx): no pthread can exist in this program (pthread_create is not imported) -> ESRCH\n", (unsigned long long)A0);
+    int r = os_pthread_join(A0, A1);
+    if (r >= 0) { RET(r); return; }
+    if (A0) trace_printf("     pthread_join(%llx): not a thread of pthread_create (the game itself never creates one) -> ESRCH\n", (unsigned long long)A0);
     if (A0 && A1) wr64(A1, 0);
     RET(3);
 }

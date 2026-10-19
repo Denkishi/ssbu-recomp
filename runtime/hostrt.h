@@ -16,6 +16,7 @@ typedef struct { const char *name; ImportFn fn; } ImportDef;
 #define HOSTFN_BASE 0x7400000000ULL      /* placeholder addresses for host functions handed out at run time */
 
 uint64_t hostfn_address(const char *name, ImportFn fn);
+uint64_t main_export(const char *name);   /* guest address of a symbol main defines (malloc ...), 0 if none */
 const char *hostfn_current_name(void);
 unsigned long long hostfn_current_calls(void);
 void print_hostfn_summary(FILE *out);

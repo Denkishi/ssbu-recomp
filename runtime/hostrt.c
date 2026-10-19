@@ -404,6 +404,14 @@ void *import_data(const char *name) {
     return NULL;
 }
 
+/* Guest address of a function or object that main itself defines and exports (malloc, free, aligned_alloc ...), 0 if
+ * there is none. Read from main's symbol table, so it holds for every game build without a GA() table entry. */
+uint64_t main_export(const char *name) {
+    for (int i = 0; i < dyn_sym_count; i++)
+        if (dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0) return GUEST_BASE + dyn_syms[i].value;
+    return 0;
+}
+
 /* What the relocations of main use for imported symbol `sym`: its redirected address or its placeholder
  * (nnro.c gives the run-time modules the same view). */
 uint64_t import_address(int sym) {
