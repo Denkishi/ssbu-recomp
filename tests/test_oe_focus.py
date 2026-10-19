@@ -46,6 +46,7 @@ def main():
         print(result.stdout + result.stderr)
         return result.returncode
     subprocess.run([str(exe)], cwd=work, check=True, timeout=20)
+    subprocess.run([str(exe), '--guest-bootstrap'], cwd=work, check=True, timeout=20)
     subprocess.run([str(exe), '--disabled'], cwd=work, check=True, timeout=20)
     return 0
 

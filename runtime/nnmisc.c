@@ -274,6 +274,21 @@ static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
     if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
     return TRUE;
 }
+/* Called with g_oe_lock held by both the guest and the watcher. A transient foreground
+ * report from an off-screen test window is not a user bringing the game to the front.
+ * Only an activatable window visible on a monitor opts into later focus loss/suspension;
+ * once opted in, the existing obscured/minimized handling continues to apply. */
+static int oe_observe_foreground(void) {
+    DWORD pid = 0;
+    HWND fg = GetForegroundWindow();
+    if (!fg || !GetWindowThreadProcessId(fg, &pid) || pid != GetCurrentProcessId()) return 0;
+    if (!g_oe_was_foreground && (!IsWindowVisible(fg) || IsIconic(fg)
+            || (GetWindowLongPtrA(fg, GWL_EXSTYLE) & WS_EX_NOACTIVATE)
+            || !MonitorFromWindow(fg, MONITOR_DEFAULTTONULL))) return 0;
+    g_oe_was_foreground = 1;
+    g_oe_window = fg;
+    return 1;
+}
 static void oe_track_focus(void);
 static DWORD WINAPI oe_watch(LPVOID unused) {
     const char *test = getenv("SSBU_FREEZE_TEST");
@@ -307,10 +322,7 @@ static DWORD WINAPI oe_watch(LPVOID unused) {
          * Keep producing focus notifications even while every guest consumer is asleep. */
         oe_track_focus();
         EnterCriticalSection(&g_oe_lock);
-        DWORD pid = 0;
-        HWND fg = GetForegroundWindow();
-        int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
-        if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
+        int ours = oe_observe_foreground();
         if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); continue; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
         int runnable = ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
@@ -346,10 +358,7 @@ static void oe_track_focus(void) {
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) { LeaveCriticalSection(&g_oe_lock); return; }
     last = now;
     g_oe_focus_recheck = 0;
-    DWORD pid = 0;
-    HWND fg = GetForegroundWindow();
-    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
-    if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
+    int ours = oe_observe_foreground();
     if (!g_oe_was_foreground) { LeaveCriticalSection(&g_oe_lock); return; }
     /* close4: the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
      * the window as the activity state: foreground = ForegroundVisible; visible but not the foreground window = ForegroundObscured

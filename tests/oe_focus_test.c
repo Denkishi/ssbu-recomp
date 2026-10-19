@@ -6,7 +6,8 @@
 #include "../runtime/os_threads.c"
 #undef ret0
 
-static volatile LONG test_foreground, test_minimised;
+static volatile LONG test_foreground, test_minimised, test_offscreen, test_noactivate;
+static volatile LONG test_visible = 1;
 static HWND test_GetForegroundWindow(void) {
     return InterlockedCompareExchange(&test_foreground, 0, 0) ? (HWND)(uintptr_t)1 : NULL;
 }
@@ -17,6 +18,20 @@ static DWORD test_GetWindowThreadProcessId(HWND w, LPDWORD pid) {
 static BOOL test_IsIconic(HWND w) {
     (void)w; return InterlockedCompareExchange(&test_minimised, 0, 0) != 0;
 }
+static BOOL test_IsWindowVisible(HWND w) {
+    (void)w; return InterlockedCompareExchange(&test_visible, 0, 0) != 0;
+}
+static LONG_PTR test_GetWindowLongPtrA(HWND w, int index) {
+    (void)w; assert(index == GWL_EXSTYLE);
+    return InterlockedCompareExchange(&test_noactivate, 0, 0) ? WS_EX_NOACTIVATE : 0;
+}
+static HMONITOR test_MonitorFromWindow(HWND w, DWORD flags) {
+    (void)w; assert(flags == MONITOR_DEFAULTTONULL);
+    return InterlockedCompareExchange(&test_offscreen, 0, 0) ? NULL : (HMONITOR)(uintptr_t)1;
+}
+#define IsWindowVisible test_IsWindowVisible
+#define GetWindowLongPtrA test_GetWindowLongPtrA
+#define MonitorFromWindow test_MonitorFromWindow
 #define GetForegroundWindow test_GetForegroundWindow
 #define GetWindowThreadProcessId test_GetWindowThreadProcessId
 #define IsIconic test_IsIconic
@@ -24,6 +39,9 @@ static BOOL test_IsIconic(HWND w) {
 #undef GetForegroundWindow
 #undef GetWindowThreadProcessId
 #undef IsIconic
+#undef IsWindowVisible
+#undef GetWindowLongPtrA
+#undef MonitorFromWindow
 
 static uint64_t notification_event;
 static void mode(int value) {
@@ -58,6 +76,19 @@ static void wait_frozen(int expected) {
     while (!!InterlockedCompareExchange(&g_guest_frozen, 0, 0) != expected && GetTickCount64() < deadline) Sleep(5);
     assert(!!InterlockedCompareExchange(&g_guest_frozen, 0, 0) == expected);
 }
+static int ignored_startup(const char *name) {
+    /* The watcher alone sees a transient foreground window, then a background one.
+     * Also query from the guest during the pulse: both producers must use the same rule. */
+    Ctx c = {0};
+    change_focus(1, test_minimised); Sleep(100);
+    oe_GetCurrentFocusState(&c);
+    change_focus(0, 0); Sleep(100);
+    EnterCriticalSection(&g_oe_lock);
+    int ok = !g_oe_was_foreground && !g_guest_frozen && g_oe_focus_state == 1 && !g_oe_count;
+    LeaveCriticalSection(&g_oe_lock);
+    if (!ok) fprintf(stderr, "FAIL %s startup incorrectly armed focus tracking\n", name);
+    return ok;
+}
 int main(int argc, char **argv) {
     int disabled = argc > 1 && !strcmp(argv[1], "--disabled");
     _putenv("SSBU_FREEZE_TEST=");
@@ -66,13 +97,26 @@ int main(int argc, char **argv) {
     Ctx c = {0};
     /* Asking for the event must also start the watcher; no other oe call here. */
     oe_GetNotificationMessageEvent(&c); notification_event = c.x[0];
-    change_focus(1, 0);
     if (argc > 1 && !strcmp(argv[1], "--guest-bootstrap")) mode(2);
     if (disabled) {
         Sleep(100); mode(2); drain(); change_focus(0, 1); Sleep(100);
         assert(!ev_wait_ms(obj(notification_event), 0) && !g_guest_frozen && g_oe_focus_state == 1);
         puts("PASS focus tracking disabled: no focus notification or suspension"); return 0;
     }
+    change_focus(0, 0);
+    InterlockedExchange(&test_offscreen, 1);
+    if (!ignored_startup("off-screen")) return 1;
+    InterlockedExchange(&test_offscreen, 0);
+    InterlockedExchange(&test_noactivate, 1);
+    if (!ignored_startup("non-activating")) return 1;
+    InterlockedExchange(&test_noactivate, 0);
+    InterlockedExchange(&test_visible, 0);
+    if (!ignored_startup("hidden")) return 1;
+    InterlockedExchange(&test_visible, 1);
+    InterlockedExchange(&test_minimised, 1);
+    if (!ignored_startup("minimized")) return 1;
+    puts("PASS transient off-screen, non-activating, hidden and minimized startup never arms focus tracking");
+    change_focus(1, 0);
     ULONGLONG deadline = GetTickCount64() + 2000;
     int seen = 0;
     while (!seen && GetTickCount64() < deadline) {
