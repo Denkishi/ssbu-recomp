@@ -384,8 +384,18 @@ class Fn:
             return SET(rt, 1, ['rd32(%s)', 'rd64(%s)', '(int64_t)(int32_t)rd32(%s)'][opc] % a)
         if bits(w, 29, 24) == 8 and not v:               # exclusive / ordered
             size, o2, load, o1 = bits(w, 31, 30), bits(w, 23, 23), bits(w, 22, 22), bits(w, 21, 21)
-            if o1:
-                raise Unimpl('excl-pair')
+            if o1:                                       # ldxp / ldaxp / stxp / stlxp (o2 = 1 is cas, size 0x casp: not here)
+                if o2 or not bits(w, 31, 31):
+                    raise Unimpl('excl-pair')
+                rt2 = bits(w, 14, 10)                    # plain loads and a compare-and-swap, as ldxr / stxr below
+                if bits(w, 30, 30) == 0:                 # two W registers: one 8-byte exclusive, ex_val holds both
+                    if load:
+                        return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd64(a); %s %s }' % (XS(rn), SET(rt, 0, 'c->ex_val'), SET(rt2, 0, 'c->ex_val >> 32'))
+                    return SET(bits(w, 20, 16), 0, 'stx64(c, %s, ((uint64_t)%s << 32) | %s)' % (XS(rn), W(rt2), W(rt)))
+                if load:                                 # two X registers: ex_val / ex_val2, checked by stxp64 (16-byte CAS)
+                    return ('{ uint64_t a = %s; uint64_t lo = rd64(a), hi = rd64(a + 8); c->ex_addr = a; c->ex_val = lo; c->ex_val2 = hi; %s %s }'
+                            % (XS(rn), SET(rt, 1, 'lo'), SET(rt2, 1, 'hi')))
+                return SET(bits(w, 20, 16), 0, 'stxp64(c, %s, %s, %s)' % (XS(rn), X(rt), X(rt2)))
             nb = 8 << size
             rs = bits(w, 20, 16)
             if o2:                                       # ldar / stlr: ordered, not exclusive
@@ -520,6 +530,9 @@ class Fn:
                     if opcode == 10:
                         return SET(rd, sf, '(%s)%s >> %s' % ('int64_t' if sf else 'int32_t', a, amt))
                     return SET(rd, sf, 'ror%d(%s, %s)' % (size, a, amt))
+                if 0x10 <= opcode <= 0x17 and sf == ((opcode & 3) == 3):    # crc32b/h/w/x, crc32cb/h/w/x (runtime.h crc32_arm)
+                    return SET(rd, 0, 'crc32_arm(%s, %s, %d, 0x%xU)' % (W(rn), X(rm) if sf else W(rm), 1 << (opcode & 3),
+                                                                        0x82f63b78 if opcode & 4 else 0xedb88320))
                 raise Unimpl('dp2')
             a = R(rn, sf)
             if opcode == 0:
@@ -723,6 +736,13 @@ class Fn:
                     return 'v_f3v(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), op, sz, fcount())
                 if opc == 3 and u and size:
                     return 'v_bitsel(%s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), size, q)
+                opx = {(0, 0x08): 'IX_SSHL', (1, 0x08): 'IX_USHL', (0, 0x0c): 'IX_SMAX', (1, 0x0c): 'IX_UMAX', (0, 0x0d): 'IX_SMIN',
+                       (1, 0x0d): 'IX_UMIN', (0, 0x17): 'IX_ADDP', (0, 0x14): 'IX_SMAXP', (1, 0x14): 'IX_UMAXP', (0, 0x15): 'IX_SMINP',
+                       (1, 0x15): 'IX_UMINP'}.get((u, opc))
+                if opx:                                  # neon.h v_i3x; scalar: only sshl / ushl d; 2d: not max / min
+                    if (scalar and (size != 3 or opc != 0x08)) or (size == 3 and (not q or opc in (0x0c, 0x0d, 0x14, 0x15))):
+                        raise Unimpl('simd-i3')
+                    return 'v_i3x(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), opx, size, icount(size))
                 op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS'}.get((u, opc))
                 if op is None:
@@ -738,11 +758,31 @@ class Fn:
                     return 'v_f1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, sz, fcount())
                 if (u, opc) == (0, 0x12) and not scalar and size < 3:
                     return 'v_xtn(%s, %s, %d);' % (V(rd), V(rn), size)
+                opx = {(0, 0x08): 'I1X_CMGT0', (1, 0x08): 'I1X_CMGE0', (1, 0x09): 'I1X_CMLE0', (0, 0x0a): 'I1X_CMLT0'}.get((u, opc))
+                if opx:                                  # compare with zero (neon.h v_i1x); scalar: d only
+                    if (scalar and size != 3) or (size == 3 and not q):
+                        raise Unimpl('simd-misc')
+                    return 'v_i1x(%s, %s, %s, %d, %d);' % (V(rd), V(rn), opx, size, icount(size))
+                if opc in (0x02, 0x06) and not scalar and size < 3:      # saddlp / uaddlp / sadalp / uadalp
+                    return 'v_addlp(%s, %s, %d, %d, %d, %d);' % (V(rd), V(rn), size, u, opc == 0x06, (16 if q else 8) >> (size + 1))
+                if (u, opc) in ((0, 0x16), (0, 0x17)) and not scalar and a == 0:   # fcvtn(2) / fcvtl(2): sz 0 half <-> single, 1 single <-> double
+                    return 'v_%s(%s, %s, %d, %d);' % ('fcvtl' if opc == 0x17 else 'fcvtn', V(rd), V(rn), sz, q)
                 op = {(1, 0x05): 'I1_NOT', (0, 0x05): 'I1_CNT', (1, 0x0b): 'I1_NEG', (0, 0x0b): 'I1_ABS',
                       (0, 0x09): 'I1_CMEQ0', (0, 0x00): 'I1_REV64'}.get((u, opc))
                 if op is None or (op in ('I1_NOT', 'I1_CNT') and size):
                     raise Unimpl('simd-misc')
                 return 'v_i1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, size, icount(size))
+            if bits(w, 20, 17) == 8 and bits(w, 11, 10) == 2:
+                opc = bits(w, 16, 12)
+                if scalar and not u and opc == 0x1b and size == 3:          # addp dD, vN.2d
+                    return '{ uint64_t t = c->v[%d].d[0] + c->v[%d].d[1]; vzero(%s); c->v[%d].d[0] = t; }' % (rn, rn, V(rd), rd)
+                if not scalar:                                               # across lanes (neon.h v_across / v_facross)
+                    opx = {(0, 0x1b): 'AX_ADDV', (0, 0x03): 'AX_SADDLV', (1, 0x03): 'AX_UADDLV', (0, 0x0a): 'AX_SMAXV',
+                           (1, 0x0a): 'AX_UMAXV', (0, 0x1a): 'AX_SMINV', (1, 0x1a): 'AX_UMINV'}.get((u, opc))
+                    if opx and (size < 2 or (size == 2 and q)):
+                        return 'v_across(%s, %s, %s, %d, %d);' % (V(rd), V(rn), opx, size, icount(size))
+                    if u and opc in (0x0c, 0x0f) and sz == 0 and q:         # fmaxnmv / fminnmv / fmaxv / fminv, 4s
+                        return 'v_facross(%s, %s, %d, %d);' % (V(rd), V(rn), a, opc == 0x0c)
             if scalar and u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:
                 f, ft = ('df', 'double') if sz else ('f', 'float')   # faddp scalar
                 return '{ %s t = c->v[%d].%s[0] + c->v[%d].%s[1]; vzero(%s); c->v[%d].%s[0] = t; }' % (ft, rn, f, rn, f, V(rd), rd, f)
@@ -795,6 +835,13 @@ class Fn:
             return 'v_shift(%s, %s, %d, %d, 0, %d);' % (V(rd), V(rn), immhb - (8 << es), es, icount(es))
         if opc == 0:
             return 'v_shift(%s, %s, %d, %d, %d, %d);' % (V(rd), V(rn), (16 << es) - immhb, es, 2 if u else 1, icount(es))
+        kind = {(0, 0x02): 'SX_SSRA', (1, 0x02): 'SX_USRA', (0, 0x04): 'SX_SRSHR', (1, 0x04): 'SX_URSHR', (0, 0x06): 'SX_SRSRA',
+                (1, 0x06): 'SX_URSRA', (1, 0x08): 'SX_SRI', (1, 0x0a): 'SX_SLI'}.get((u, opc))
+        if kind and not (scalar and es != 3) and not (es == 3 and not q):   # neon.h v_shiftx; scalar: d only
+            amount = immhb - (8 << es) if kind == 'SX_SLI' else (16 << es) - immhb
+            return 'v_shiftx(%s, %s, %d, %d, %s, %d);' % (V(rd), V(rn), amount, es, kind, icount(es))
+        if opc in (0x10, 0x11) and not u and not scalar and es < 3:          # shrn(2) / rshrn(2) (neon.h v_shrn)
+            return 'v_shrn(%s, %s, %d, %d, %d, %d);' % (V(rd), V(rn), (16 << es) - immhb, es, opc & 1, q)
         raise Unimpl('simd-shift')
 
 

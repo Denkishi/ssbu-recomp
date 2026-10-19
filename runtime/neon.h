@@ -327,4 +327,178 @@ static inline void v_shift(V128 *d, const V128 *pn, int shift, int sz, int kind,
     *d = r;
 }
 
+/* ---- Instructions the game's code does not use (they appear in Rust-compiled modules, e.g. Skyline plugins). Added
+ * after the existing helpers, which do not change. Same rules: element by element, the upper half of a 64-bit (Q = 0)
+ * destination cleared. */
+
+/* Integer three-same additions. SSHL / USHL: shift by the signed low byte of each element of vm (negative: right,
+ * arithmetic for SSHL); SMAX..UMIN; the pairwise forms (ADDP, SMAXP..UMINP) work on the concatenation vm:vn. */
+enum { IX_SSHL, IX_USHL, IX_SMAX, IX_UMAX, IX_SMIN, IX_UMIN, IX_ADDP, IX_SMAXP, IX_UMAXP, IX_SMINP, IX_UMINP };
+
+static inline uint64_t ix_op(int op, uint64_t x, uint64_t y, int sz) {
+    int bits = 8 << sz;
+    switch (op) {
+    case IX_SSHL: case IX_USHL: {
+        int s = (int8_t)y;
+        if (s >= 0) return s >= bits ? 0 : x << s;
+        s = -s;
+        if (op == IX_USHL) return s >= bits ? 0 : x >> s;
+        return (uint64_t)(vsext(x, sz) >> (s >= bits ? bits - 1 : s));
+    }
+    case IX_SMAX: case IX_SMAXP: return vsext(x, sz) > vsext(y, sz) ? x : y;
+    case IX_UMAX: case IX_UMAXP: return x > y ? x : y;
+    case IX_SMIN: case IX_SMINP: return vsext(x, sz) < vsext(y, sz) ? x : y;
+    case IX_UMIN: case IX_UMINP: return x < y ? x : y;
+    case IX_ADDP: return x + y;
+    }
+    return 0;
+}
+static inline void v_i3x(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int n) {
+    V128 a = *pn, b = *pm, r;
+    r.d[0] = 0; r.d[1] = 0;
+    if (op >= IX_ADDP) {
+        int half = n / 2;
+        for (int i = 0; i < half; i++) {
+            vset(&r, sz, i, ix_op(op, vget(&a, sz, 2 * i), vget(&a, sz, 2 * i + 1), sz));
+            vset(&r, sz, half + i, ix_op(op, vget(&b, sz, 2 * i), vget(&b, sz, 2 * i + 1), sz));
+        }
+    } else {
+        for (int i = 0; i < n; i++) vset(&r, sz, i, ix_op(op, vget(&a, sz, i), vget(&b, sz, i), sz));
+    }
+    *d = r;
+}
+
+/* Compare signed elements with zero: CMGT / CMGE / CMLE / CMLT #0 (CMEQ #0 is I1_CMEQ0). */
+enum { I1X_CMGT0, I1X_CMGE0, I1X_CMLE0, I1X_CMLT0 };
+
+static inline void v_i1x(V128 *d, const V128 *pn, int op, int sz, int n) {
+    V128 a = *pn, r;
+    r.d[0] = 0; r.d[1] = 0;
+    uint64_t ones = sz == 3 ? ~0ull : ((1ull << (8 << sz)) - 1);
+    for (int i = 0; i < n; i++) {
+        int64_t x = vsext(vget(&a, sz, i), sz);
+        int t = op == I1X_CMGT0 ? x > 0 : op == I1X_CMGE0 ? x >= 0 : op == I1X_CMLE0 ? x <= 0 : x < 0;
+        vset(&r, sz, i, t ? ones : 0);
+    }
+    *d = r;
+}
+
+/* SADDLP / UADDLP / SADALP / UADALP: adjacent pairs of sz elements added into n elements of size sz + 1 (and, for the
+ * accumulating forms, added to the destination's elements). */
+static inline void v_addlp(V128 *d, const V128 *pn, int sz, int is_unsigned, int acc, int n) {
+    V128 a = *pn, o = *d, r;
+    r.d[0] = 0; r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t x = vget(&a, sz, 2 * i), y = vget(&a, sz, 2 * i + 1);
+        uint64_t s = is_unsigned ? x + y : (uint64_t)(vsext(x, sz) + vsext(y, sz));
+        vset(&r, sz + 1, i, s + (acc ? vget(&o, sz + 1, i) : 0));
+    }
+    *d = r;
+}
+
+/* Across all n elements, result in element 0 (size sz, or sz + 1 for the long sums), the rest of vd cleared. */
+enum { AX_ADDV, AX_SADDLV, AX_UADDLV, AX_SMAXV, AX_UMAXV, AX_SMINV, AX_UMINV };
+
+static inline void v_across(V128 *d, const V128 *pn, int op, int sz, int n) {
+    V128 a = *pn, r;
+    r.d[0] = 0; r.d[1] = 0;
+    uint64_t acc = vget(&a, sz, 0);
+    int64_t sacc = vsext(acc, sz);
+    for (int i = 1; i < n; i++) {
+        uint64_t x = vget(&a, sz, i);
+        int64_t sx = vsext(x, sz);
+        switch (op) {
+        case AX_ADDV: case AX_UADDLV: acc += x; break;
+        case AX_SADDLV: sacc += sx; break;
+        case AX_SMAXV: if (sx > sacc) { sacc = sx; acc = x; } break;
+        case AX_UMAXV: if (x > acc) acc = x; break;
+        case AX_SMINV: if (sx < sacc) { sacc = sx; acc = x; } break;
+        case AX_UMINV: if (x < acc) acc = x; break;
+        }
+    }
+    if (op == AX_SADDLV) vset(&r, sz + 1, 0, (uint64_t)sacc);
+    else vset(&r, op == AX_UADDLV ? sz + 1 : sz, 0, acc);
+    *d = r;
+}
+
+/* FMAXNMV / FMINNMV / FMAXV / FMINV, 4 singles: Reduce() of the Arm manual pairs the halves, op(op(e0, e1), op(e2, e3)). */
+static inline void v_facross(V128 *d, const V128 *pn, int is_min, int num) {
+    V128 a = *pn;
+    uint32_t lo = fp_maxmin32_bits(a.w[0], a.w[1], is_min, num), hi = fp_maxmin32_bits(a.w[2], a.w[3], is_min, num);
+    uint32_t t = fp_maxmin32_bits(lo, hi, is_min, num);
+    vzero(d);
+    d->w[0] = t;
+}
+
+/* Shifts by immediate. kind: SSRA / USRA (shift right and accumulate), SRSHR / URSHR (rounding), SRSRA / URSRA (both),
+ * SRI / SLI (shift and insert: the destination keeps the bits the shift brings in). Right shifts are 1..esize. */
+enum { SX_SSRA, SX_USRA, SX_SRSHR, SX_URSHR, SX_SRSRA, SX_URSRA, SX_SRI, SX_SLI };
+
+static inline void v_shiftx(V128 *d, const V128 *pn, int shift, int sz, int kind, int n) {
+    V128 a = *pn, o = *d, r;
+    int bits = 8 << sz;
+    uint64_t ones = sz == 3 ? ~0ull : ((1ull << bits) - 1);
+    r.d[0] = 0; r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t x = vget(&a, sz, i), dv = vget(&o, sz, i), z = 0, m;
+        switch (kind) {
+        case SX_SSRA: z = dv + (uint64_t)(vsext(x, sz) >> (shift >= bits ? bits - 1 : shift)); break;
+        case SX_USRA: z = dv + (shift >= bits ? 0 : x >> shift); break;
+        case SX_SRSHR: case SX_SRSRA:
+            z = (uint64_t)(int64_t)(((__int128)vsext(x, sz) + ((__int128)1 << (shift - 1))) >> shift);
+            if (kind == SX_SRSRA) z += dv;
+            break;
+        case SX_URSHR: case SX_URSRA:
+            z = (uint64_t)(((unsigned __int128)x + ((unsigned __int128)1 << (shift - 1))) >> shift);
+            if (kind == SX_URSRA) z += dv;
+            break;
+        case SX_SRI:
+            if (shift >= bits) { z = dv; break; }
+            m = ones >> shift;
+            z = (dv & ~m) | (x >> shift);
+            break;
+        case SX_SLI:
+            m = (ones << shift) & ones;
+            z = (dv & ~m) | ((x << shift) & m);
+            break;
+        }
+        vset(&r, sz, i, z);
+    }
+    *d = r;
+}
+
+/* SHRN / RSHRN (and the "2" forms, upper = 1: written to the upper half, the lower half of vd kept): elements of size
+ * sz + 1 shifted right (1..esize, rounding for RSHRN) and narrowed to size sz. */
+static inline void v_shrn(V128 *d, const V128 *pn, int shift, int sz, int round, int upper) {
+    V128 a = *pn, r;
+    int n = 8 >> sz;
+    r.d[0] = upper ? d->d[0] : 0;
+    r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned __int128 x = vget(&a, sz + 1, i);
+        if (round) x += (unsigned __int128)1 << (shift - 1);
+        vset(&r, sz, (upper ? n : 0) + i, (uint64_t)(x >> shift));
+    }
+    *d = r;
+}
+
+/* FCVTL / FCVTL2: widen the lower (upper = 1: upper) half, half -> single (dbl = 0) or single -> double (dbl = 1).
+ * FCVTN / FCVTN2: narrow, single -> half or double -> single, into the lower half (FCVTN2: the upper half, lower kept).
+ * Half precision through fpexact.h; single <-> double are the host's conversions (as the scalar FCVT), which round to
+ * nearest and quiet a NaN keeping the top of its payload, like FPConvert with FPCR.DN = 0. */
+static inline void v_fcvtl(V128 *d, const V128 *pn, int dbl, int upper) {
+    V128 a = *pn, r;
+    if (dbl) for (int i = 0; i < 2; i++) r.df[i] = (double)a.f[i + 2 * upper];
+    else for (int i = 0; i < 4; i++) r.f[i] = half_to_f32(a.h[i + 4 * upper]);
+    *d = r;
+}
+static inline void v_fcvtn(V128 *d, const V128 *pn, int dbl, int upper) {
+    V128 a = *pn, r;
+    r.d[0] = upper ? d->d[0] : 0;
+    r.d[1] = 0;
+    if (dbl) for (int i = 0; i < 2; i++) r.f[i + 2 * upper] = (float)a.df[i];
+    else for (int i = 0; i < 4; i++) r.h[i + 4 * upper] = f32_to_half(a.f[i]);
+    *d = r;
+}
+
 #endif
