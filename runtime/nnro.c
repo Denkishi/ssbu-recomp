@@ -60,6 +60,8 @@ typedef struct {
     void (*stx_diag)(Ctx *, uint64_t, uint64_t, uint64_t, uint64_t, int);
     void (*nro_import)(Ctx *, void *, int);
     void (*catch_call)(Ctx *, void (*)(Ctx *, uint64_t));      /* nnunwind.c: entry of functions with a catch clause */
+    void (*site_inline)(Ctx *, uint64_t);                      /* site callouts of a re-lifted module (nro_bin_sky, relift_sites.py) */
+    int (*site_midhook)(Ctx *, uint64_t);
 } NroHost;
 typedef struct { uint64_t lp; void (*fn)(Ctx *, uint64_t); } NroResume;      /* landing pad -> resume entry (nnunwind.c) */
 /* a DLL built before the exception support fills only the first four fields: resume stays NULL */
@@ -418,7 +420,9 @@ static int cmp_host(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
-static const NroHost g_host = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag, nro_import_host, nro_catch_call};
+void sky_site_inline(Ctx *c, uint64_t pc);                   /* skyline.c (included below) */
+int sky_site_midhook(Ctx *c, uint64_t pc);
+static const NroHost g_host = {call_indirect, host_import, guest_trap, guest_unimpl, guest_svc, stx_diag, nro_import_host, nro_catch_call, sky_site_inline, sky_site_midhook};
 
 /* Load nro_bin\<module>.dll (next to the exe) and take its tables. */
 static int attach_dll(NroModule *m) {
@@ -429,7 +433,14 @@ static int attach_dll(NroModule *m) {
     const char *bin = getenv("SSBU_NRO_BIN");               /* folder of the module DLLs next to the exe (default nro_bin) */
     if (m->plugin) bin = sky_bin_dir();                     /* skyline.c: plugin_bin (SSBU_PLUGIN_BIN) */
     snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_eh_o2", m->info->name);      /* P3 (2026-10-09): the optimised modules are the default; SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
-    HMODULE dll = LoadLibraryA(path);
+    HMODULE dll = NULL;
+    if (!m->plugin && sky_registry() > 0) {                 /* skyline.c: a module re-lifted with the plugins' sites (relift_sites.py --module) */
+        char hp[MAX_PATH * 2];
+        snprintf(hp, sizeof hp, "%.*snro_bin_sky\\%s.dll", (int)n, path, m->info->name);
+        dll = LoadLibraryA(hp);
+        if (dll) printf("nn::ro: %s from %s\n", m->info->name, hp);
+    }
+    if (!dll) dll = LoadLibraryA(path);
     const char *python = getenv("SSBU_NRO_AUTOBUILD");       /* development aid: path of python.exe; lift a missing module on demand */
     if (!dll && python && python[0]) {
         char cmd[MAX_PATH * 4];

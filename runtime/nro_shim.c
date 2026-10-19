@@ -13,6 +13,10 @@ typedef struct {
     void (*stx_diag)(Ctx *, uint64_t, uint64_t, uint64_t, uint64_t, int);
     void (*nro_import)(Ctx *, void *, int);
     void (*catch_call)(Ctx *, void (*)(Ctx *, uint64_t));      /* nnunwind.c; absent in hosts older than the exception support */
+    /* appended: the site callouts of a module re-lifted from a site list (tools/lifter/relift_sites.py --module,
+     * nro_bin_sky); only such a DLL calls them, an older host does not have them */
+    void (*site_inline)(Ctx *, uint64_t);
+    int (*site_midhook)(Ctx *, uint64_t);
 } NroHost;
 typedef struct { uint64_t lp; void (*fn)(Ctx *, uint64_t); } NroResume;
 typedef struct { const FnEntry *fns; int fn_count; const DynSym *syms; int sym_count; const NroResume *resume; int resume_count; } NroTables;
@@ -39,6 +43,8 @@ void guest_svc(Ctx *c, uint32_t number) { host.guest_svc(c, number); }
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits) { host.stx_diag(c, a, expected, seen, v, bits); }
 void nro_import(Ctx *c, struct NroModule *m, int sym) { host.nro_import(c, m->host_module, sym); }
 void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) { host.catch_call(c, body); }
+void sky_site_inline(Ctx *c, uint64_t addr) { host.site_inline(c, addr); }      /* see game_shim.c */
+int sky_site_midhook(Ctx *c, uint64_t addr) { return host.site_midhook(c, addr); }
 
 __declspec(dllexport) void nro_bind(const NroHost *h, void *host_module, NroTables *t) {
     host = *h;

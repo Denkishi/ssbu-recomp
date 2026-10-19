@@ -11,16 +11,16 @@
  * and Skyline's exports are host functions:
  *   A64HookFunction(sym, repl, &orig)  function entry of lifted code -> the hook table (hook_install); an import of main or
  *                                      a host function (nn::ro::LoadModule ...) -> hostentry_hook (hostrt.c); any other
- *                                      address of main is a "mid-function hook", which lifted code has no place for: NOT
- *                                      ACTIVE.
+ *                                      address of main = a "mid-function hook": active only where the re-lifted game DLL
+ *                                      (tools/lifter/relift_sites.py: site list) has a callout there (sky_site_midhook).
  *   A64InlineHook(addr, cb)            at a lifted function entry: a hook-table layer runs the callbacks, then the original;
- *                                      elsewhere: NOT ACTIVE.
+ *                                      elsewhere: the re-lifted code calls sky_site_inline(c, addr) before the instruction.
  *   sky_memcpy(dst, src, n)            writes the bytes (through a writable view of read-only pages); a write into data
- *                                      takes effect, a write into code that has been compiled ahead of time does not.
+ *                                      takes effect, a write into code only where the re-lifted DLL compiled that word in.
  *   getRegionAddress, get_program_id, skyline_tcp_send_raw (log), get_plugin_addresses (NULL, as Skyline's own build).
- * Every hook / inline hook / patch a plugin makes is written to skyline_sites.log (next to the exe), one site per line
- * (kind, address; a patch with the old and new word), marked "active" or "NOT ACTIVE", so you can see what a plugin did
- * that has no effect here.
+ * Every hook / inline hook / patch a plugin makes is written to skyline_sites.log (next to the exe) in the re-lift site
+ * list format (kind, address; a patch with the old and new word), marked "active" or "NOT ACTIVE", so the next re-lift
+ * can cover it.
  *
  * Also here, because plugins walk them: rtld ModuleObjects for main, the SDK and every loaded module, in the lists
  * nn::ro::detail::g_pAutoLoadList / g_pManualLoadList (smashline's rtld crate reads them), nn::ro::LookupSymbol /
@@ -42,6 +42,8 @@ int sdk_image_ready(void);
 #define SKY_PLUGIN_DIR "atmosphere\\contents\\01006A800016E000\\romfs\\skyline\\plugins"
 
 static void sky_find_interpreter(NroModule *m);
+static void sky_sites_init(void);
+static void sky_sites_add(HMODULE m, const char *what);
 static NroInfo g_sky_info[SKY_MAX_PLUGINS];
 static char g_sky_src[SKY_MAX_PLUGINS][MAX_PATH];
 static int g_sky_count;
@@ -229,6 +231,7 @@ static void sky_module_loaded(NroModule *m, uint64_t obj) {
     rtld_fill(obj, base, image_dynamic(base), m->info->image_size);
     list_push(&g_sky_manual, obj);
     m->rtld_obj = obj;
+    if (!m->plugin) { sky_sites_init(); sky_sites_add(m->dll, m->info->name); }      /* a module re-lifted with sites (nro_bin_sky) */
 }
 static void sky_module_unloaded(NroModule *m) {
     if (m->rtld_obj) list_remove(&g_sky_manual, m->rtld_obj);
@@ -296,6 +299,41 @@ static int sky_svc(Ctx *c, uint32_t n) {
     return 0;
 }
 
+/* ---------------------------------------------------------------- sites compiled into a re-lifted DLL
+ * A game DLL or module DLL re-lifted from a site list (tools/lifter/relift_sites.py) exports sky_site_table (kind 1 patch,
+ * 2 inline, 3 midhook, 4 dynimm, 5 jtable, 6 noinline): what it has compiled in. */
+typedef struct { uint64_t addr; uint32_t kind; uint32_t word; } SkySite;
+static struct { const SkySite *t; int n; } g_site_tabs[16];      /* the game DLL's, then each re-lifted module DLL's */
+static volatile LONG g_site_ntabs;
+static void sky_sites_add(HMODULE m, const char *what) {
+    const SkySite *t = m ? (const SkySite *)(void *)GetProcAddress(m, "sky_site_table") : NULL;
+    const int *n = m ? (const int *)(void *)GetProcAddress(m, "sky_site_count") : NULL;
+    if (!t || !n) return;
+    LONG k = InterlockedIncrement(&g_site_ntabs) - 1;
+    if (k >= 16) return;
+    g_site_tabs[k].t = t; g_site_tabs[k].n = *n;
+    sky_logf("%s has %d plugin sites compiled in", what, *n);
+}
+static void sky_sites_init(void) {               /* the game DLL the exe was linked against (RECOMP_DLL), whatever its name */
+    static volatile LONG done;
+    extern const FnEntry (*game_fn_table_p)[];   /* gamedll.c: the DLL's fn_table */
+    if (InterlockedExchange(&done, 1)) return;
+    HMODULE gm = NULL;
+    char name[MAX_PATH] = "the game DLL";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(const void *)game_fn_table_p, &gm)) {
+        DWORD k = GetModuleFileNameA(gm, name, sizeof name);
+        while (k && name[k - 1] != '\\' && name[k - 1] != '/') k--;
+        memmove(name, name + k, strlen(name + k) + 1);
+    }
+    sky_sites_add(gm, name);
+}
+static const SkySite *sky_compiled(uint64_t addr, uint32_t kind) {
+    sky_sites_init();
+    for (int k = 0; k < g_site_ntabs && k < 16; k++)
+        for (int i = 0; i < g_site_tabs[k].n; i++) if (g_site_tabs[k].t[i].addr == addr && g_site_tabs[k].t[i].kind == kind) return &g_site_tabs[k].t[i];
+    return NULL;
+}
+
 /* "module+offset" for the log */
 static void sky_where(uint64_t a, char *out, size_t n) {
     if (a >= GUEST_BASE && a < GUEST_BASE + IMAGE_SIZE) { snprintf(out, n, "main+0x%llx", (unsigned long long)(a - GUEST_BASE)); return; }
@@ -333,6 +371,11 @@ static void sky_run_inline(Ctx *c, SkyInline *e) {
         c->N = f[0]; c->Z = f[1]; c->C = f[2]; c->V = f[3];
     }
 }
+/* the re-lifted code calls this before the instruction at pc (game_shim.c / nro_shim.c host interface) */
+void sky_site_inline(Ctx *c, uint64_t pc) {
+    SkyInline *e = sky_ih_find(pc);
+    if (e && e->n) sky_run_inline(c, e);
+}
 static void sky_ih_entry(Ctx *c, void *user) { SkyInline *e = user; sky_run_inline(c, e); e->orig(c); }
 
 static void sky_A64InlineHook(Ctx *c) {
@@ -349,19 +392,39 @@ static void sky_A64InlineHook(Ctx *c) {
     if (e->n < 16) e->cb[e->n++] = cb;
     ReleaseSRWLockExclusive(&g_sky_lock);
     const char *state;
-    if (function_at(addr)) {
+    if (sky_compiled(addr, 2)) state = "active (callout)";
+    else if (function_at(addr)) {
         if (fresh) e->entry = hook_install(addr, sky_ih_entry, e, &e->orig) > 0;
         state = e->entry ? "active (entry hook)" : "NOT ACTIVE (hook table refused the entry)";
-    } else state = "NOT ACTIVE (not a function entry: compiled code has no place for it)";
+    } else state = "NOT ACTIVE (needs a callout: re-lift)";
     sky_site("inline %llx    # %s cb=%llx %s", (unsigned long long)addr, where, (unsigned long long)cb, state);
     if (state[0] == 'N') sky_logf("inline hook at %s: %s", where, state);
 }
 
 /* ---------------------------------------------------------------- function hooks */
-typedef struct SkyHook { uint64_t target, repl; ImportFn orig; volatile LONG64 calls; struct SkyHook *all; } SkyHook;
+typedef struct SkyHook { uint64_t target, repl; ImportFn orig; struct SkyHook *prev; volatile LONG64 calls; struct SkyHook *all; } SkyHook;
 static SkyHook *volatile g_sky_hooks;      /* every hook, for the report at exit */
 static void sky_hook_thunk(Ctx *c, void *user) { InterlockedIncrement64(&((SkyHook *)user)->calls); call_indirect(c, ((SkyHook *)user)->repl); }
 static void sky_hook_orig(Ctx *c, void *user) { ((SkyHook *)user)->orig(c); }
+
+/* mid-function hooks: a branch written at a non-entry address of main; the re-lifted code asks at that point */
+typedef struct SkyMid { uint64_t addr; SkyHook *top; struct SkyMid *next; } SkyMid;
+static SkyMid *g_sky_mid;
+static __declspec(thread) uint64_t t_sky_mid_skip;       /* "orig" of a mid hook: run the original instruction at addr */
+int sky_site_midhook(Ctx *c, uint64_t pc) {
+    if (t_sky_mid_skip == pc) { t_sky_mid_skip = 0; return 0; }
+    for (SkyMid *m = g_sky_mid; m; m = m->next)
+        if (m->addr == pc && m->top) { call_indirect(c, m->top->repl); return 1; }
+    return 0;
+}
+static void sky_mid_orig(Ctx *c, void *user) {           /* the previous hook at the address, or the original code from it */
+    SkyHook *h = user;
+    if (h->prev) { call_indirect(c, h->prev->repl); return; }
+    ImportFn f = function_at(h->target);
+    if (!f) guest_trap("skyline: original of a mid-function hook: no lifted entry at the address (re-lift with a midhook site)", h->target);
+    t_sky_mid_skip = h->target;
+    f(c);
+}
 
 static void sky_A64HookFunction(Ctx *c) {
     uint64_t sym = c->x[0], repl = c->x[1], out = c->x[2];
@@ -371,12 +434,21 @@ static void sky_A64HookFunction(Ctx *c) {
     do h->all = g_sky_hooks; while (InterlockedCompareExchangePointer((void *volatile *)&g_sky_hooks, h, h->all) != h->all);
     const char *state = "active";
     uint64_t orig = 0;
-    if (function_at(sym)) {
+    int mid = sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE && sky_compiled(sym, 3);   /* the re-lifted DLL has an entry there too */
+    if (!mid && function_at(sym)) {
         if (hook_install(sym, sky_hook_thunk, h, &h->orig) > 0) orig = hostfn_closure("skyline orig", sky_hook_orig, h);
         else state = "NOT ACTIVE (hook table refused the entry)";
-    } else if (hostentry_hook(sym, sky_hook_thunk, h, &orig)) state = "active (host entry)";
-    else if (sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE) state = "NOT ACTIVE (mid-function: compiled code has no place for it)";
-    else state = "NOT ACTIVE (not lifted code of main or a module)";
+    } else if (!mid && hostentry_hook(sym, sky_hook_thunk, h, &orig)) state = "active (host entry)";
+    else if (sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE) {
+        AcquireSRWLockExclusive(&g_sky_lock);
+        SkyMid *m = g_sky_mid;
+        while (m && m->addr != sym) m = m->next;
+        if (!m) { m = calloc(1, sizeof *m); m->addr = sym; m->next = g_sky_mid; g_sky_mid = m; }
+        h->prev = m->top; m->top = h;
+        ReleaseSRWLockExclusive(&g_sky_lock);
+        orig = hostfn_closure("skyline mid orig", sky_mid_orig, h);
+        state = mid ? "active (mid-function callout)" : "NOT ACTIVE (mid-function: needs a midhook site, re-lift)";
+    } else state = "NOT ACTIVE (not lifted code of main or a module)";
     if (out) wr64(out, orig);
     char from[96]; sky_where(c->x[30], from, sizeof from);
     sky_site("%s %llx    # %s repl=%llx (%s) %s; from %s", strstr(state, "mid") ? "midhook" : sym >= GUEST_BASE && sym < GUEST_BASE + IMAGE_SIZE ? "noinline" : "hook",
@@ -406,9 +478,12 @@ static void sky_memcpy_fn(Ctx *c) {
     if (code) {
         for (uint64_t off = 0; off + 4 <= n; off += 4) {
             uint32_t was = off + 4 <= keep ? *(uint32_t *)(before + off) : 0, now = rd32(dst + off);
+            const SkySite *s = sky_compiled(dst + off, 1);
+            int act = s && s->word == now, dyn = sky_compiled(dst + off, 4) != NULL;
             char w2[96]; sky_where(dst + off, w2, sizeof w2);
-            sky_site("patch %llx %08x %08x    # %s %s", (unsigned long long)(dst + off), was, now, w2, was == now ? "unchanged" : "NOT ACTIVE (code patch)");
-            if (was != now) sky_logf("patch at %s (%08x -> %08x): NOT ACTIVE", w2, was, now);
+            sky_site("patch %llx %08x %08x    # %s %s", (unsigned long long)(dst + off), was, now, w2,
+                     act ? "active" : dyn ? "active (decoded at run time)" : was == now ? "unchanged" : "NOT ACTIVE (code patch: re-lift)");
+            if (!act && !dyn && was != now) sky_logf("patch at %s (%08x -> %08x): NOT ACTIVE", w2, was, now);
         }
         if (n & 3) sky_site("patchbytes %llx %llu    # %s: not a whole number of words", (unsigned long long)dst, (unsigned long long)n, where);
     } else sky_site("data %llx %llu    # %s", (unsigned long long)dst, (unsigned long long)n, where);
@@ -522,7 +597,7 @@ static void sky_MountRom(Ctx *c) {               /* the game's first MountRom: p
     if (sky_registry() > 0) {
         char log[MAX_PATH * 2]; exe_dir(log, sizeof log); strncat(log, "skyline_sites.log", sizeof log - strlen(log) - 1);
         g_sky_log = fopen(log, "w");
-        if (g_sky_log) fprintf(g_sky_log, "# sites the plugins hooked / patched in this run (runtime/skyline.c)\n");
+        if (g_sky_log) fprintf(g_sky_log, "# sites the plugins hooked / patched in this run (re-lift site list format; tools/lifter/relift_sites.py)\n");
         { uint32_t fs_mount_direct(const char *name, const char *host_dir); uint32_t r = fs_mount_direct("sd", g_sky_sd);
           sky_logf("sd:/ = %s (mount result 0x%x); %d plugins have lifted code", g_sky_sd, r, g_sky_count); }
         sky_rtld_init();
