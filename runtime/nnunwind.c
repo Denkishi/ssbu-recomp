@@ -29,6 +29,7 @@ ecomp_nro.py) gives
  * Environment: SSBU_UNWIND_LOG=1 prints every frame of every throw (the first 3 throws are always summarised). */
 #include <windows.h>
 #include <setjmp.h>
+#include <intrin.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -223,6 +224,125 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     }
 }
 
+/* ---------------------------------------------------------------- smashline's ACMD interpreter (skyline.c)
+ * smashline (a Skyline plugin) runs every ACMD script through an asm stub, __smashline_interpreter, that records
+ * (landing pad, sp) for the current fiber and calls the script, often Rust code without unwind tables. On the console it
+ * hooks libunwind's step: while that record exists, the first frame stepped gets the stub's landing pad and a personality
+ * that says "handler here", so a script ended by L2CExceptionShutdown resumes in the stub, which takes its saved sp back
+ * and returns normally to the game. Here: when the stub is on the throwing stack (its call's return address in a frame
+ * record, or failing that in a stack slot), raise() enters the landing pad's resume entry; the stub then returns, and the
+ * host stack is cut back to the record unwind_interp_call() made at the stub's entry (installed with the hook table). */
+static uint64_t g_interp_ret, g_interp_lp;
+/* SSBU_EH_TIMING=1 (test): where a throw that smashline's stub takes spends its time. Stages: 0 interp_on_stack, 1 the
+ * stub's landing code, 2 catch_take + checks, 3 longjmp back to unwind_interp_call (the host unwind); plus the host stack
+ * the longjmp cut. Slow throws (> 2 ms, first 80) get a line; every 500 throws a summary. */
+static int g_ehtm = -1;
+static __declspec(thread) LONG64 t_eh_t[5];
+static __declspec(thread) uint64_t t_eh_rsp;
+static LONG64 g_ehtm_sum[4], g_ehtm_max[4], g_ehtm_n, g_ehtm_slow;
+static double g_ehtm_f;
+static LONG64 ehtm_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static int ehtm_on(void) { if (g_ehtm < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_ehtm_f = 1000.0 / (double)f.QuadPart; g_ehtm = getenv("SSBU_EH_TIMING") && atoi(getenv("SSBU_EH_TIMING")); } return g_ehtm; }
+static void ehtm_landed(uint64_t rsp_now) {
+    t_eh_t[4] = ehtm_now();
+    LONG64 d[4]; for (int i = 0; i < 4; i++) d[i] = t_eh_t[i + 1] - t_eh_t[i];
+    LONG64 n = InterlockedIncrement64(&g_ehtm_n);
+    for (int i = 0; i < 4; i++) { InterlockedAdd64(&g_ehtm_sum[i], d[i]); if (d[i] > g_ehtm_max[i]) g_ehtm_max[i] = d[i]; }
+    double tot = (double)(t_eh_t[4] - t_eh_t[0]) * g_ehtm_f;
+    if (tot > 2.0 && InterlockedIncrement64(&g_ehtm_slow) <= 80)
+        printf("eh-timing: slow throw %.2f ms: stub search %.2f, landing code %.2f, record %.2f, longjmp %.2f ms; host stack cut %llu KB\n", tot,
+               d[0] * g_ehtm_f, d[1] * g_ehtm_f, d[2] * g_ehtm_f, d[3] * g_ehtm_f, (unsigned long long)((rsp_now - t_eh_rsp) >> 10));
+    if (n % 500 == 0)
+        printf("eh-timing: %lld stub throws: average ms search %.3f landing %.3f record %.3f longjmp %.3f | worst %.2f %.2f %.2f %.2f | slow (> 2 ms) %lld\n", (long long)n,
+               g_ehtm_sum[0] * g_ehtm_f / n, g_ehtm_sum[1] * g_ehtm_f / n, g_ehtm_sum[2] * g_ehtm_f / n, g_ehtm_sum[3] * g_ehtm_f / n,
+               g_ehtm_max[0] * g_ehtm_f, g_ehtm_max[1] * g_ehtm_f, g_ehtm_max[2] * g_ehtm_f, g_ehtm_max[3] * g_ehtm_f, (long long)g_ehtm_slow);
+}
+static volatile LONG g_interp_landings;
+void unwind_set_interpreter(uint64_t ret_addr, uint64_t resume_lp) { g_interp_ret = ret_addr; g_interp_lp = resume_lp; }
+/* The interpreter calls in progress on each guest thread / fiber: a list through records on the host stack of
+ * unwind_interp_call, its head in fiber-local storage (every guest fiber is a Windows fiber, os_threads.c; a fiber that
+ * is dropped takes its list with it). interp_on_stack used to scan the whole throwing stack (up to 2 MB, one word at a
+ * time) for the stub's return address, after a VirtualQuery of the stack: the guest stacks of fibers lie in the game's
+ * heap, one committed region of gigabytes, which VirtualQuery walks page by page. Every L2CExceptionShutdown of HDR's
+ * scripts paid 1-22 ms for it on the main thread (frames of 10-37 ms in a 120 Hz fight, up to 2.5 s of them in two
+ * minutes). Now the innermost record of this fiber is the interpreter call the throw is inside of; its guest side is
+ * confirmed by the stub's return address just below the stub's sp (a few hundred bytes), else the old scan decides. */
+typedef struct IRec { struct IRec *prev; uint64_t cfa; } IRec;
+static DWORD g_irec_fls = FLS_OUT_OF_INDEXES;
+static volatile LONG g_irec_init;
+static DWORD irec_slot(void) {
+    if (g_irec_init != 2) {
+        if (InterlockedCompareExchange(&g_irec_init, 1, 0) == 0) { g_irec_fls = FlsAlloc(NULL); InterlockedExchange(&g_irec_init, 2); }
+        else while (g_irec_init != 2) SwitchToThread();
+    }
+    return g_irec_fls;
+}
+void unwind_interp_call(Ctx *c, void (*orig)(Ctx *)) {
+    Ctx *volatile cc = c;
+    jmp_buf jb;
+    volatile uint64_t cfa = c->x[31];
+    const char *volatile in_import = c->in_import;
+    volatile uint64_t import_from = c->import_from;
+    volatile DWORD fls = irec_slot();
+    IRec rec = {fls != FLS_OUT_OF_INDEXES ? (IRec *)FlsGetValue(fls) : NULL, cfa};
+    IRec *volatile prev = rec.prev;                       /* read again after a longjmp: kept in memory */
+    if (fls != FLS_OUT_OF_INDEXES) FlsSetValue(fls, &rec);
+    catch_put(cfa, &jb);
+    if (setjmp(jb) == 0) {
+        orig(c);
+        catch_take(cfa, &jb);
+    } else {
+        if (g_ehtm > 0 && t_eh_t[0]) { ehtm_landed((uint64_t)(uintptr_t)_AddressOfReturnAddress()); t_eh_t[0] = 0; }
+        cc->in_import = in_import;
+        cc->import_from = import_from;
+    }
+    if (fls != FLS_OUT_OF_INDEXES) FlsSetValue(fls, prev);
+}
+static LONG64 g_iact_fast, g_iact_scan, g_iact_stale, g_iact_none;
+static int interp_on_stack_scan(Ctx *c) {                /* the old way: when the record is not confirmed */
+    MEMORY_BASIC_INFORMATION mi;
+    uint64_t sp = c->x[31];
+    if (!VirtualQuery((void *)(uintptr_t)sp, &mi, sizeof mi)) return 0;
+    uint64_t top = (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+    if (top - sp > 0x200000) top = sp + 0x200000;
+    for (uint64_t fp = c->x[29], n = 0; fp >= sp && fp + 16 <= top && !(fp & 7) && n < 4096; n++) {      /* frame records */
+        if (rd64(fp + 8) == g_interp_ret) return 1;
+        uint64_t next = rd64(fp);
+        if (next <= fp) break;
+        fp = next;
+    }
+    for (uint64_t a = sp & ~7ull; a + 8 <= top; a += 8) if (rd64(a) == g_interp_ret) return 1;      /* a frame without a record */
+    return 0;
+}
+static int interp_on_stack(Ctx *c) {
+    DWORD fls = irec_slot();
+    if (fls == FLS_OUT_OF_INDEXES) { InterlockedIncrement64(&g_iact_scan); return interp_on_stack_scan(c); }
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    uint64_t now = (uint64_t)(uintptr_t)_AddressOfReturnAddress(), base = (uint64_t)(uintptr_t)tib->StackBase, sp = c->x[31];
+    IRec *r = (IRec *)FlsGetValue(fls);
+    if (!r) {
+        LONG64 k = InterlockedIncrement64(&g_iact_none);
+        if (g_ehtm > 0) {                             /* SSBU_EH_TIMING (test): would the old scan have said otherwise? */
+            static LONG64 differ;
+            if (interp_on_stack_scan(c) && InterlockedIncrement64(&differ) <= 10) printf("eh-timing: no interpreter call recorded on this fiber, but the old scan finds the stub's return address (guest sp %llx)\n", (unsigned long long)sp);
+            if (k % 100 == 0) printf("eh-timing: interpreter check: %lld outside (old scan disagrees %lld), %lld inside (confirmed), %lld unconfirmed\n",
+                                     (long long)k, (long long)differ, (long long)g_iact_fast, (long long)g_iact_stale);
+        }
+        return 0;
+    }
+    if ((uint64_t)(uintptr_t)r > now && (uint64_t)(uintptr_t)r < base && r->cfa > sp && r->cfa - sp <= 0x200000) {
+        uint64_t cfa = r->cfa, lo = cfa - sp > 0x10000 ? cfa - 0x10000 : sp;      /* the stub's return address in the frame it called, just below its sp */
+        for (uint64_t a = (cfa - 8) & ~7ull; a >= lo && a >= sp; a -= 8)
+            if (rd64(a) == g_interp_ret) {
+                LONG64 k = InterlockedIncrement64(&g_iact_fast);
+                if (g_ehtm > 0 && k % 500 == 0) printf("eh-timing: interpreter check: %lld inside (confirmed), %lld outside, %lld unconfirmed\n", (long long)k, (long long)g_iact_none, (long long)g_iact_stale);
+                return 1;
+            }
+    }
+    InterlockedIncrement64(&g_iact_stale);            /* not confirmed (a record left behind by a longjmp?): the old scan decides */
+    return interp_on_stack_scan(c);
+}
+
 /* ---------------------------------------------------------------- the unwinder (eh_runtime.h: EhRaiseFn) */
 static void (*resume_entry(uint64_t lp, const char **name))(Ctx *, uint64_t) {
     uint64_t base, size; const NroResume *tab = NULL; int count = 0;
@@ -268,6 +388,31 @@ static void eh_raise(Ctx *c, int reason) {
     uint64_t cfa = 0;
     const char *stop = "frame limit";
     const char *owner = "?";
+    if (g_interp_ret && ehtm_on()) { t_eh_t[0] = ehtm_now(); t_eh_rsp = (uint64_t)(uintptr_t)_AddressOfReturnAddress(); }
+    if (g_interp_ret && interp_on_stack(c)) {            /* smashline: the interpreter stub catches it (see above) */
+        if (g_ehtm > 0) t_eh_t[1] = ehtm_now();
+        void (*fn)(Ctx *, uint64_t) = resume_entry(g_interp_lp, &owner);
+        if (fn) {
+            EhPad ip;
+            memset(&ip, 0, sizeof ip);
+            ip.kind = EH_HANDLER; ip.landing_pad = g_interp_lp; ip.exception = exc;
+            if (InterlockedIncrement(&g_interp_landings) <= 3 || g_log)
+                printf("unwind: %s thrown at 0x%llx: smashline's interpreter stub takes it (landing pad %llx)\n", eh_type_name(exc), (unsigned long long)c->x[30] - 4, (unsigned long long)g_interp_lp);
+            int uncaught_before = eh_uncaught_count(c);
+            eh_enter_pad(c, &ip);
+            c->in_import = NULL;
+            fn(c, g_interp_lp);                           /* the stub's landing code: its saved sp back, then it returns */
+            if (g_ehtm > 0) t_eh_t[2] = ehtm_now();
+            eh_stub_done(c, exc, uncaught_before);        /* nncxxrt.c: the exception is over for this context */
+            jmp_buf *jb = catch_take(c->x[31], NULL);
+            if (!jb) {
+                printf("\nunwind: smashline's interpreter stub returned to sp %llx, where no entry record is\n", (unsigned long long)c->x[31]);
+                eh_terminate(c, "no host frame to return to");
+            }
+            if (g_ehtm > 0) t_eh_t[3] = ehtm_now();
+            longjmp(*jb, 1);
+        }
+    }
     if (reason == EH_RAISE_THROW) {                       /* phase 1: is there a handler at all? (the console terminates without unwinding if not) */
         LONG seq = InterlockedIncrement(&g_throws);
         int found = 0, depth = 0;
@@ -324,6 +469,7 @@ static void eh_raise(Ctx *c, int reason) {
 
 void unwind_report(FILE *out) {
     if (g_throws) fprintf(out, "unwind: %ld exceptions thrown, %ld clean-up pads run, %ld skipped\n", (long)g_throws, (long)g_cleanups, (long)g_skipped);
+    if (g_interp_landings) fprintf(out, "unwind: %ld taken by smashline's interpreter stub\n", (long)g_interp_landings);
 }
 
 void register_unwind_imports(void) {

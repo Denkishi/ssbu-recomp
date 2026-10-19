@@ -41,6 +41,7 @@ int sdk_image_ready(void);
 #define SKY_PROGRAM_ID 0x01006A800016E000ULL
 #define SKY_PLUGIN_DIR "atmosphere\\contents\\01006A800016E000\\romfs\\skyline\\plugins"
 
+static void sky_find_interpreter(NroModule *m);
 static NroInfo g_sky_info[SKY_MAX_PLUGINS];
 static char g_sky_src[SKY_MAX_PLUGINS][MAX_PATH];
 static int g_sky_count;
@@ -493,6 +494,7 @@ static DWORD WINAPI sky_boot_thread(LPVOID arg) {
         ro_LoadModule_entry(c);
         if (c->x[0] != RO_OK) { sky_logf("%s: nn::ro::LoadModule failed (0x%llx)", files[i].path, (unsigned long long)c->x[0]); continue; }
         mods[nm++] = m;
+        if (!strcmp(m->info->name, "sky_smashline")) sky_find_interpreter(m);
     }
     for (int i = 0; i < nm; i++) {                 /* Skyline: every plugin is loaded before the first main runs */
         uint64_t entry = sky_lookup_module_symbol(mods[i], "main");
@@ -542,6 +544,36 @@ static void ro_LookupModuleSymbol(Ctx *c) {      /* (uintptr_t *out, const Modul
     uint64_t a = m && m->loaded ? sky_lookup_module_symbol(m, (const char *)(uintptr_t)c->x[2]) : 0;
     wr64(c->x[0], a);
     c->x[0] = a ? RO_OK : 0x1416u;
+}
+
+/* smashline's interpreter stub (nnunwind.c), found by the shape of its code, which smashline's interpreter.asm fixes:
+ * entry stp x29,x30 / stp x19,x20 / str x21 (all pre-indexed -16), mov x19,x0 / mov x20,x1 / mov x21,x2, then
+ * adr x0, <landing pad>; mov x1, sp; bl set_smashline_interpreter_landing; three movs; bl smashline_interpreter (its return
+ * address is the stub's exit); the landing pad is a nop, resumed at +4. */
+void unwind_set_interpreter(uint64_t ret_addr, uint64_t resume_lp);
+void unwind_interp_call(Ctx *c, void (*orig)(Ctx *));
+static ImportFn g_sky_interp_orig;
+static void sky_interp_hook(Ctx *c, void *user) { (void)user; unwind_interp_call(c, g_sky_interp_orig); }
+static void sky_find_interpreter(NroModule *m) {
+    uint64_t base = m->info->base, tsize = rd32(base + 0x24);
+    static const uint32_t head[6] = {0xa9bf7bfd, 0xa9bf53f3, 0xf81f0ff5, 0xaa0003f3, 0xaa0103f4, 0xaa0203f5};
+    for (uint64_t a = base; a + 0x60 < base + tsize; a += 4) {
+        if (memcmp((void *)(uintptr_t)a, head, sizeof head)) continue;
+        uint32_t adr = rd32(a + 24);
+        if ((adr & 0x9f00001f) != 0x10000000) continue;                     /* adr x0, <label> */
+        int64_t imm = ((int64_t)(int32_t)((adr >> 5) << 13) >> 11) | ((adr >> 29) & 3);
+        uint64_t lp = a + 24 + (uint64_t)imm;
+        int bls = 0;
+        for (uint64_t b = a + 28; b < a + 0x40; b += 4) {
+            if ((rd32(b) & 0xfc000000) != 0x94000000 || ++bls < 2) continue;   /* the second bl: smashline_interpreter */
+            if (rd32(lp) != 0xd503201f) break;                             /* the landing pad is a nop */
+            unwind_set_interpreter(b + 4, lp + 4);
+            if (hook_install(a, sky_interp_hook, NULL, &g_sky_interp_orig) > 0)
+                sky_logf("smashline interpreter stub at %llx (exit %llx, landing pad %llx): exceptions of scripts land there", (unsigned long long)a, (unsigned long long)(b + 4), (unsigned long long)(lp + 4));
+            return;
+        }
+    }
+    sky_logf("smashline: interpreter stub NOT found: a script ended by an exception will stop the game");
 }
 
 /* nnro.c register_ro_imports (after nnfs.c registered MountRom) */
