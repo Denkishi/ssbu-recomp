@@ -9,9 +9,15 @@ and memory must be identical.
     python difftest.py gen        generate difftest_gen.c from the samples
     python difftest.py check      run difftest.exe and Unicorn, compare
 
+`gen` appends to the sampled shapes the instruction words of extra_words() (every valid arrangement of the instructions
+the game's code does not use but Rust-compiled modules do) and short exclusive sequences (LDXP + STXP, LDXR + STXR ...),
+each from a random state.
+
 difftest.exe is difftest_gen.c + difftest_host.c compiled with the flags of the build under test, e.g.
     C:\\llvm-8.0.0\\bin\\clang.exe -O0 -w -fno-strict-aliasing -I . difftest_gen.c difftest_host.c -o difftest.exe
-(DIFFTEST_EXE=<path> selects another exe for `check`; DIFFTEST_NO_SPECIAL=1 makes `gen` write only the old list.)
+(DIFFTEST_EXE=<path> selects another exe for `check`; DIFFTEST_NO_SPECIAL=1 makes `gen` write only the old list,
+DIFFTEST_NO_EXTRA=1 the list without those additions; DIFFTEST_LIFTER=recomp_nro lifts with tools/nro/recomp_nro.py,
+whose instruction translation is a copy of recomp.py's. The tests of a list keep their index, so old indices stay valid.)
 """
 import collections
 import json
@@ -23,6 +29,12 @@ import sys
 import zlib
 
 import recomp
+
+LIFT = recomp                                              # the lifter under test (Fn, Env, Unimpl, bits)
+if os.environ.get('DIFFTEST_LIFTER') == 'recomp_nro':
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.path[:0] = [os.path.join(_here, 'ro_study'), os.path.join(_here, '..', 'nro')]   # build\work layout, repo layout
+    import recomp_nro as LIFT
 
 REGION, REGION_SIZE = 0x7200000000, 0x400000
 CODE, DATA = REGION + 0x200000, REGION + 0x300000
@@ -119,7 +131,7 @@ def build_special(env_fn, old):
     for key, w in words:
         try:
             stmt = env_fn.lift(w, CODE)
-        except recomp.Unimpl:                              # counted as different: the host does nothing
+        except LIFT.Unimpl:                                # counted as different: the host does nothing
             stmt = 'guest_unimpl(0, 0, "untranslated");'
         mode = fp_mode(w)
         if mode not in SPECIAL: continue                   # close5: not a floating-point operand width (DIFFTEST_FP_ALL)
@@ -155,9 +167,9 @@ def cmd_sample():
 
 def build_tests():
     shapes = json.load(open('difftest_samples.json'))
-    env = recomp.Env()
+    env = LIFT.Env()
     env.imports = set()
-    fn = recomp.Fn(CODE, CODE + 4, env)
+    fn = LIFT.Fn(CODE, CODE + 4, env)
     tests = []
     for key, words in sorted(shapes.items()):
         for w in words:
@@ -169,7 +181,7 @@ def build_tests():
                 continue                                  # exclusives: single-thread model differs by design
             try:
                 stmt = fn.lift(w, CODE)
-            except recomp.Unimpl:
+            except LIFT.Unimpl:
                 continue
             if any(t in stmt for t in ('goto', 'return', 'call_indirect', 'guest_', 'f_7')):
                 continue
@@ -180,7 +192,186 @@ def build_tests():
             tests.append({'key': key, 'word': w, 'stmt': stmt, 'mem': int(mem), 'rn': rn, 'rm': rm, 'fpmode': 0, 'k': 0, 'frm': -1})
     if os.environ.get('DIFFTEST_NO_SPECIAL'):              # the old list only (3,120 tests before the FP fixes)
         return tests
-    return tests + build_special(fn, tests)
+    tests += build_special(fn, tests)
+    if os.environ.get('DIFFTEST_NO_EXTRA'):
+        return tests
+    return tests + build_extra(fn)
+
+
+# ---- instructions the game's code does not use (Rust-compiled modules do): every valid arrangement written out here,
+# plus sequences around the exclusive monitor. Appended after the sampled list, so the old indices stay valid.
+def _shape_key(md, w, prefix=''):
+    ins = list(md.disasm(struct.pack('<I', w), CODE))
+    if not ins:
+        return None
+    shape = re.sub(r'#-?(0x)?[0-9a-f.e+-]+', '#', ins[0].op_str)
+    shape = re.sub(r'\b([vqdshbwx])\d+\b', r'\1', shape)
+    return prefix + ins[0].mnemonic + ' ' + shape
+
+
+def _regs(i, n, avoid=()):
+    """n distinct register numbers 0..30 (a deterministic spread), none in avoid."""
+    out, r = [], (i * 7 + 3) % 31
+    while len(out) < n:
+        if r not in out and r not in avoid:
+            out.append(r)
+        r = (r + 11) % 31
+    return out
+
+
+def extra_words():
+    """(word, fp special-operand width or 0) for every valid arrangement of the added instructions."""
+    out = []
+    v3 = lambda q, u, size, rm, opc, rn, rd: (q << 30) | (u << 29) | (0x0e << 24) | (size << 22) | (1 << 21) | (rm << 16) | (opc << 11) | (1 << 10) | (rn << 5) | rd
+    s3 = lambda u, size, rm, opc, rn, rd: (1 << 30) | (u << 29) | (0x1e << 24) | (size << 22) | (1 << 21) | (rm << 16) | (opc << 11) | (1 << 10) | (rn << 5) | rd
+    v2 = lambda q, u, size, opc, rn, rd: (q << 30) | (u << 29) | (0x0e << 24) | (size << 22) | (0x10 << 17) | (opc << 12) | (2 << 10) | (rn << 5) | rd
+    s2 = lambda u, size, opc, rn, rd: (1 << 30) | (u << 29) | (0x1e << 24) | (size << 22) | (0x10 << 17) | (opc << 12) | (2 << 10) | (rn << 5) | rd
+    vx = lambda q, u, size, opc, rn, rd: (q << 30) | (u << 29) | (0x0e << 24) | (size << 22) | (0x18 << 17) | (opc << 12) | (2 << 10) | (rn << 5) | rd
+    sp = lambda u, size, opc, rn, rd: (1 << 30) | (u << 29) | (0x1e << 24) | (size << 22) | (0x18 << 17) | (opc << 12) | (2 << 10) | (rn << 5) | rd
+    vsh = lambda q, u, immhb, opc, rn, rd: (q << 30) | (u << 29) | (0x1e << 23) | (immhb << 16) | (opc << 11) | (1 << 10) | (rn << 5) | rd
+    ssh = lambda u, immhb, opc, rn, rd: (1 << 30) | (u << 29) | (0x3e << 23) | (immhb << 16) | (opc << 11) | (1 << 10) | (rn << 5) | rd
+    arr = [(q, size) for size in range(4) for q in (0, 1) if not (size == 3 and q == 0)]     # 8b 16b 4h 8h 2s 4s 2d
+    k = 0
+    for u, opc in [(0, 0x08), (1, 0x08), (0, 0x0c), (1, 0x0c), (0, 0x0d), (1, 0x0d), (0, 0x17), (0, 0x14), (1, 0x14), (0, 0x15), (1, 0x15)]:
+        for q, size in arr:
+            if size == 3 and opc in (0x0c, 0x0d, 0x14, 0x15):
+                continue
+            for j in range(2):
+                rd, rn, rm = _regs(k, 3); k += 1
+                if j:
+                    rd = rn                               # destination = source
+                out.append((v3(q, u, size, rm, opc, rn, rd), 0))
+        if opc == 0x08:
+            rd, rn, rm = _regs(k, 3); k += 1
+            out.append((s3(u, 3, rm, opc, rn, rd), 0))   # sshl / ushl d
+    for u, opc in [(0, 0x08), (1, 0x08), (1, 0x09), (0, 0x0a)]:          # cmgt / cmge / cmle / cmlt #0
+        for q, size in arr:
+            for j in range(2):
+                rd, rn = _regs(k, 2); k += 1
+                out.append((v2(q, u, size, opc, rn, rn if j else rd), 0))
+        rd, rn = _regs(k, 2); k += 1
+        out.append((s2(u, 3, opc, rn, rd), 0))
+    for u in (0, 1):                                                      # [su]addlp, [su]adalp
+        for opc in (0x02, 0x06):
+            for q, size in arr:
+                if size == 3:
+                    continue
+                for j in range(2):
+                    rd, rn = _regs(k, 2); k += 1
+                    out.append((v2(q, u, size, opc, rn, rn if j else rd), 0))
+    for opc in (0x16, 0x17):                                              # fcvtn(2) / fcvtl(2)
+        for sz in (0, 1):
+            for q in (0, 1):
+                for j in range(2):
+                    rd, rn = _regs(k, 2); k += 1
+                    mode = (16 if sz == 0 else 32) if opc == 0x17 else (32 if sz == 0 else 64)
+                    out.append((v2(q, 0, sz, opc, rn, rn if j else rd), mode))
+    for u, opc in [(0, 0x1b), (0, 0x03), (1, 0x03), (0, 0x0a), (1, 0x0a), (0, 0x1a), (1, 0x1a)]:   # across lanes
+        for q, size in arr:
+            if size == 3 or (size == 2 and not q):
+                continue
+            for j in range(2):
+                rd, rn = _regs(k, 2); k += 1
+                out.append((vx(q, u, size, opc, rn, rn if j else rd), 0))
+    for opc in (0x0c, 0x0f):                                              # fmaxnmv / fminnmv / fmaxv / fminv
+        for o1 in (0, 1):
+            for j in range(2):
+                rd, rn = _regs(k, 2); k += 1
+                out.append((vx(1, 1, o1 << 1, opc, rn, rn if j else rd), 32))
+    for j in range(3):                                                    # addp d, v.2d
+        rd, rn = _regs(k, 2); k += 1
+        out.append((sp(0, 3, 0x1b, rn, rn if j == 2 else rd), 0))
+    for u, opc in [(0, 0x02), (1, 0x02), (0, 0x04), (1, 0x04), (0, 0x06), (1, 0x06), (1, 0x08), (1, 0x0a), (0, 0x10), (0, 0x11)]:
+        narrow = opc in (0x10, 0x11)
+        for es in range(3 if narrow else 4):
+            ebits = 8 << es
+            for q in (0, 1):
+                if es == 3 and not q:
+                    continue
+                left = opc == 0x0a
+                amounts = sorted({0, 1, ebits // 2, ebits - 1}) if left else sorted({1, 2, ebits // 2, ebits - 1, ebits})
+                for amt in amounts:
+                    immhb = (ebits + amt) if left else (2 * ebits - amt)
+                    rd, rn = _regs(k, 2); k += 1
+                    out.append((vsh(q, u, immhb, opc, rn, rd), 0))
+        if not narrow:                                                    # scalar d forms
+            for amt in ((0, 1, 33, 63) if opc == 0x0a else (1, 2, 31, 63, 64)):
+                immhb = (64 + amt) if opc == 0x0a else (128 - amt)
+                rd, rn = _regs(k, 2); k += 1
+                out.append((ssh(u, immhb, opc, rn, rd), 0))
+    for opc in range(0x10, 0x18):                                         # crc32 / crc32c b h w x
+        sf = 1 if (opc & 3) == 3 else 0
+        for j in range(3):
+            rd, rn, rm = _regs(k, 3); k += 1
+            if j == 2:
+                rd = rn
+            out.append(((sf << 31) | (0xd6 << 21) | (rm << 16) | (opc << 10) | (rn << 5) | rd, 0))
+    return out
+
+
+def exclusive_sequences():
+    """Short sequences around the exclusive monitor: (words, base register). The base is set to an aligned address of
+    the data window by the test state (mem = 1)."""
+    seqs = []
+    ldxp = lambda sz, o0, rt, rt2, rn: (1 << 31) | (sz << 30) | (0x08 << 24) | (1 << 22) | (1 << 21) | (31 << 16) | (o0 << 15) | (rt2 << 10) | (rn << 5) | rt
+    stxp = lambda sz, o0, rs, rt, rt2, rn: (1 << 31) | (sz << 30) | (0x08 << 24) | (1 << 21) | (rs << 16) | (o0 << 15) | (rt2 << 10) | (rn << 5) | rt
+    ldxr = lambda size, o0, rt, rn: (size << 30) | (0x08 << 24) | (1 << 22) | (31 << 16) | (o0 << 15) | (31 << 10) | (rn << 5) | rt
+    stxr = lambda size, o0, rs, rt, rn: (size << 30) | (0x08 << 24) | (rs << 16) | (o0 << 15) | (31 << 10) | (rn << 5) | rt
+    ldar = lambda size, rt, rn: (size << 30) | (0x08 << 24) | (1 << 23) | (1 << 22) | (31 << 16) | (1 << 15) | (31 << 10) | (rn << 5) | rt
+    stlr = lambda size, rt, rn: (size << 30) | (0x08 << 24) | (1 << 23) | (31 << 16) | (1 << 15) | (31 << 10) | (rn << 5) | rt
+    add16 = lambda rn: 0x91004000 | (rn << 5) | rn                    # add xN, xN, #16
+    k = 0
+    for sz in (0, 1):
+        for o0l in (0, 1):
+            for o0s in (0, 1):
+                rn, rt, rt2, rs, a, b = _regs(k, 6); k += 1
+                seqs.append(([ldxp(sz, o0l, rt, rt2, rn)], rn))                                        # the load alone
+                seqs.append(([ldxp(sz, o0l, rt, rt2, rn), stxp(sz, o0s, rs, a, b, rn)], rn))           # succeeds
+                seqs.append(([ldxp(sz, o0l, rt, rt2, rn), add16(rn), stxp(sz, o0s, rs, a, b, rn)], rn))   # other address: fails
+                st = (0xf9000000 if sz else 0xb9000000) | (rn << 5) | a                                # str x/w a, [rn]: value changed
+                seqs.append(([ldxp(sz, o0l, rt, rt2, rn), st, stxp(sz, o0s, rs, rt, b, rn)], rn))      # fails (value compare)
+        seqs.append(([ldxp(sz, 0, 1, 2, 31), stxp(sz, 1, 3, 4, 5, 31)], 31))                          # base sp
+    for size in range(4):
+        rn, rt, rs, a = _regs(k, 4); k += 1
+        for o0 in (0, 1):
+            seqs.append(([ldxr(size, o0, rt, rn), stxr(size, o0, rs, a, rn)], rn))
+        seqs.append(([ldar(size, rt, rn)], rn))
+        seqs.append(([stlr(size, a, rn)], rn))
+    return seqs
+
+
+def build_extra(fn):
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+    md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    words = [(_shape_key(md, w, '(added) ') or '(added) %08x' % w, w, mode) for w, mode in extra_words()]   # (key, word, fp mode)
+    tests = []
+    for key, w, mode in words:
+        op0 = LIFT.bits(w, 28, 25)
+        if op0 in (10, 11):
+            continue
+        mem = op0 in (4, 6, 12, 14)
+        if mem and LIFT.bits(w, 29, 24) == 8 and not LIFT.bits(w, 26, 26):
+            continue                                                      # exclusives: as sequences below
+        try:
+            stmt = fn.lift(w, CODE)
+        except LIFT.Unimpl:
+            raise SystemExit('extra_words: %08x (%s) is not translated' % (w, key))
+        if any(t in stmt for t in ('goto', 'return', 'call_indirect', 'guest_', 'f_7')):
+            continue
+        rn, rm = LIFT.bits(w, 9, 5), -1
+        if mem and LIFT.bits(w, 29, 27) == 7 and LIFT.bits(w, 24, 24) == 0 and LIFT.bits(w, 21, 21) and LIFT.bits(w, 11, 10) == 2:
+            rm = LIFT.bits(w, 20, 16)
+        tests.append({'key': key, 'word': w, 'stmt': stmt, 'mem': int(mem), 'rn': rn, 'rm': rm, 'fpmode': 0, 'k': 0, 'frm': -1})
+        if mode:                                                          # one-operand floating point: every special value
+            for kk in range(len(SPECIAL[mode])):
+                tests.append({'key': key + ' [special]', 'word': w, 'stmt': stmt, 'mem': 0, 'rn': rn, 'rm': -1,
+                              'fpmode': mode, 'k': kk, 'frm': -1})
+    for ws, rn in exclusive_sequences():
+        stmts = [fn.lift(w, CODE + 4 * i) for i, w in enumerate(ws)]
+        key = '(sequence) ' + ' ; '.join(_shape_key(md, w) for w in ws)
+        tests.append({'key': key, 'word': ws[0], 'words': ws, 'stmt': ' '.join(stmts), 'mem': 1, 'rn': rn, 'rm': -1,
+                      'fpmode': 0, 'k': 0, 'frm': -1})
+    return tests
 
 
 def cmd_gen():
@@ -195,8 +386,9 @@ def cmd_gen():
             f.write('  { t_%d, 0x%08xU, %d, %d, %d, %d, %d, %d },\n' % (i, t['word'], t['mem'], t['rn'], t['rm'], t['fpmode'], t['k'], t['frm']))
         f.write('};\nconst int test_count = %d;\n' % len(tests))
     json.dump(tests, open('difftest_tests.json', 'w'))
-    print('tests generated: %d (random state: %d, floating-point special operands: %d)'
-          % (len(tests), sum(1 for t in tests if not t['fpmode']), sum(1 for t in tests if t['fpmode'])))
+    print('tests generated: %d (random state: %d, floating-point special operands: %d; added instructions and sequences: %d)'
+          % (len(tests), sum(1 for t in tests if not t['fpmode']), sum(1 for t in tests if t['fpmode']),
+             sum(1 for t in tests if t['key'].startswith(('(added)', '(sequence)')))))
 
 
 def cmd_check():
@@ -219,7 +411,10 @@ def cmd_check():
     vr = [getattr(A, 'UC_ARM64_REG_V%d' % i) for i in range(32)]
     bad = collections.defaultdict(list)
     ok = errors = ok_special = 0
+    ok_cat, n_cat = collections.Counter(), collections.Counter()
     for i, t in enumerate(tests):
+        cat = t['key'].split(')')[0] + ')' if t['key'].startswith('(') and not t['key'].startswith('(not') else 'game'
+        n_cat[cat] += 1
         x, v, flags = initial_state(i, t['mem'], t['rn'], t['rm'])
         if t.get('fpmode'):
             v = special_v(t)
@@ -230,9 +425,10 @@ def cmd_check():
             uc.reg_write(r, int.from_bytes(val, 'little'))
         uc.reg_write(A.UC_ARM64_REG_NZCV, flags << 28)
         uc.mem_write(WIN_LO, window)
-        uc.mem_write(CODE, struct.pack('<I', t['word']))
+        ws = t.get('words') or [t['word']]                 # a sequence (exclusives) or one instruction
+        uc.mem_write(CODE, b''.join(struct.pack('<I', w) for w in ws))
         try:
-            uc.emu_start(CODE, CODE + 4, count=1)
+            uc.emu_start(CODE, CODE + 4 * len(ws), count=len(ws))
         except UcError as e:
             errors += 1
             bad['(reference emulator fault: %s) %s' % (e, t['key'])].append(i)
@@ -244,12 +440,16 @@ def cmd_check():
         if host.get(i) == ref:
             ok += 1
             ok_special += 1 if t.get('fpmode') else 0
+            ok_cat[cat] += 1
         else:
             bad[t['key']].append(i)
     n_special = sum(1 for t in tests if t.get('fpmode'))
     print('tests: %d   identical: %d   different: %d   (reference faults: %d)' % (len(tests), ok, len(tests) - ok, errors))
     print('  random-state tests: %d identical of %d   floating-point special-operand tests: %d identical of %d'
           % (ok - ok_special, len(tests) - n_special, ok_special, n_special))
+    for cat in ('(added)', '(sequence)'):
+        if n_cat[cat]:
+            print('  %-10s tests: %d identical of %d' % (cat, ok_cat[cat], n_cat[cat]))
     for key, idxs in sorted(bad.items(), key=lambda kv: -len(kv[1]))[:60]:
         t = tests[idxs[0]]
         print('  %-52s %d   e.g. #%d %08x' % (key[:52], len(idxs), idxs[0], t['word']))
@@ -279,8 +479,9 @@ def cmd_show(idx):
     for r, val in zip(vr, v):
         uc.reg_write(r, int.from_bytes(val, 'little'))
     uc.reg_write(A.UC_ARM64_REG_NZCV, flags << 28)
-    uc.mem_write(CODE, struct.pack('<I', t['word']))
-    uc.emu_start(CODE, CODE + 4, count=1)
+    ws = t.get('words') or [t['word']]
+    uc.mem_write(CODE, b''.join(struct.pack('<I', w) for w in ws))
+    uc.emu_start(CODE, CODE + 4 * len(ws), count=len(ws))
     ref = {}
     for i, r in enumerate(xr):
         ref['x%d' % i] = uc.reg_read(r)
