@@ -59,8 +59,16 @@
 #define RESULT_WRITE_FILE_OPEN 0x327202u
 #define RESULT_NOT_MOUNTED 0x35f202u
 #define RESULT_GENERIC_FAILURE 0x3e802u      /* a Windows failure with no console counterpart (disk error, sharing violation) */
+/* Read in sdk.elf: [0x1f4cd0] CheckMountName: 0x2f5e02 null name (NullptrArgument), 0x2f6202 InvalidMountName.
+ * [doc] switchbrew / nn-fuse: 6003 TooLongPath, 6364 UnsupportedOperation (what nn-fuse returns for unsupported calls). */
+#define RESULT_NULLPTR_ARGUMENT 0x2f5e02u
+#define RESULT_INVALID_MOUNT_NAME 0x2f6202u
+#define RESULT_TOO_LONG_PATH 0x2ee602u
+#define RESULT_UNSUPPORTED 0x31b802u
 
-enum { MK_ROM = 1, MK_SAVE, MK_CACHE, MK_PLAIN /* self-tests: a writable host folder without a journal */ };
+enum { MK_ROM = 1, MK_SAVE, MK_CACHE, MK_PLAIN /* self-tests: a writable host folder without a journal */,
+       MK_DIRECT /* a host folder written directly, no working folder (Skyline's sd:) */,
+       MK_FSA /* a file system implemented by guest code (nn::fs::fsa::Register, see below) */ };
 typedef struct {
     char name[16];
     int kind;
@@ -68,8 +76,9 @@ typedef struct {
     char work[MAX_PATH];                     /* journal working folder ("" for the rom) */
     char **tomb;                             /* relative paths deleted since the last commit, '\\' separators */
     int tomb_n;
+    uint64_t fsa;                            /* MK_FSA: the guest nn::fs::fsa::IFileSystem object */
 } Mount;
-#define MOUNT_MAX 8
+#define MOUNT_MAX 16
 static Mount g_mounts[MOUNT_MAX];
 static char g_rom_root[MAX_PATH], g_user_root[MAX_PATH];
 static volatile LONG g_open_log;
@@ -151,6 +160,7 @@ static uint32_t split_path(const char *guest, Mount **mount, char *rel) {
     fs_roots();
     Mount *m = mount_find(guest, (size_t)(colon - guest));
     if (!m) return RESULT_NOT_MOUNTED;
+    if (m->kind == MK_FSA) return RESULT_UNSUPPORTED;      /* a guest file system: every entry point sends those to the fsa_* functions first */
     const char *rest = colon + 1;
     while (*rest == '/' || *rest == '\\') rest++;
     snprintf(rel, MAX_PATH, "%s", rest);
@@ -257,6 +267,266 @@ static int open_mode(HANDLE h, int forget) {             /* mode of an open hand
     return mode;
 }
 
+/* ---- guest file systems: nn::fs::fsa::Register
+ * ARCropolis mounts "arc:" and "mods:" as file systems implemented in its own (lifted) code, through the nn-fuse crate
+ * (github.com/Raytwo/nn-fuse f167b47); HDR, smashline and the game's hooked loaders then read "mods:/..." with the
+ * ordinary nn::fs calls. The object given to Register is an nn::fs::fsa::IFileSystem, word 0 = its vtable. Slots, read
+ * in sdk.elf (FileSystemAccessor 0x1f37a0 .. 0x1f4490: the offset each accessor method calls through) and identical to
+ * nn-fuse's FsAccessorVtable:
+ *   0 ~IFileSystem, 1 deleting destructor, 2 DoCreateFile(path, s64 size, int option), 3 DoDeleteFile(path),
+ *   4 DoCreateDirectory(path), 5 DoDeleteDirectory(path), 6 DoDeleteDirectoryRecursively(path),
+ *   7 DoCleanDirectoryRecursively(path), 8 DoRenameFile(old, new), 9 DoRenameDirectory(old, new),
+ *   10 DoGetEntryType(DirectoryEntryType *out, path), 11 DoGetFreeSpaceSize, 12 DoGetTotalSpaceSize,
+ *   13 DoOpenFile(unique_ptr<IFile> *out, path, OpenMode), 14 DoOpenDirectory(unique_ptr<IDirectory> *out, path, mode),
+ *   15 DoCommit.
+ * IFile ([sdk] FileAccessor 0x1f2d00 Read, 0x1f2fb0 Write, 0x1f3150 Flush, 0x1f31d0 SetSize, 0x1f3270 GetSize): 1 deleting
+ *   destructor, 2 DoRead(size_t *out, s64 offset, void *buf, size_t size, const ReadOption &), 3 DoWrite(s64 offset,
+ *   const void *buf, size_t size, const WriteOption &), 4 DoFlush(), 5 DoSetSize(s64), 6 DoGetSize(s64 *out).
+ * IDirectory ([sdk] DirectoryAccessor 0x1f2540 Read, 0x1f25a0 GetEntryCount): 1 deleting destructor, 2 DoRead(s64 *out,
+ *   DirectoryEntry *buf, s64 count), 3 DoGetEntryCount(s64 *out).
+ * Every method returns an nn::Result; it runs on the calling guest thread (call_guest, x0..x30 saved around it) and no
+ * lock of this file is held meanwhile (the guest code may itself call nn::fs). Out-parameters live in host memory.
+ * The path handed down is what follows "name:", with a leading '/' (nn-fuse strips it with unwrap()).
+ * Handles given to the guest: FSA_FILE_TAG | slot and FSA_DIR_TAG | slot, never a Windows HANDLE (small numbers) nor a
+ * HostDir pointer (nnfsdir.c), so every nn::fs entry point can tell them apart.
+ * nn-fuse's IDirectory::DoRead always fills from the FIRST entry and writes exactly `count` entries (one past the end
+ * panics): a directory read asks for exactly DoGetEntryCount entries into host memory and gives the caller those after its
+ * position, so ReadDirectory consumes the listing as the SDK's own directories do. */
+#define FSA_TAG_MASK 0xffffff0000000000ull
+#define FSA_FILE_TAG 0x4653460000000000ull                 /* "FSF" */
+#define FSA_DIR_TAG 0x4653440000000000ull                  /* "FSD" */
+#define FSA_FILES 1024
+#define FSA_DIRS 256
+#define FSA_PATH_MAX 0x302                                 /* EntryNameLengthMax 0x300 + '/' + NUL */
+static struct { uint64_t obj; Mount *mount; int mode; } g_fsa_file[FSA_FILES];
+static struct { uint64_t obj; Mount *mount; int64_t pos; } g_fsa_dir[FSA_DIRS];
+
+static uint32_t fsa_call(Ctx *c, uint64_t obj, int slot, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    uint64_t saved[31], fn = rd64(rd64(obj) + (uint64_t)slot * 8);
+    memcpy(saved, c->x, sizeof saved);
+    c->x[0] = obj; c->x[1] = a1; c->x[2] = a2; c->x[3] = a3; c->x[4] = a4; c->x[5] = a5;
+    call_guest(c, fn);
+    uint32_t r = (uint32_t)c->x[0];
+    memcpy(c->x, saved, sizeof saved);
+    return r;
+}
+#define HP(p) ((uint64_t)(uintptr_t)(p))
+/* The guest file system that `guest` names ("name:/rest"), or NULL when the name is not such a mount (then the host
+ * code handles the path, including "not mounted"). `sub` receives "/rest"; *r a path error. */
+static Mount *fsa_mount_of(const char *guest, char *sub, uint32_t *r) {
+    const char *colon = guest ? strchr(guest, ':') : NULL;
+    if (!colon) return NULL;
+    fs_lock();
+    Mount *m = mount_find(guest, (size_t)(colon - guest));
+    int is_fsa = m && m->kind == MK_FSA;
+    fs_unlock();
+    if (!is_fsa) return NULL;
+    const char *rest = colon + 1;
+    size_t n = strlen(rest);
+    *r = 0;
+    sub[0] = 0;
+    if (n + 2 > FSA_PATH_MAX) { *r = RESULT_TOO_LONG_PATH; return m; }
+    if (rest[0] != '/') { sub[0] = '/'; memcpy(sub + 1, rest, n + 1); }
+    else memcpy(sub, rest, n + 1);
+    return m;
+}
+/* slot of a guest-file-system file handle: > 0 valid, 0 = not such a handle (a host one), -1 = stale */
+static int fsa_file_slot(uint64_t h) {
+    if ((h & FSA_TAG_MASK) != FSA_FILE_TAG) return 0;
+    uint64_t i = h & 0xffffffffu;
+    return i > 0 && i < FSA_FILES && g_fsa_file[i].obj ? (int)i : -1;
+}
+static int fsa_dir_slot(uint64_t h) {
+    if ((h & FSA_TAG_MASK) != FSA_DIR_TAG) return 0;
+    uint64_t i = h & 0xffffffffu;
+    return i > 0 && i < FSA_DIRS && g_fsa_dir[i].obj ? (int)i : -1;
+}
+static volatile LONG g_fsa_log;
+static void fsa_log(const char *what, const char *path, uint32_t r) {
+    if (InterlockedIncrement(&g_fsa_log) <= 400 || (r && r != RESULT_PATH_NOT_FOUND))
+        trace_printf("     fs (guest file system) %s \"%s\" -> %x\n", what, path ? path : "", r);
+    static int on = -1; if (on < 0) on = getenv("SSBU_FSLOG") != NULL;
+    if (on) printf("fslog: guest fs %s \"%s\" -> %x\n", what, path ? path : "", r);
+}
+
+static uint32_t fsa_open_file(Ctx *c, Mount *m, const char *guest, const char *sub, int mode, uint64_t out) {
+    uint64_t file = 0;
+    uint32_t r = fsa_call(c, m->fsa, 13, HP(&file), HP(sub), (uint64_t)(uint32_t)mode, 0, 0);
+    if (!r && !file) r = RESULT_GENERIC_FAILURE;
+    if (!r) {
+        int slot = 0;
+        fs_lock();
+        for (int i = 1; i < FSA_FILES && !slot; i++) if (!g_fsa_file[i].obj) { g_fsa_file[i].obj = file; g_fsa_file[i].mount = m; g_fsa_file[i].mode = mode & 7; slot = i; }
+        fs_unlock();
+        if (!slot) { fsa_call(c, file, 1, 0, 0, 0, 0, 0); r = RESULT_GENERIC_FAILURE; }
+        else if (out) wr64(out, FSA_FILE_TAG | (uint64_t)slot);
+    }
+    if (r && out) wr64(out, 0);
+    fsa_log("open", guest, r);
+    return r;
+}
+static void fsa_close_file(Ctx *c, int slot) {             /* [sdk] the FileAccessor deletes its unique_ptr<IFile> */
+    fs_lock();
+    uint64_t file = g_fsa_file[slot].obj;
+    g_fsa_file[slot].obj = 0;
+    fs_unlock();
+    if (file) fsa_call(c, file, 1, 0, 0, 0, 0, 0);
+}
+/* DoRead; *got = bytes read. ReadNotPermitted without the read mode ([sdk] FileAccessor::Read). */
+static uint32_t fsa_read(Ctx *c, int slot, int64_t offset, uint64_t buf, uint64_t size, uint64_t *got) {
+    uint64_t option = 0;
+    *got = 0;
+    if (!(g_fsa_file[slot].mode & 1)) return RESULT_READ_NOT_PERMITTED;
+    if (offset < 0) return RESULT_OUT_OF_RANGE;
+    if (!size) return 0;
+    return fsa_call(c, g_fsa_file[slot].obj, 2, HP(got), (uint64_t)offset, buf, size, HP(&option));
+}
+static uint32_t fsa_get_size(Ctx *c, int slot, int64_t *size) {
+    *size = 0;
+    return fsa_call(c, g_fsa_file[slot].obj, 6, HP(size), 0, 0, 0, 0);
+}
+static uint32_t fsa_write(Ctx *c, int slot, int64_t offset, uint64_t buf, uint64_t size, uint64_t option) {
+    uint64_t zero = 0;
+    int64_t cur;
+    int mode = g_fsa_file[slot].mode;
+    if (!(mode & 2)) return RESULT_WRITE_NOT_PERMITTED;
+    if (!(mode & 4)) {                                      /* a file only grows in append mode */
+        uint32_t r = fsa_get_size(c, slot, &cur);
+        if (r) return r;
+        if (offset + (int64_t)size > cur) return RESULT_NO_APPEND;
+    }
+    return fsa_call(c, g_fsa_file[slot].obj, 3, (uint64_t)offset, buf, size, option ? option : HP(&zero), 0);
+}
+/* path operations: slot 2 create file, 3 delete file, 4 create directory, 5 delete directory, 6 delete recursively,
+ * 7 clean recursively, 10 get entry type */
+static uint32_t fsa_path_op(Ctx *c, Mount *m, const char *what, const char *guest, const char *sub, uint32_t perr, int slot, uint64_t a2, uint64_t a3) {
+    uint32_t r = perr ? perr : fsa_call(c, m->fsa, slot, HP(sub), a2, a3, 0, 0);
+    fsa_log(what, guest, r);
+    return r;
+}
+static uint32_t fsa_get_entry_type(Ctx *c, Mount *m, const char *guest, const char *sub, uint32_t perr, uint64_t out) {
+    uint32_t type = 0;
+    uint32_t r = perr ? perr : fsa_call(c, m->fsa, 10, HP(&type), HP(sub), 0, 0, 0);
+    if (!r && out) wr32(out, type);
+    fsa_log("entry type", guest, r);
+    return r;
+}
+static uint32_t fsa_rename(Ctx *c, int slot, const char *from, const char *to) {     /* slot 8 file, 9 directory */
+    char a[FSA_PATH_MAX], b[FSA_PATH_MAX];
+    uint32_t ra = 0, rb = 0;
+    Mount *ma = fsa_mount_of(from, a, &ra), *mb = fsa_mount_of(to, b, &rb);
+    uint32_t r = ma != mb ? RESULT_UNSUPPORTED : ra ? ra : rb ? rb : fsa_call(c, ma->fsa, slot, HP(a), HP(b), 0, 0, 0);   /* both on one guest file system */
+    fsa_log(slot == 8 ? "rename file" : "rename directory", from, r);
+    return r;
+}
+/* nnfsdir.c: directories of guest file systems */
+int fs_fsa_dir_handle(uint64_t h) { return fsa_dir_slot(h) != 0; }
+uint32_t fs_fsa_open_directory(Ctx *c, const char *guest, int mode, uint64_t out, int *handled) {
+    char sub[FSA_PATH_MAX];
+    uint32_t r = 0;
+    Mount *m = fsa_mount_of(guest, sub, &r);
+    *handled = m != NULL;
+    if (!m) return 0;
+    uint64_t dir = 0;
+    if (!r) r = fsa_call(c, m->fsa, 14, HP(&dir), HP(sub), (uint64_t)(uint32_t)mode, 0, 0);
+    if (!r && !dir) r = RESULT_GENERIC_FAILURE;
+    if (!r) {
+        int slot = 0;
+        fs_lock();
+        for (int i = 1; i < FSA_DIRS && !slot; i++) if (!g_fsa_dir[i].obj) { g_fsa_dir[i].obj = dir; g_fsa_dir[i].mount = m; g_fsa_dir[i].pos = 0; slot = i; }
+        fs_unlock();
+        if (!slot) { fsa_call(c, dir, 1, 0, 0, 0, 0, 0); r = RESULT_GENERIC_FAILURE; }
+        else if (out) wr64(out, FSA_DIR_TAG | (uint64_t)slot);
+    }
+    if (r && out) wr64(out, 0);
+    fsa_log("open directory", guest, r);
+    return r;
+}
+uint32_t fs_fsa_dir_count(Ctx *c, uint64_t h, int64_t *count) {      /* entries not read yet */
+    int slot = fsa_dir_slot(h);
+    *count = 0;
+    if (slot <= 0) return RESULT_GENERIC_FAILURE;
+    int64_t n = 0;
+    uint32_t r = fsa_call(c, g_fsa_dir[slot].obj, 3, HP(&n), 0, 0, 0, 0);
+    if (!r) *count = n > g_fsa_dir[slot].pos ? n - g_fsa_dir[slot].pos : 0;
+    return r;
+}
+uint32_t fs_fsa_dir_read(Ctx *c, uint64_t h, uint64_t entries, int64_t max, int64_t *got) {
+    int slot = fsa_dir_slot(h);
+    *got = 0;
+    if (slot <= 0) return RESULT_GENERIC_FAILURE;
+    if (max <= 0) return 0;
+    int64_t total = 0, read = 0, pos = g_fsa_dir[slot].pos;
+    uint32_t r = fsa_call(c, g_fsa_dir[slot].obj, 3, HP(&total), 0, 0, 0, 0);
+    if (r || total <= pos) return r;
+    uint8_t *all = calloc((size_t)total, 0x310);           /* sizeof(nn::fs::DirectoryEntry) */
+    if (!all) return RESULT_GENERIC_FAILURE;
+    r = fsa_call(c, g_fsa_dir[slot].obj, 2, HP(&read), HP(all), (uint64_t)total, 0, 0);
+    if (!r) {
+        if (read > total) read = total;
+        int64_t n = read - pos < max ? read - pos : max;
+        if (n > 0) { memcpy((void *)(uintptr_t)entries, all + pos * 0x310, (size_t)n * 0x310); g_fsa_dir[slot].pos = pos + n; *got = n; }
+    }
+    free(all);
+    return r;
+}
+void fs_fsa_dir_close(Ctx *c, uint64_t h) {
+    int slot = fsa_dir_slot(h);
+    if (slot <= 0) return;
+    fs_lock();
+    uint64_t dir = g_fsa_dir[slot].obj;
+    g_fsa_dir[slot].obj = 0;
+    fs_unlock();
+    if (dir) fsa_call(c, dir, 1, 0, 0, 0, 0, 0);
+}
+
+/* nn::fs::detail::CheckMountName(const char *) [sdk 0x1f4cd0]: a name is valid unless it is null, starts with '@'
+ * (reserved), is empty or a single drive letter, holds ':' or '/', or is longer than 15 characters. It does not look at
+ * the mount table (Register answers MountNameAlreadyExists). */
+static uint32_t check_mount_name(const char *name) {
+    if (!name) return RESULT_NULLPTR_ARGUMENT;
+    size_t n = strlen(name);
+    if (name[0] == '@' || n == 0 || n > 15 || (n == 1 && ((name[0] | 0x20) >= 'a' && (name[0] | 0x20) <= 'z')) || strpbrk(name, ":/")) return RESULT_INVALID_MOUNT_NAME;
+    return 0;
+}
+static void fs_CheckMountName(Ctx *c) { RET(check_mount_name(STR(0))); }
+/* nn::fs::fsa::Register(const char *name, std::unique_ptr<IFileSystem> &&fs): the mount takes the object over (the
+ * caller's unique_ptr is left empty, as after a move); Unmount deletes it. */
+static void fs_fsa_Register(Ctx *c) {
+    const char *name = STR(0);
+    uint64_t holder = A1, fsobj = A1 ? rd64(A1) : 0;
+    uint32_t r = check_mount_name(name);
+    if (!r && !fsobj) r = RESULT_NULLPTR_ARGUMENT;
+    if (!r) {
+        Mount *m = NULL;
+        fs_lock();
+        if (mount_find(name, strlen(name))) r = RESULT_MOUNT_NAME_EXISTS;
+        for (int i = 0; i < MOUNT_MAX && !m && !r; i++) if (!g_mounts[i].kind) m = &g_mounts[i];
+        if (!r && !m) r = RESULT_GENERIC_FAILURE;
+        if (!r) { memset(m, 0, sizeof *m); strcpy(m->name, name); m->fsa = fsobj; m->kind = MK_FSA; wr64(holder, 0); }
+        fs_unlock();
+    }
+    printf("nn::fs::fsa::Register(\"%s\", guest file system %llx) -> %x\n", name ? name : "(null)", (unsigned long long)fsobj, r);
+    trace_printf("     fs fsa::Register \"%s\" object %llx vtable %llx -> %x\n", name ? name : "(null)", (unsigned long long)fsobj, fsobj ? (unsigned long long)rd64(fsobj) : 0ull, r);
+    RET(r);
+}
+/* nn::fs::detail::Allocate(size_t) / Deallocate(void *, size_t): the SDK's file-system allocator; nn-fuse makes its
+ * accessor objects with it. The SDK's default allocator is malloc / free, which the game defines itself (13.0.4: [game]
+ * 0x710353be80 / 0x710353bf00; found by name in main's symbol table): the same heap the plugins' objects come from anyway. */
+static uint64_t game_call1(Ctx *c, uint64_t *fn_cache, const char *name, uint64_t a0) {
+    uint64_t saved[31], fn = *fn_cache ? *fn_cache : (*fn_cache = main_export(name));
+    if (!fn) guest_trap("nn::fs::detail::Allocate / Deallocate: main does not define the allocator", c->x[30] - 4);
+    memcpy(saved, c->x, sizeof saved);
+    c->x[0] = a0;
+    call_guest(c, fn);
+    uint64_t r = c->x[0];
+    memcpy(c->x, saved, sizeof saved);
+    return r;
+}
+static uint64_t g_game_malloc, g_game_free;
+static void fs_detail_Allocate(Ctx *c) { RET(game_call1(c, &g_game_malloc, "malloc", A0)); }
+static void fs_detail_Deallocate(Ctx *c) { if (A0) game_call1(c, &g_game_free, "free", A0); }
+
 /* ---- journal: commit and recovery */
 static HANDLE commit_mutex(void) {
     HANDLE mx = CreateMutexA(NULL, FALSE, "ssbu_native_save_commit");
@@ -360,7 +630,7 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     memset(m, 0, sizeof *m);
     strcpy(m->name, name);
     snprintf(m->root, MAX_PATH, "%s", root);
-    if (kind != MK_ROM) {
+    if (kind != MK_ROM && kind != MK_DIRECT) {             /* a direct folder (sd:) is written at once: no working folder */
         snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
         remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
         CreateDirectoryA(m->work, NULL);
@@ -402,6 +672,18 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     const char *name = STR(0);
     fs_lock();
     Mount *m = name ? mount_find(name, strlen(name)) : NULL;
+    if (m && m->kind == MK_FSA) {                         /* guest file system: what is still open, then the object itself, is deleted */
+        uint64_t objs[FSA_FILES + FSA_DIRS + 1];
+        int n = 0;
+        for (int i = 1; i < FSA_FILES; i++) if (g_fsa_file[i].obj && g_fsa_file[i].mount == m) { objs[n++] = g_fsa_file[i].obj; g_fsa_file[i].obj = 0; }
+        for (int i = 1; i < FSA_DIRS; i++) if (g_fsa_dir[i].obj && g_fsa_dir[i].mount == m) { objs[n++] = g_fsa_dir[i].obj; g_fsa_dir[i].obj = 0; }
+        objs[n++] = m->fsa;
+        m->kind = 0; m->fsa = 0;
+        fs_unlock();
+        trace_printf("     fs unmount \"%s\" (guest file system, %d objects deleted)\n", name, n);
+        for (int i = 0; i < n; i++) fsa_call(c, objs[i], 1, 0, 0, 0, 0, 0);
+        return;
+    }
     if (m) {
         for (int i = 0; i < OPEN_MAX; i++) if (g_open[i].h && g_open[i].mount == m) { CloseHandle(g_open[i].h); g_open[i].h = NULL; }   /* [sdk 0x1f4870] the accessor closes what is left open */
         if (m->work[0]) remove_tree(m->work);
@@ -424,6 +706,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     Mount *m = name ? mount_find(name, strlen(name)) : NULL;
     if (!m) { fs_unlock(); RET(RESULT_NOT_MOUNTED); return; }
     if (m->kind == MK_ROM) { fs_unlock(); RET(0); return; }                 /* nothing to commit on a read-only file system */
+    if (m->kind == MK_FSA || m->kind == MK_DIRECT) { fs_unlock(); RET(0); return; }  /* no journal (nn-fuse's DoCommit would panic: not called) */
     for (int i = 0; i < OPEN_MAX; i++)
         if (g_open[i].h && g_open[i].mount == m && (g_open[i].mode & 2)) { fs_unlock(); trace_printf("     fs commit \"%s\": refused, a file is open for writing\n", name); RET(RESULT_WRITE_FILE_OPEN); return; }
     HANDLE mx = commit_mutex();
@@ -494,10 +777,13 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
 }
 
 static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const char *path, int mode) */
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[MAX_PATH], path[MAX_PATH], sub[FSA_PATH_MAX];
     Mount *m = NULL;
     HANDLE h = INVALID_HANDLE_VALUE;
     int write = (A2 & 2) != 0;
+    uint32_t pr = 0;
+    Mount *fm = fsa_mount_of(STR(1), sub, &pr);
+    if (fm) { uint64_t out = A0; if (pr) { wr64(out, 0); fsa_log("open", STR(1), pr); RET(pr); } else RET(fsa_open_file(c, fm, STR(1), sub, (int)A2, out)); return; }
     fs_lock();
     uint32_t r = split_path(STR(1), &m, rel);
     if (!r && write && m->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
@@ -525,7 +811,11 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
     wr64(A0, (uint64_t)h);
     RET(0);
 }
-static void fs_CloseFile(Ctx *c) { if (A0) { open_mode((HANDLE)A0, 1); CloseHandle((HANDLE)A0); } }
+static void fs_CloseFile(Ctx *c) {
+    int slot = fsa_file_slot(A0);
+    if (slot) { if (slot > 0) fsa_close_file(c, slot); return; }
+    if (A0) { open_mode((HANDLE)A0, 1); CloseHandle((HANDLE)A0); }
+}
 extern int g_hitch_ms; void hitch_note(const char *s);      /* hitch.c: SSBU_HITCH */
 static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     uint64_t total = 0;
@@ -545,6 +835,13 @@ static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
 }
 static volatile LONG g_read_log;
 static void fs_ReadFile(Ctx *c) {                     /* (handle, offset, buffer, size) */
+    int slot = fsa_file_slot(A0);
+    if (slot) {
+        uint64_t n = 0;
+        uint32_t r = slot < 0 ? RESULT_GENERIC_FAILURE : fsa_read(c, slot, (int64_t)A1, A2, A3, &n);
+        RET(r ? r : n == A3 ? 0 : RESULT_OUT_OF_RANGE);
+        return;
+    }
     uint64_t got = read_at((HANDLE)A0, (int64_t)A1, (void *)(uintptr_t)A2, A3);
     if (InterlockedIncrement(&g_read_log) <= 60)
         trace_printf("     fs read offset %llx size %llx -> %llx bytes  from=%llx\n", (unsigned long long)A1,
@@ -553,12 +850,22 @@ static void fs_ReadFile(Ctx *c) {                     /* (handle, offset, buffer
     RET(got == A3 ? 0 : RESULT_OUT_OF_RANGE);            /* this overload must read exactly `size` bytes */
 }
 static void fs_ReadFileCount(Ctx *c) {                /* (size_t *outRead, handle, offset, buffer, size) */
+    int slot = fsa_file_slot(A1);
+    if (slot) {
+        uint64_t n = 0, out = A0;
+        uint32_t r = slot < 0 ? RESULT_GENERIC_FAILURE : fsa_read(c, slot, (int64_t)A2, A3, A4, &n);
+        if (out) wr64(out, r ? 0 : n);
+        RET(r);
+        return;
+    }
     uint64_t got = read_at((HANDLE)A1, (int64_t)A2, (void *)(uintptr_t)A3, A4);
     wr64(A0, got);
     if (got != A4 && getenv("SSBU_FSLOG")) printf("fslog: ReadFile(count) SHORT handle %llx offset %llx size %llx got %llx from=%llx\n", (unsigned long long)A1, (unsigned long long)A2, (unsigned long long)A4, (unsigned long long)got, (unsigned long long)c->x[30] - 4);   /* D2 debug */
     RET(0);
 }
 static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer, size, option) */
+    int slot = fsa_file_slot(A0);
+    if (slot) { RET(slot < 0 ? RESULT_GENERIC_FAILURE : fsa_write(c, slot, (int64_t)A1, A2, A3, A4)); return; }
     OVERLAPPED ov = {0};
     ov.Offset = (DWORD)A1;
     ov.OffsetHigh = (DWORD)(A1 >> 32);
@@ -573,9 +880,40 @@ static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer
 }
 static void fs_GetFileSize(Ctx *c) {                  /* (s64 *out, handle) */
     LARGE_INTEGER size;
+    int slot = fsa_file_slot(A1);
+    if (slot) {
+        int64_t n = 0;
+        uint64_t out = A0;
+        uint32_t r = slot < 0 ? RESULT_GENERIC_FAILURE : fsa_get_size(c, slot, &n);
+        if (!r) wr64(out, (uint64_t)n);
+        RET(r);
+        return;
+    }
     if (!GetFileSizeEx((HANDLE)A1, &size)) { RET(RESULT_GENERIC_FAILURE); return; }
     wr64(A0, (uint64_t)size.QuadPart);
     RET(0);
+}
+/* (handle, s64 size): WriteNotPermitted without the write mode; the file is cut or zero-extended */
+static void fs_SetFileSize(Ctx *c) {
+    int slot = fsa_file_slot(A0);
+    if (slot) {
+        uint32_t r = slot < 0 ? RESULT_GENERIC_FAILURE : !(g_fsa_file[slot].mode & 2) ? RESULT_WRITE_NOT_PERMITTED
+                   : fsa_call(c, g_fsa_file[slot].obj, 5, A1, 0, 0, 0, 0);
+        RET(r);
+        return;
+    }
+    if ((int64_t)A1 < 0) { RET(RESULT_OUT_OF_RANGE); return; }
+    if (!(open_mode((HANDLE)A0, 0) & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
+    FILE_END_OF_FILE_INFO eof;
+    eof.EndOfFile.QuadPart = (LONGLONG)A1;
+    RET(SetFileInformationByHandle((HANDLE)A0, FileEndOfFileInfo, &eof, sizeof eof) ? 0 : RESULT_GENERIC_FAILURE);
+}
+/* (handle): [sdk 0x1f3150] FileAccessor::Flush does nothing for a file opened without the write mode */
+static void fs_FlushFile(Ctx *c) {
+    int slot = fsa_file_slot(A0);
+    if (slot) { RET(slot < 0 ? RESULT_GENERIC_FAILURE : !(g_fsa_file[slot].mode & 2) ? 0 : fsa_call(c, g_fsa_file[slot].obj, 4, 0, 0, 0, 0, 0)); return; }
+    if (!(open_mode((HANDLE)A0, 0) & 2)) { RET(0); return; }
+    RET(FlushFileBuffers((HANDLE)A0) ? 0 : RESULT_GENERIC_FAILURE);
 }
 /* Where a new entry goes: the working folder of a journaled mount. Result code; `path` = host path to create. */
 static uint32_t create_target(const char *guest, Mount **mount, char *rel, char *path) {
@@ -585,13 +923,17 @@ static uint32_t create_target(const char *guest, Mount **mount, char *rel, char 
     if ((*mount)->kind == MK_ROM) return RESULT_PERMISSION_DENIED;
     if (!rel[0] || view_path(*mount, rel, host)) return RESULT_PATH_ALREADY_EXISTS;
     if (!view_parent_is_dir(*mount, rel)) return RESULT_PATH_NOT_FOUND;
-    join(path, (*mount)->work, rel);
+    join(path, (*mount)->work[0] ? (*mount)->work : (*mount)->root, rel);      /* a plain folder has no working copy */
     make_parents(path);
     return 0;
 }
+/* the path names a guest file system: its method `slot` answers (see fsa_path_op) */
+#define FSA_PATH_CALL(argpath, what, slot, a2, a3) do { char sub_[FSA_PATH_MAX]; uint32_t pr_ = 0; Mount *fm_ = fsa_mount_of(argpath, sub_, &pr_); \
+        if (fm_) { RET(fsa_path_op(c, fm_, what, argpath, sub_, pr_, slot, a2, a3)); return; } } while (0)
 static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m;
+    FSA_PATH_CALL(STR(0), "create file", 2, A1, 0);
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
     if (!r) {
@@ -612,11 +954,13 @@ static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
 static void fs_DeleteFile(Ctx *c) {
     char rel[MAX_PATH], path[MAX_PATH], w[MAX_PATH], cm[MAX_PATH];
     Mount *m;
+    FSA_PATH_CALL(STR(0), "delete file", 3, 0, 0);
     fs_lock();
     uint32_t r = split_path(STR(0), &m, rel);
     if (!r && m->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
     if (!r && (!view_path(m, rel, path) || is_dir(path))) r = RESULT_PATH_NOT_FOUND;
-    if (!r) {
+    if (!r && !m->work[0]) r = DeleteFileA(path) ? 0 : RESULT_GENERIC_FAILURE;   /* a plain folder: at once */
+    else if (!r) {
         join(w, m->work, rel); join(cm, m->root, rel);
         if (exists(w)) DeleteFileA(w);
         if (exists(cm)) tomb_add(m, rel);
@@ -627,6 +971,7 @@ static void fs_DeleteFile(Ctx *c) {
 static void fs_CreateDirectory(Ctx *c) {
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m;
+    FSA_PATH_CALL(STR(0), "create directory", 4, 0, 0);
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
     if (!r && !CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) r = RESULT_GENERIC_FAILURE;
@@ -634,8 +979,11 @@ static void fs_CreateDirectory(Ctx *c) {
     RET(r);
 }
 static void fs_GetEntryType(Ctx *c) {                 /* (DirectoryEntryType *out, path): 0 directory, 1 file */
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[MAX_PATH], path[MAX_PATH], sub[FSA_PATH_MAX];
     Mount *m;
+    uint32_t pr = 0;
+    Mount *fm = fsa_mount_of(STR(1), sub, &pr);
+    if (fm) { RET(fsa_get_entry_type(c, fm, STR(1), sub, pr, A0)); return; }
     fs_lock();
     uint32_t r = split_path(STR(1), &m, rel);
     if (!r && !view_path(m, rel, path)) r = RESULT_PATH_NOT_FOUND;
@@ -645,10 +993,80 @@ static void fs_GetEntryType(Ctx *c) {                 /* (DirectoryEntryType *ou
     RET(0);
 }
 static void fs_OpenDirectory(Ctx *c) { wr64(A0, 0); RET(RESULT_PATH_NOT_FOUND); }   /* replaced by nnfsdir.c */
+/* nnfsdir.c DeleteDirectory: a guest file system's DoDeleteDirectory; *handled = 0 for any other path */
+uint32_t fs_fsa_delete_directory(Ctx *c, const char *guest, int *handled) {
+    char sub[FSA_PATH_MAX];
+    uint32_t pr = 0;
+    Mount *fm = fsa_mount_of(guest, sub, &pr);
+    *handled = fm != NULL;
+    return fm ? fsa_path_op(c, fm, "delete directory", guest, sub, pr, 5, 0, 0) : 0;
+}
+/* RenameFile / RenameDirectory (old, new): both names on one mount; the new name must not exist and its folder must.
+ * Journaled save data: a file is renamed in the working state (the working copy moves, or the committed file is copied
+ * under the new name) and the old name is deleted at the next Commit; a folder of journaled save data is not renamed
+ * (UnsupportedOperation: nothing asks for it). */
+static uint32_t host_rename(const char *from, const char *to, int want_dir) {
+    Mount *ma = NULL, *mb = NULL;
+    char ra[MAX_PATH], rb[MAX_PATH], pa[MAX_PATH], pb[MAX_PATH], host[MAX_PATH];
+    fs_lock();
+    uint32_t r = split_path(from, &ma, ra);
+    if (!r) r = split_path(to, &mb, rb);
+    if (!r && ma != mb) r = RESULT_UNSUPPORTED;
+    if (!r && ma->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
+    if (!r && (!ra[0] || !view_path(ma, ra, pa) || is_dir(pa) != want_dir)) r = RESULT_PATH_NOT_FOUND;
+    if (!r && (!rb[0] || view_path(ma, rb, host))) r = RESULT_PATH_ALREADY_EXISTS;
+    if (!r && !view_parent_is_dir(ma, rb)) r = RESULT_PATH_NOT_FOUND;
+    if (!r && !ma->work[0]) { join(pb, ma->root, rb); r = MoveFileExA(pa, pb, 0) ? 0 : RESULT_GENERIC_FAILURE; }
+    else if (!r && want_dir) r = RESULT_UNSUPPORTED;
+    else if (!r) {
+        char w[MAX_PATH], cm[MAX_PATH];
+        join(pb, ma->work, rb); make_parents(pb);
+        join(w, ma->work, ra); join(cm, ma->root, ra);
+        r = (_stricmp(pa, w) == 0 ? MoveFileExA(w, pb, 0) : CopyFileA(pa, pb, TRUE)) ? 0 : RESULT_GENERIC_FAILURE;
+        if (!r && exists(cm)) tomb_add(ma, ra);
+    }
+    fs_unlock();
+    trace_printf("     fs rename \"%s\" -> \"%s\": %x\n", from ? from : "", to ? to : "", r);
+    return r;
+}
+static void fs_RenameFile(Ctx *c) {
+    char tmp[FSA_PATH_MAX]; uint32_t pr = 0;
+    if (fsa_mount_of(STR(0), tmp, &pr) || fsa_mount_of(STR(1), tmp, &pr)) { RET(fsa_rename(c, 8, STR(0), STR(1))); return; }
+    RET(host_rename(STR(0), STR(1), 0));
+}
+static void fs_RenameDirectory(Ctx *c) {
+    char tmp[FSA_PATH_MAX]; uint32_t pr = 0;
+    if (fsa_mount_of(STR(0), tmp, &pr) || fsa_mount_of(STR(1), tmp, &pr)) { RET(fsa_rename(c, 9, STR(0), STR(1))); return; }
+    RET(host_rename(STR(0), STR(1), 1));
+}
+/* DeleteDirectoryRecursively(path): the folder and everything below it. Journaled save data: the working copy goes at
+ * once, the committed folder is deleted at the next Commit (its tombstone hides everything below it meanwhile). The root
+ * of a mount is not deleted (UnsupportedOperation). */
+static void fs_DeleteDirectoryRecursively(Ctx *c) {
+    char rel[MAX_PATH], path[MAX_PATH];
+    Mount *m;
+    FSA_PATH_CALL(STR(0), "delete directory recursively", 6, 0, 0);
+    fs_lock();
+    uint32_t r = split_path(STR(0), &m, rel);
+    if (!r && m->kind == MK_ROM) r = RESULT_PERMISSION_DENIED;
+    if (!r && !rel[0]) r = RESULT_UNSUPPORTED;
+    if (!r && (!view_path(m, rel, path) || !is_dir(path))) r = RESULT_PATH_NOT_FOUND;
+    if (!r && !m->work[0]) { remove_tree(path); r = exists(path) ? RESULT_GENERIC_FAILURE : 0; }
+    else if (!r) {
+        char w[MAX_PATH], cm[MAX_PATH];
+        join(w, m->work, rel); join(cm, m->root, rel);
+        if (is_dir(w)) remove_tree(w);
+        if (is_dir(cm)) tomb_add(m, rel);
+    }
+    fs_unlock();
+    trace_printf("     fs DeleteDirectoryRecursively \"%s\" -> %x\n", STR(0), r);
+    RET(r);
+}
 static void fs_false(Ctx *c) { RET(0); }
 
 /* ---- self-test of the mount table and of the save data journal, in a scratch folder under %TEMP% (SSBU_SDK_SELFTEST) */
 uint32_t fs_mount_plain(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_PLAIN, host_dir); }
+uint32_t fs_mount_direct(const char *name, const char *host_dir) { fs_roots(); return mount_add(name, MK_DIRECT, host_dir); }   /* skyline.c: sd: */
 static int st_host_is(const char *path, const char *text) {
     char buf[64] = "";
     FILE *f = fopen(path, "rb");
@@ -766,6 +1184,9 @@ static volatile LONG g_acc_user_open;                    /* the one local user {
 int account_user_is_open(uint64_t lo, uint64_t hi) { return g_acc_user_open && lo == 1 && hi == 0; }
 static void acc_TryOpenPreselectedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); wr64(A0 + 16, 0); InterlockedExchange(&g_acc_user_open, 1); RET(1); }
 static void acc_GetUserId(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0); }
+/* CloseUser(const UserHandle &): only ARCropolis imports it, for the handle of its own TryOpenPreselectedUser; the game
+ * keeps its own open, so the user stays open here (the console counts opens per handle). */
+static void acc_CloseUser(Ctx *c) { (void)c; }
 /* The nickname of the console user is the name of the Windows user (SSBU_NICKNAME overrides): UTF-8, at most 32
  * bytes, NUL-terminated, in the 33-byte Nickname. */
 static void acc_GetNickname(Ctx *c) {
@@ -817,6 +1238,13 @@ static const ImportDef fs_imports[] = {
     {FS("9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE"), fs_WriteFile}, {FS("11GetFileSizeEPlNS0_10FileHandleE"), fs_GetFileSize},
     {FS("10CreateFileEPKcl"), fs_CreateFile}, {FS("10DeleteFileEPKc"), fs_DeleteFile}, {FS("15CreateDirectoryEPKc"), fs_CreateDirectory},
     {FS("12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc"), fs_GetEntryType}, {FS("13OpenDirectoryEPNS0_15DirectoryHandleEPKci"), fs_OpenDirectory},
+    /* names only the Skyline plugins import (hostrt.c keeps them for nnro.c's binding) */
+    {FS("11SetFileSizeENS0_10FileHandleEl"), fs_SetFileSize}, {FS("9FlushFileENS0_10FileHandleE"), fs_FlushFile},
+    {FS("10RenameFileEPKcS2_"), fs_RenameFile}, {FS("15RenameDirectoryEPKcS2_"), fs_RenameDirectory},
+    {FS("26DeleteDirectoryRecursivelyEPKc"), fs_DeleteDirectoryRecursively},
+    {FS("3fsa8RegisterEPKcONSt3__110unique_ptrINS1_11IFileSystemENS4_14default_deleteIS6_EEEE"), fs_fsa_Register},
+    {FS("6detail14CheckMountNameEPKc"), fs_CheckMountName}, {FS("6detail8AllocateEm"), fs_detail_Allocate},
+    {FS("6detail10DeallocateEPvm"), fs_detail_Deallocate}, {AC("9CloseUserERKNS0_10UserHandleE"), acc_CloseUser},
     {AC("10InitializeEv"), fs_ok}, {AC("12ListAllUsersEPiPNS0_3UidEi"), acc_ListAllUsers},
     {AC("22TryOpenPreselectedUserEPNS0_10UserHandleE"), acc_TryOpenPreselectedUser},
     {AC("9GetUserIdEPNS0_3UidERKNS0_10UserHandleE"), acc_GetUserId}, {AC("11GetNicknameEPNS0_8NicknameERKNS0_3UidE"), acc_GetNickname},
