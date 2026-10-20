@@ -37,6 +37,8 @@ int r1_ra_present_mode(void) { return 0; }
 void r1_stats_report(void) {}
 int r1_poll(int ticks) { (void)ticks; return 0; }
 void r1_pad(uint64_t *b, int *lx, int *ly, int *rx, int *ry) { (void)b; (void)lx; (void)ly; (void)rx; (void)ry; }
+void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) { (void)id; (void)b; (void)lx; (void)ly; (void)rx; (void)ry; }
+int r1_net_on(void) { return 0; }
 void r1_init(void) { r1_on(); }
 void r1_on_decommit(void *p, size_t n) { (void)p; (void)n; }
 void r1_on_commit(void *p, size_t n) { (void)p; (void)n; }
