@@ -307,6 +307,12 @@ def build_game_dll():
     return r.returncode
 
 
+def game_exports():
+    """The names the exe takes from the game DLL / library: the EXPORTS of nocrt/ssbu_game.def."""
+    with open(os.path.join(NOCRT_DIR, 'ssbu_game.def')) as f:
+        return [l.split()[0] for l in f.read().split('EXPORTS', 1)[1].splitlines() if l.strip() and not l.strip().startswith(';')]
+
+
 def game_import_lib(objdir):
     """The exe's import library of the game DLL, made from nocrt\\ssbu_game.def (the DLL's exports), not by linking the
     DLL: the exe links without the game DLL, on a PC without any dump (scripts/make_release.py)."""
@@ -369,7 +375,9 @@ def cmd_link(host_only=False):
         game = ['-Wl,-undefined,dynamic_lookup'] if host_only else [os.path.join(HERE, GAME_DLL)]
         r = subprocess.run([CLANG] + MACOS_MIN + objs + game + ['-Wl,-rpath,@executable_path'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     elif TARGET_LINUX:
-        game = ['-Wl,--unresolved-symbols=ignore-in-object-files'] if host_only else ['-L', HERE, '-l:' + GAME_DLL]      # host alone: a compile + link check, not runnable
+        # host alone: a compile + link check, not runnable. Only the game library's exports (nocrt/ssbu_game.def) are left
+        # without a definition (set to 0), so a name nothing defines (a Windows-only function without its Linux stub) fails it
+        game = ['-Wl,--defsym=%s=0' % n for n in game_exports()] if host_only else ['-L', HERE, '-l:' + GAME_DLL]
         r = subprocess.run([CLANG] + objs + game + ['-Wl,-rpath,$ORIGIN'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     else:
         r = subprocess.run([CLANG] + objs + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
