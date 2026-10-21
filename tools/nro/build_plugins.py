@@ -141,7 +141,8 @@ def build_one(name, nro, base, jobs, relift, flags_local):
     # 4. compile what changed
     t0 = time.time()
     sources = sorted(n for n in os.listdir(genfl) if n.endswith('.c'))
-    flags = ['-w', '-fno-strict-aliasing', '-I', WORK, '-I', genfl]
+    import build                                             # build.py (build/work): NOCRT_FLAGS / PLAT_FLAGS and link_dll, as the
+    flags = ['-w', '-fno-strict-aliasing', '-I', WORK, '-I', genfl] + build.NOCRT_FLAGS + build.PLAT_FLAGS     # game's modules (build_nro.py)
     headers = [os.path.join(WORK, h) for h in ('runtime.h', 'neon.h', 'flags_local.h', 'fpexact.h') if os.path.exists(os.path.join(WORK, h))]
     newest_header = max(os.path.getmtime(h) for h in headers)
     todo = []
@@ -177,10 +178,7 @@ def build_one(name, nro, base, jobs, relift, flags_local):
     dll = os.path.join(bindir, name + '.dll')
     objs = sorted(os.path.join(obj, n) for n in os.listdir(obj) if n.endswith('.obj'))
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(o) for o in objs):
-        rsp = os.path.join(obj, 'link.rsp')
-        with open(rsp, 'w') as f:
-            f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-        r = subprocess.run([build_opt.CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True)
+        r = build.link_dll(objs, dll, os.path.join(obj, 'link.rsp'), implib=False, fltused=True)      # lld-link alone under RECOMP_NOCRT (no MSVC)
         if r.returncode:
             print((r.stdout + r.stderr)[-4000:])
             print('could not link %s (is a game exe still running and holding it open?)' % dll)

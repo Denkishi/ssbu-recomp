@@ -387,9 +387,11 @@ def optnone_names(path):
 class Compiler:
     def __init__(self, base_obj, gen, obj, jobs, min_free, module=None):
         import build_opt
-        self.build_opt = build_opt
+        import build                              # NOCRT_FLAGS / PLAT_FLAGS: what build_opt.py adds to every compile of the base set
+        self.build_opt = build_opt                # (RECOMP_NOCRT: a build with LLVM alone, scripts/setup.py with a runtime package)
         self.base_obj, self.gen, self.obj = base_obj, gen, obj
         self.clang, self.opt, self.extra, self.per_file = base_settings(base_obj, module)
+        self.extra = self.extra + build.NOCRT_FLAGS + build.PLAT_FLAGS
         self.jobs, self.min_free = jobs, min_free
         self.lock = threading.Lock()
         self.running = {}
@@ -493,16 +495,18 @@ class Compiler:
 def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
     """read fn_table out of the linked DLL (address from the link map) and check that each wanted guest address is
     there and points at f_<addr>. Returns {addr: ok?}."""
-    sym = {}
-    for line in open(mapfile, errors='replace'):
-        t = line.split()
-        if len(t) >= 3 and re.match(r'^[0-9a-fA-F]{16}$', t[2] if len(t) > 2 else ''):
-            sym[t[1]] = int(t[2], 16)
     data = open(dll, 'rb').read()
     pe = struct.unpack_from('<I', data, 0x3c)[0]
     nsec = struct.unpack_from('<H', data, pe + 6)[0]
     opt = pe + 24
     image_base = struct.unpack_from('<Q', data, opt + 24)[0]
+    sym = {}                                      # symbol -> RVA: link.exe's map (`0002:000b4120  fn_table  00000001a2f82120  table.obj`:
+    for line in open(mapfile, errors='replace'):  # Rva+Base) or lld-link's /lldmap (`00003000 00000000  0  fn_table`: RVA; RECOMP_NOCRT, build.py link_dll)
+        t = line.split()
+        if len(t) >= 3 and re.match(r'^[0-9a-fA-F]{16}$', t[2]):
+            sym[t[1]] = int(t[2], 16) - image_base
+        elif len(t) == 4 and re.match(r'^[0-9a-fA-F]{8}$', t[0]) and t[1] == '00000000' and not t[3].startswith('.'):
+            sym[t[3]] = int(t[0], 16)
     secs = []
     so = opt + struct.unpack_from('<H', data, pe + 20)[0]
     for i in range(nsec):
@@ -516,7 +520,9 @@ def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
         raise ValueError('rva %x not in the image' % rva)
     tab = sym.get(table_sym)
     cnt = sym.get('fn_table_count' + table_sym[len('fn_table'):])
-    n = struct.unpack('<i', at(cnt - image_base, 4))[0]
+    if tab is None or cnt is None:
+        raise ValueError('%s: %s / fn_table_count not in the link map' % (mapfile, table_sym))
+    n = struct.unpack('<i', at(cnt, 4))[0]
     res = {}
     lo, hi = 0, n - 1
     entries = {}
@@ -525,7 +531,7 @@ def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
         found = None
         while lo <= hi:
             mid = (lo + hi) // 2
-            ga, fp = struct.unpack('<QQ', at(tab - image_base + mid * 16, 16))
+            ga, fp = struct.unpack('<QQ', at(tab + mid * 16, 16))
             if ga == a:
                 found = fp
                 break
@@ -533,7 +539,7 @@ def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
                 lo = mid + 1
             else:
                 hi = mid - 1
-        res[a] = found is not None and found == sym.get('f_%x' % a)
+        res[a] = found is not None and found - image_base == sym.get('f_%x' % a)
         entries[a] = found
     return n, res
 
@@ -732,6 +738,7 @@ def main():
                                                                    ' '.join('%x' % a for a in new) or 'none', time.time() - t0))
     if sys.argv[1] == 'check':
         return 1 if refused else 0
+    import build                                  # link_dll, NOCRT_FLAGS (RECOMP_NOCRT: LLVM alone, no MSVC)
 
     os.makedirs(gen, exist_ok=True)
     os.makedirs(obj, exist_ok=True)
@@ -870,10 +877,11 @@ def main():
 
     # ---- compile
     comp = Compiler(base_obj, gen, obj, int(opts.get('jobs', '2')), float(opts.get('min-free-gb', '5')), rl.module)
+    newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith('.h'))      # the staged runtime headers
     todo = []
     for name in names + ['table.c']:
         s, o = os.path.join(gen, name), os.path.join(obj, name[:-2] + '.obj')
-        if 'force' in opts or not os.path.exists(o) or os.path.getmtime(o) < os.path.getmtime(s):
+        if 'force' in opts or not os.path.exists(o) or os.path.getmtime(o) < max(os.path.getmtime(s), newest_header):      # a changed header (neon.h, runtime.h) recompiles too, as build.py does
             todo.append(name)
     log('compile: %d of %d files (%s %s %s), %d at a time' % (len(todo), len(names) + 1, comp.clang, comp.opt, ' '.join(comp.extra), comp.jobs))
     t1 = time.time()
@@ -910,15 +918,23 @@ def main():
                 return 1
         objs = [os.path.join(obj, '_shim.obj') if n == '_shim.obj' else o for n, o in zip(base, objs)] + [os.path.join(obj, '_sky_sites.obj')]
         mine |= {'_shim.obj'}
-        cmd_head, cmd_tail = [comp.clang, '-shared'], []
     else:
         shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
-        cmd_head, cmd_tail = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, shim, os.path.join(gen, 'sky_sites.c')], []
-    rsp = dll + '.rsp'
-    with open(rsp, 'w') as f:
-        f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-    cmd = cmd_head + ['@' + rsp, '-o', dll, '-Wl,/MAP:' + mapfile] + cmd_tail
-    r = subprocess.run(cmd, capture_output=True, text=True)
+        # build.py build_game_dll: the dump-derived host tables and the lifted SDK code (GAME_DATA_SOURCES, game_data_bind) are
+        # in the game DLL too, as objects beside the base set; without them the exe cannot load the DLL (entry point not found)
+        data_dir = base_obj + '_data'
+        if os.path.isdir(data_dir):
+            objs += [os.path.join(data_dir, n) for n in sorted(os.listdir(data_dir)) if n.endswith('.obj') and not n.startswith('_shim')]
+        # the shim and the site table as objects, compiled as build.py compile_game_data compiles the shim
+        flags = ['-c', '-O1', '-w', '-fno-strict-aliasing', '-DSDKLIFT_GEN', '-I', HERE, '-I', gen] + build.NOCRT_FLAGS + build.PLAT_FLAGS
+        for src, o in ((shim, os.path.join(obj, '_shim.obj')), (os.path.join(gen, 'sky_sites.c'), os.path.join(obj, '_sky_sites.obj'))):
+            r = subprocess.run([comp.clang] + flags + [src, '-o', o], capture_output=True, text=True)
+            if r.returncode:
+                log('could not compile %s:\n%s' % (src, (r.stdout + r.stderr)[-2000:]))
+                return 1
+            objs.append(o)
+    # link.exe through clang, or lld-link alone under RECOMP_NOCRT (a build made with a runtime package: no MSVC): build.py link_dll
+    r = build.link_dll(objs, dll, dll + '.rsp', implib=False, fltused=bool(rl.module), mapfile=mapfile)      # fltused as build_nro.py / build_game_dll link
     t_link = time.time() - t2
     log((r.stdout + r.stderr)[-3000:])
     log('link %s: exit %d, %d objects (%d re-compiled), %.0f MB, %.0fs' % (os.path.basename(dll), r.returncode, len(objs), len(mine & set(base)),

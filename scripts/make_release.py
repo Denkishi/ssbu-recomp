@@ -9,7 +9,7 @@ Needs no dump and reads nothing of the game: the exe is built from the runtime's
 which since game_data.h hold nothing derived from the dump; the game DLL it loads is built on the player's PC.
 
 The package, dist/ssbu-runtime-<commit>.zip, holds:
-    ssbu_native.exe      the host runtime (runtime/*.c), linked against nocrt/ssbu_game.def, not against a game DLL
+    ssbu_native.exe      the host runtime (runtime/*.c); it loads the game DLL by name at start (gamedll.c), no import library
     SDL3.dll             SDL 3 (zlib licence), as in the official VC development package
     ssbu_glslang.dll     runtime/vk_glslang_shim.c + the glslang / SPIRV-Tools release libraries
     opus.dll             only with --opus: libopus (BSD licence), for the music
@@ -18,8 +18,8 @@ The package, dist/ssbu-runtime-<commit>.zip, holds:
                          tree (the package is used only by the tree it was built from), the game-data interface version
 
 Before the zip is written the package is audited (audit_package): only the files above; the exe's linker map lists no object
-but the runtime's own sources; the exe imports from the game DLL only its exports in nocrt/ssbu_game.def; no file holds a
-path or name of this PC or a lifted-function name. --against <build\\work> also checks that none of that build's dump-derived
+but the runtime's own sources; the exe imports no game DLL (gamedll.c loads it by name at start); no file holds a path or
+name of this PC or a lifted-function name. --against <build\\work> also checks that none of that build's dump-derived
 tables (sdkdata.c byte blobs, nro_registry.c build ids) occurs in any file. The result is printed with the zip's SHA-256,
 which goes into scripts/install.py (RUNTIME_RELEASE) once the zip is uploaded.
 """
@@ -140,7 +140,7 @@ def source_names():
 
 
 def audit_exe_build(work, exe, llvm):
-    """The exe's own build: its linker map names only runtime objects, and it imports only the game DLL's three exports."""
+    """The exe's own build: its linker map names only runtime objects, and it imports no game DLL (gamedll.c loads it by name)."""
     bad = []
     mp = os.path.join(work, os.path.splitext(exe)[0] + '.map')
     if not os.path.exists(mp):
@@ -175,13 +175,8 @@ def audit_exe_build(work, exe, llvm):
         elif cur and re.match(r'\s+\d+\s+\S+', line):
             imports[cur].append(line.split()[-1])
     game = [d for d in imports if d.startswith('ssbu_game')]
-    if len(game) != 1:
-        bad.append('the exe should import exactly one game DLL, it imports %s' % (game or 'none'))
-    else:
-        exports = set(l.split()[0] for l in open(os.path.join(work, 'nocrt', 'ssbu_game.def')).read().split('EXPORTS', 1)[1].splitlines() if l.strip())
-        extra = set(imports[game[0]]) - exports
-        if extra:
-            bad.append('the exe imports from %s names that are not in nocrt/ssbu_game.def: %s' % (game[0], ' '.join(sorted(extra))))
+    if game:                                     # gamedll.c loads the game DLL by name at start (ssbu_game_sky.dll with plugins): no import
+        bad.append('the exe should import no game DLL (gamedll.c loads it by name), it imports %s' % ' '.join(game))
     return bad, imports
 
 

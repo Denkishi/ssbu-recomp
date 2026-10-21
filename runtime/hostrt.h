@@ -34,6 +34,7 @@ extern GameData game_data;
 #define sdk_data (game_data.sdk_data_tab)
 #define sdk_data_count (game_data.sdk_data_n)
 void register_imports(const ImportDef *defs, int count);
+void register_plugin_imports(const ImportDef *defs, int count);   /* the plugin-only table alone (never main's handlers) */
 ImportFn import_lookup(const char *name);    /* registered handler of an imported function, or NULL */
 void call_guest(Ctx *c, uint64_t addr);
 uint64_t guest_function_of(uint64_t host_rip);
