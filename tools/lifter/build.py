@@ -164,6 +164,7 @@ def cmd_compile(jobs, force):
 GAME_DLL = os.environ.get('RECOMP_DLL', 'ssbu_game_eh_o1' + ('.dylib' if TARGET_MACOS else '.so' if TARGET_LINUX else '.dll'))
 HOST_FLAGS = ['-O1', '-g', '-w', '-fno-strict-aliasing', '-I', HERE, '-I', GEN, '-Dfn_table=(*game_fn_table_p)', '-Dfn_table_count=(*game_fn_table_count_p)',
               '-Ddyn_syms=(*game_dyn_syms_p)', '-Ddyn_sym_count=(*game_dyn_sym_count_p)',
+              '-DGAME_DLL_NAME="%s"' % GAME_DLL,        # gamedll.c (Windows): the game DLL the exe loads by name (or ssbu_game_sky.dll with plugins)
               '-I', os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'include'),
               '-I', os.path.join(os.environ.get('VULKAN_HEADERS', os.path.join(HERE, '..', 'reference', 'upstream', 'Vulkan-Headers')), 'include')]      # Khronos headers for nvn_vk.c (track V)
 SDL_DIR = os.path.join(os.environ.get('SDL3_ROOT', os.path.join(HERE, '..', 'reference', 'upstream', 'SDL3-3.4.18-VC', 'SDL3-3.4.18')), 'lib', 'x64')      # SDL3 for nnpad_sdl.c; SDL3.dll is copied beside the exe at link (SDL3_ROOT / VULKAN_HEADERS: scripts\setup.py)
@@ -237,10 +238,11 @@ def nocrt_fltused(libdir):
     return obj
 
 
-def link_dll(objs, dll, rsp, implib=True, fltused=False):
+def link_dll(objs, dll, rsp, implib=True, fltused=False, mapfile=None):
     """Objects -> DLL: with clang's default linker (MSVC link.exe and the static C runtime) or, under RECOMP_NOCRT, with
     lld-link alone against the import libraries of nocrt\\ (ucrtbase.dll, ntdll.dll). fltused: add the _fltused object
-    (DLLs whose objects do not define it). Returns the CompletedProcess."""
+    (DLLs whose objects do not define it). mapfile: write the link map there (link.exe's format, or lld-link's /lldmap
+    under RECOMP_NOCRT; relift_sites.py reads both). Returns the CompletedProcess."""
     libdir = os.path.join(HERE, 'obj_nocrt')
     if NOCRT and fltused:
         os.makedirs(libdir, exist_ok=True)
@@ -252,10 +254,10 @@ def link_dll(objs, dll, rsp, implib=True, fltused=False):
     if TARGET_LINUX:          # a .so: -z now resolves everything at load, as a DLL is
         return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll] + PLAT_FLAGS + ['-lm', '-Wl,-soname,' + os.path.basename(dll), '-Wl,-z,now'], capture_output=True, text=True, errors='replace')
     if not NOCRT:
-        return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll], capture_output=True, text=True, errors='replace')
+        return subprocess.run([CLANG, '-shared', '@' + rsp, '-o', dll] + (['-Wl,/MAP:' + mapfile] if mapfile else []), capture_output=True, text=True, errors='replace')
     os.makedirs(libdir, exist_ok=True)
     libs = [lld_def_lib(os.path.join(NOCRT_DIR, n + '.def'), os.path.join(libdir, n + '.lib')) for n in ('ucrtbase_min', 'ntdll_min')]
-    argv = [LLD_LINK, '/dll', '/noentry', '/nodefaultlib', '/machine:x64', '/out:' + dll, '@' + rsp] + libs
+    argv = [LLD_LINK, '/dll', '/noentry', '/nodefaultlib', '/machine:x64', '/out:' + dll, '@' + rsp] + libs + (['/lldmap:' + mapfile] if mapfile else [])
     return subprocess.run(argv + (['/implib:' + dll[:-4] + '.lib'] if implib else []), capture_output=True, text=True, errors='replace')
 
 
@@ -347,9 +349,9 @@ def cmd_link(host_only=False):
     for n in HOST_SOURCES + ['gamedll.c'] + ([] if HAVE_IMGUI else ['menu_stub.c']):
         src, obj = os.path.join(HERE, 'r1src' if r1 and n == 'nncxxrt.c' else '', n), os.path.join(objdir, n[:-2] + '.obj')
         objs.append(obj)
-        if not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,
+        if n == 'gamedll.c' or not os.path.exists(obj) or os.path.getmtime(obj) < max(os.path.getmtime(src), newest_dep, newest_vk if n == 'nvn_vk.c' else 0,     # gamedll.c: always (GAME_DLL_NAME is a flag, not a dependency)
                                                                        os.path.getmtime(os.path.join(HERE, 'plat_mf.c')) if n == 'mf_ffmpeg.c' else 0,   # mf_ffmpeg.c includes plat_mf.c
-                                                                       os.path.getmtime(os.path.join(HERE, 'skyline.c')) if n == 'nnro.c' else 0):   # nnro.c includes skyline.c
+                                                                       max(os.path.getmtime(os.path.join(HERE, 'skyline.c')), os.path.getmtime(os.path.join(HERE, 'sky_compat.c'))) if n == 'nnro.c' else 0):   # nnro.c includes skyline.c, which includes sky_compat.c
             jobs.append((src, obj))
     for src in CXX_SOURCES:                          # U1: the settings menu (C++); imgui's own files depend on their source and menu_imconfig.h only
         obj = os.path.join(objdir, os.path.splitext(os.path.basename(src))[0] + '_cxx.obj')
@@ -372,7 +374,8 @@ def cmd_link(host_only=False):
         game = ['-Wl,--unresolved-symbols=ignore-in-object-files'] if host_only else ['-L', HERE, '-l:' + GAME_DLL]      # host alone: a compile + link check, not runnable
         r = subprocess.run([CLANG] + objs + game + ['-Wl,-rpath,$ORIGIN'] + LIBS + ['-o', out], capture_output=True, text=True, errors='replace')
     else:
-        r = subprocess.run([CLANG] + objs + [game_import_lib(objdir), os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
+        # no import library of the game DLL: gamedll.c loads it by name (GAME_DLL_NAME, or ssbu_game_sky.dll with plugins)
+        r = subprocess.run([CLANG] + objs + [os.path.join(SDL_DIR, 'SDL3.lib')] + LIBS + debug_link_flags(out) + ['-o', out], capture_output=True, text=True, errors='replace')
     if r.returncode == 0 and not TARGET_POSIX:
         import shutil
         try:

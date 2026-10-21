@@ -464,6 +464,11 @@ void register_imports(const ImportDef *defs, int count) {
         if (!found) extra_add(defs[d].name, defs[d].fn);
     }
 }
+/* Handlers for the plugins only (skyline.c, sky_compat.c): the plugin-only table, never main's handlers, whatever the
+ * order of registration; nnro.c resolve prefers main's own handler for a name main imports and falls back to this table. */
+void register_plugin_imports(const ImportDef *defs, int count) {
+    for (int d = 0; d < count; d++) extra_add(defs[d].name, defs[d].fn);
+}
 
 /* Function hooks on host entries (skyline.c A64HookFunction on an address that is not lifted code): an import placeholder of
  * main (0x73..., e.g. nn::ro::LoadModule, which the game and the plugins both call) or a host function handed out at run time

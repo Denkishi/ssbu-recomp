@@ -120,6 +120,14 @@ def main():
             ap.error('--userdata is required (or --play)')
     main_exe = 'ssbu_native' if (a.linux or a.mac) else 'ssbu_native.exe'
     a.exe = a.exe or main_exe
+    mods_ok, mods_env = True, {}
+    if a.play and not (a.linux or a.mac):
+        # mods: Skyline plugins in the SD folder (sd\ beside build\, or SSBU_SD) are lifted, their hook sites recorded and the
+        # game re-lifted with them before the start, when they are new or changed (scripts/mods.py, docs/SKYLINE.md); the exe
+        # then loads ssbu_game_sky.dll by itself. Without plugins nothing happens here.
+        import mods
+        user_env = dict(kv.partition('=')[::2] for kv in a.env)
+        mods_ok, mods_env = mods.prepare(a.build, sd=user_env.get('SSBU_SD'), exe=a.exe)
     state_file = os.path.join(a.build, 'state.json')
     with open(state_file) as f:
         state = json.load(f)
@@ -186,6 +194,7 @@ def main():
                     if os.path.isfile(p)), None)
         if icd:
             env['VK_DRIVER_FILES'] = icd
+    env.update(mods_env)                              # SSBU_SD, and SSBU_SKYLINE=0 when the plugins could not be prepared
     for kv in a.env:
         k, _, v = kv.partition('=')
         env[k] = v
@@ -196,6 +205,8 @@ def main():
     out = open(a.log, 'wb') if a.log else None
     p = subprocess.run(cmd, cwd=work, env=env, stdout=out, stderr=subprocess.STDOUT if out else None)
     print('game exited with code %d after %.0f s' % (p.returncode, time.time() - t0))
+    if mods_ok and mods_env and env.get('SSBU_SKYLINE') != '0':
+        mods.after_run(a.build, t0)                   # this run's site list, for the next start (a plugin hooking something new)
     return p.returncode
 
 

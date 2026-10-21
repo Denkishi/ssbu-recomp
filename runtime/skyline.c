@@ -107,6 +107,12 @@ static int sky_registry(void) {                  /* number of registered plugins
     InitOnceExecuteOnce(&once, sky_registry_once, NULL, NULL);
     return g_sky_sd[0] ? g_sky_count : 0;
 }
+int sky_plugins_present(void) { return sky_registry() > 0; }      /* gamedll.c: which game DLL to load */
+int sky_use_relift(void) {                       /* the re-lifted DLLs (ssbu_game_sky.dll, nro_bin_sky) are used unless SSBU_SKY_RELIFT=0:
+                                                  * scripts/mods.py records the plugins' sites with the normal DLLs, whatever an older re-lift has */
+    const char *e = getenv("SSBU_SKY_RELIFT");
+    return !(e && !strcmp(e, "0"));
+}
 
 /* ---------------------------------------------------------------- rtld ModuleObjects and the load lists
  * Layout (nnsdk-rs rtld.rs, smashline crates/rtld): next, prev, rela_plt, rela, module_base, dynamic, is_rela,
@@ -683,10 +689,13 @@ static void sky_report(void) {
     fflush(stdout);
 }
 
+#include "sky_compat.c"                     /* SDK entry points only plugins import, answered here */
+
 /* nnro.c register_ro_imports (after nnfs.c registered MountRom) */
 static void sky_register(void) {
     extern int (*g_svc_handler)(Ctx *, uint32_t);        /* hostrt.c guest_svc */
     register_imports(sky_imports, (int)(sizeof sky_imports / sizeof sky_imports[0]));
+    sky_compat_register();
     if (sky_registry() <= 0) return;
     g_svc_handler = sky_svc;
     hostfn_placeholders_readable();         /* hostrt.c: plugins read "orig" addresses as data */

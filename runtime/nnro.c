@@ -89,6 +89,7 @@ uint64_t import_address(int sym);              /* hostrt.c: what main's relocati
 static NroModule *g_mods;                      /* one per registry entry, then one per Skyline plugin */
 static int g_mod_count;                        /* nro_registry_count + plugins */
 static int sky_registry(void);                 /* skyline.c */
+int sky_use_relift(void);                      /* skyline.c: the re-lifted DLLs unless SSBU_SKY_RELIFT=0 */
 static NroInfo g_sky_info[];
 static void sky_module_loaded(NroModule *m, uint64_t obj);
 static void sky_module_unloaded(NroModule *m);
@@ -429,7 +430,7 @@ static int attach_dll(NroModule *m) {
     if (m->plugin) bin = sky_bin_dir();                     /* skyline.c: plugin_bin (SSBU_PLUGIN_BIN) */
     snprintf(path + n, sizeof path - n, "%s\\%s.dll", bin && bin[0] ? bin : "nro_bin_eh_o2", m->info->name);      /* P3 (2026-10-09): the optimised modules are the default; SSBU_NRO_BIN=nro_bin_eh = the -O0 ones */
     HMODULE dll = NULL;
-    if (!m->plugin && sky_registry() > 0) {                 /* skyline.c: a module re-lifted with the plugins' sites (relift_sites.py --module) */
+    if (!m->plugin && sky_registry() > 0 && sky_use_relift()) {      /* skyline.c: a module re-lifted with the plugins' sites (relift_sites.py --module) */
         char hp[MAX_PATH * 2];
         snprintf(hp, sizeof hp, "%.*snro_bin_sky\\%s.dll", (int)n, path, m->info->name);
         dll = LoadLibraryA(hp);

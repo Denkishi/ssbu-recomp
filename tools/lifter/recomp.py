@@ -692,6 +692,14 @@ class Fn:
                 if op:
                     v16 ^= 0xffff
                 val = v16 * 0x0001000100010001
+            elif cmode in (1, 3, 5, 7, 9, 11):           # orr (op 0) / bic (op 1) with a shifted immediate: 32-bit lanes (cmode 0xx1), 16-bit (10x1)
+                if cmode < 8:
+                    val = (imm8 << (8 * (cmode >> 1))) * 0x100000001
+                else:
+                    val = (imm8 << (8 * ((cmode >> 1) & 1))) * 0x0001000100010001
+                opn = '& ~' if op else '| '
+                return '{ c->v[%d].d[0] = c->v[%d].d[0] %s0x%xULL; c->v[%d].d[1] = %s; }' % (
+                    rd, rd, opn, val, rd, ('c->v[%d].d[1] %s0x%xULL' % (rd, opn, val)) if q else '0')
             else:
                 raise Unimpl('simd-imm')
             return '{ c->v[%d].d[0] = 0x%xULL; c->v[%d].d[1] = %s; }' % (rd, val, rd, ('0x%xULL' % val) if q else '0')
@@ -743,7 +751,7 @@ class Fn:
                     if (scalar and (size != 3 or opc != 0x08)) or (size == 3 and (not q or opc in (0x0c, 0x0d, 0x14, 0x15))):
                         raise Unimpl('simd-i3')
                     return 'v_i3x(%s, %s, %s, %s, %d, %d);' % (V(rd), V(rn), V(rm), opx, size, icount(size))
-                op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
+                op = {(0, 0x10): 'I_ADD', (1, 0x10): 'I_SUB', (0, 0x13): 'I_MUL', (0, 0x12): 'I_MLA', (1, 0x12): 'I_MLS', (1, 0x11): 'I_CMEQ', (0, 0x11): 'I_CMTST',
                       (0, 0x06): 'I_CMGT', (1, 0x06): 'I_CMHI', (0, 0x07): 'I_CMGE', (1, 0x07): 'I_CMHS'}.get((u, opc))
                 if op is None:
                     raise Unimpl('simd-i3')
@@ -768,8 +776,8 @@ class Fn:
                 if (u, opc) in ((0, 0x16), (0, 0x17)) and not scalar and a == 0:   # fcvtn(2) / fcvtl(2): sz 0 half <-> single, 1 single <-> double
                     return 'v_%s(%s, %s, %d, %d);' % ('fcvtl' if opc == 0x17 else 'fcvtn', V(rd), V(rn), sz, q)
                 op = {(1, 0x05): 'I1_NOT', (0, 0x05): 'I1_CNT', (1, 0x0b): 'I1_NEG', (0, 0x0b): 'I1_ABS',
-                      (0, 0x09): 'I1_CMEQ0', (0, 0x00): 'I1_REV64'}.get((u, opc))
-                if op is None or (op in ('I1_NOT', 'I1_CNT') and size):
+                      (0, 0x09): 'I1_CMEQ0', (0, 0x00): 'I1_REV64', (0, 0x01): 'I1_REV16', (1, 0x00): 'I1_REV32'}.get((u, opc))
+                if op is None or (op in ('I1_NOT', 'I1_CNT', 'I1_REV16') and size) or (op == 'I1_REV32' and size > 1):
                     raise Unimpl('simd-misc')
                 return 'v_i1v(%s, %s, %s, %d, %d);' % (V(rd), V(rn), op, size, icount(size))
             if bits(w, 20, 17) == 8 and bits(w, 11, 10) == 2:
@@ -786,6 +794,10 @@ class Fn:
             if scalar and u and bits(w, 20, 17) == 8 and bits(w, 16, 12) == 0x0d and bits(w, 11, 10) == 2:
                 f, ft = ('df', 'double') if sz else ('f', 'float')   # faddp scalar
                 return '{ %s t = c->v[%d].%s[0] + c->v[%d].%s[1]; vzero(%s); c->v[%d].%s[0] = t; }' % (ft, rn, f, rn, f, V(rd), rd, f)
+            if bits(w, 11, 10) == 0 and not scalar and size < 3:      # three registers, different types: the widening forms (neon.h v_wide)
+                opw = {0: 'W_ADDL', 1: 'W_ADDW', 2: 'W_SUBL', 3: 'W_SUBW', 8: 'W_MLAL', 10: 'W_MLSL', 12: 'W_MULL'}.get(bits(w, 15, 12))
+                if opw:                                  # (s/u)addl(2), addw(2), subl(2), subw(2), mlal(2), mlsl(2), mull(2); q = the "2" form
+                    return 'v_wide(%s, %s, %s, %s, %d, %d, %d);' % (V(rd), V(rn), V(rm), opw, size, u, q)
             raise Unimpl('simd-e')
         if bits(w, 27, 24) == 0xe:
             if bits(w, 15, 15) == 0 and bits(w, 10, 10) == 1:    # copy: dup / ins / umov / smov
@@ -819,7 +831,15 @@ class Fn:
                 return 'v_perm(%s, %s, %s, %d, %d, %d);' % (V(rd), V(rn), V(rm), bits(w, 14, 12), size, icount(size))
             raise Unimpl('simd-e')
         if bits(w, 10, 10) == 0:                          # by element
-            op = {9: 'F_MUL', 1: 'F_MLA', 5: 'F_MLS'}.get(bits(w, 15, 12))
+            opcode = bits(w, 15, 12)
+            opi = {(1, 0x0): 'IE_MLA', (1, 0x4): 'IE_MLS', (0, 0x8): 'IE_MUL', (0, 0xc): 'IE_SQDMULH', (0, 0xd): 'IE_SQRDMULH'}.get((u, opcode))
+            if opi and size in (1, 2) and not scalar:    # integer, h or s lanes (neon.h v_i3e): index H:L:M and a 4-bit Vm (h), H:L and M:Vm (s)
+                if size == 1:
+                    idx, vm = (bits(w, 11, 11) << 2) | (bits(w, 21, 21) << 1) | bits(w, 20, 20), bits(w, 19, 16)
+                else:
+                    idx, vm = (bits(w, 11, 11) << 1) | bits(w, 21, 21), bits(w, 20, 16)
+                return 'v_i3e(%s, %s, %s, %d, %s, %d, %d);' % (V(rd), V(rn), V(vm), idx, opi, size, icount(size))
+            op = {9: 'F_MUL', 1: 'F_MLA', 5: 'F_MLS'}.get(opcode)
             if op is None or u or not a:
                 raise Unimpl('simd-elem')
             idx = bits(w, 11, 11) if sz else (bits(w, 11, 11) << 1) | bits(w, 21, 21)

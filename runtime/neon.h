@@ -158,10 +158,10 @@ static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
     *d = r;
 }
 
-enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST };
+enum { I_ADD, I_SUB, I_MUL, I_CMEQ, I_CMGT, I_CMHI, I_CMGE, I_CMHS, I_CMTST, I_MLA, I_MLS };
 
 static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int n) {
-    V128 a = *pn, b = *pm, r;
+    V128 a = *pn, b = *pm, acc = *d, r;
     r.d[0] = 0; r.d[1] = 0;
     uint64_t ones = sz == 3 ? ~0ull : ((1ull << (8 << sz)) - 1);
     for (int i = 0; i < n; i++) {
@@ -176,13 +176,15 @@ static inline void v_i3v(V128 *d, const V128 *pn, const V128 *pm, int op, int sz
         case I_CMHI: z = x > y ? ones : 0; break;
         case I_CMHS: z = x >= y ? ones : 0; break;
         case I_CMTST: z = (x & y) ? ones : 0; break;
+        case I_MLA: z = vget(&acc, sz, i) + x * y; break;
+        case I_MLS: z = vget(&acc, sz, i) - x * y; break;
         }
         vset(&r, sz, i, z);
     }
     *d = r;
 }
 
-enum { I1_NOT, I1_NEG, I1_ABS, I1_CMEQ0, I1_REV64, I1_CNT };
+enum { I1_NOT, I1_NEG, I1_ABS, I1_CMEQ0, I1_REV64, I1_CNT, I1_REV16, I1_REV32 };
 
 static inline void v_i1v(V128 *d, const V128 *pn, int op, int sz, int n) {
     V128 a = *pn, r;
@@ -198,8 +200,63 @@ static inline void v_i1v(V128 *d, const V128 *pn, int op, int sz, int n) {
         case I1_CMEQ0: z = x == 0 ? ones : 0; break;
         case I1_CNT: z = (uint64_t)__builtin_popcountll(x); break;
         case I1_REV64: vset(&r, sz, (i / per64) * per64 + (per64 - 1 - i % per64), x); continue;
+        case I1_REV16: { int g = 2 >> sz; vset(&r, sz, (i / g) * g + (g - 1 - i % g), x); continue; }     /* b lanes within each 16 bits */
+        case I1_REV32: { int g = 4 >> sz; vset(&r, sz, (i / g) * g + (g - 1 - i % g), x); continue; }     /* b / h lanes within each 32 bits */
         }
         vset(&r, sz, i, z);
+    }
+    *d = r;
+}
+
+/* Integer multiply by one lane of vm (MUL / MLA / MLS / SQDMULH / SQRDMULH by element), h (sz 1) or s (sz 2) lanes.
+ * SQDMULH: the high half of twice the signed product, saturated (only min * min overflows); SQRDMULH rounds it. */
+enum { IE_MUL, IE_MLA, IE_MLS, IE_SQDMULH, IE_SQRDMULH };
+static inline void v_i3e(V128 *d, const V128 *pn, const V128 *pm, int idx, int op, int sz, int n) {
+    V128 a = *pn, acc = *d, r;
+    uint64_t y = vget(pm, sz, idx);
+    r.d[0] = 0; r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t x = vget(&a, sz, i), z = 0;
+        switch (op) {
+        case IE_MUL: z = x * y; break;
+        case IE_MLA: z = vget(&acc, sz, i) + x * y; break;
+        case IE_MLS: z = vget(&acc, sz, i) - x * y; break;
+        case IE_SQDMULH: case IE_SQRDMULH: {
+            int es = 8 << sz;
+            int64_t p = vsext(x, sz) * vsext(y, sz);                      /* |p| <= 2^62: no overflow */
+            int64_t h = op == IE_SQRDMULH ? (p + (1ll << (es - 2))) >> (es - 1) : p >> (es - 1);   /* (2p [+ 2^(es-1)]) >> es */
+            int64_t mx = (1ll << (es - 1)) - 1;
+            z = (uint64_t)(h > mx ? mx : h);
+            break; }
+        }
+        vset(&r, sz, i, z);
+    }
+    *d = r;
+}
+
+/* Three registers, different types, the widening forms: each result lane is twice the width of the narrow source lanes
+ * (sz = the narrow size: 0 b -> h, 1 h -> s, 2 s -> d), n = 8 >> sz lanes. ADDL / SUBL / MULL widen both operands, ADDW /
+ * SUBW take vn already wide, MLAL / MLSL accumulate into vd. The "2" forms (upper) read the high half of the narrow
+ * register(s). Signed lanes are sign-extended, unsigned ones zero-extended; the arithmetic is modulo 2^(2 * lane). */
+enum { W_ADDL, W_ADDW, W_SUBL, W_SUBW, W_MLAL, W_MLSL, W_MULL };
+static inline void v_wide(V128 *d, const V128 *pn, const V128 *pm, int op, int sz, int is_unsigned, int upper) {
+    V128 a = *pn, b = *pm, acc = *d, r;
+    int n = 8 >> sz, off = upper ? n : 0;
+    r.d[0] = 0; r.d[1] = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t xn = vget(&a, sz, i + off), xm = vget(&b, sz, i + off);
+        uint64_t en = is_unsigned ? xn : (uint64_t)vsext(xn, sz), em = is_unsigned ? xm : (uint64_t)vsext(xm, sz);
+        uint64_t wn = vget(&a, sz + 1, i), z = 0;
+        switch (op) {
+        case W_ADDL: z = en + em; break;
+        case W_ADDW: z = wn + em; break;
+        case W_SUBL: z = en - em; break;
+        case W_SUBW: z = wn - em; break;
+        case W_MULL: z = en * em; break;
+        case W_MLAL: z = vget(&acc, sz + 1, i) + en * em; break;
+        case W_MLSL: z = vget(&acc, sz + 1, i) - en * em; break;
+        }
+        vset(&r, sz + 1, i, z);
     }
     *d = r;
 }
