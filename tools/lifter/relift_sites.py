@@ -877,10 +877,11 @@ def main():
 
     # ---- compile
     comp = Compiler(base_obj, gen, obj, int(opts.get('jobs', '2')), float(opts.get('min-free-gb', '5')), rl.module)
+    newest_header = max(os.path.getmtime(os.path.join(HERE, h)) for h in os.listdir(HERE) if h.endswith('.h'))      # the staged runtime headers
     todo = []
     for name in names + ['table.c']:
         s, o = os.path.join(gen, name), os.path.join(obj, name[:-2] + '.obj')
-        if 'force' in opts or not os.path.exists(o) or os.path.getmtime(o) < os.path.getmtime(s):
+        if 'force' in opts or not os.path.exists(o) or os.path.getmtime(o) < max(os.path.getmtime(s), newest_header):      # a changed header (neon.h, runtime.h) recompiles too, as build.py does
             todo.append(name)
     log('compile: %d of %d files (%s %s %s), %d at a time' % (len(todo), len(names) + 1, comp.clang, comp.opt, ' '.join(comp.extra), comp.jobs))
     t1 = time.time()
