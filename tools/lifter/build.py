@@ -194,9 +194,12 @@ if TARGET_POSIX:
         return subprocess.run(['pkg-config'] + list(args) + ['sdl3', 'freetype2', 'openssl', 'libavformat', 'libavcodec', 'libswscale', 'libswresample', 'libavutil'], capture_output=True, text=True, check=True).stdout.split()
     _sdl_inc = HOST_FLAGS.index('-I', HOST_FLAGS.index('-Ddyn_sym_count=(*game_dyn_sym_count_p)'))      # the SDL3 VC package: the system's SDL3 instead
     HOST_FLAGS = HOST_FLAGS[:_sdl_inc] + HOST_FLAGS[_sdl_inc + 2:] + PLAT_FLAGS + ['-I', os.path.join(HERE, 'plat')] + pkg('--cflags')
-    # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Not in the Linux build yet: online play
-    # (net_relay.c: Winsock extensions, COM UPnP; net_off.c answers "off", as with SSBU_ONLINE unset)
-    HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['plat_posix.c', 'plat_mf.c', 'net_off.c']
+    # plat_mf.c: the Media Foundation subset nnmovie_mf.c uses, on FFmpeg. Online play (net_relay.c) on Linux: Winsock from
+    # plat/winsock2.h, UPnP on plain sockets (net_upnp.c); not tried on macOS yet: net_off.c answers "off" there, as with
+    # SSBU_ONLINE unset
+    HOST_SOURCES = HOST_SOURCES + ['plat_posix.c', 'plat_mf.c']
+    if TARGET_MACOS or 'net_relay.c' not in HOST_SOURCES:
+        HOST_SOURCES = [n for n in HOST_SOURCES if n != 'net_relay.c'] + ['net_off.c']
     LIBS = pkg('--libs') + ['-lGL', '-lm', '-ldl', '-lpthread']      # libGL: the OpenGL front end is linked (not used)
     if TARGET_MACOS:                                     # OpenGL is a system framework; dl / pthread are in libSystem
         LIBS = pkg('--libs') + ['-framework', 'OpenGL', '-lm']

@@ -1,5 +1,5 @@
-/* Online play is not in the Linux build yet (net_relay.c uses Winsock extensions and COM UPnP; tools/lifter/build.py
- * leaves it out there). These are the net_relay.h functions nnldn.c calls, answering as with SSBU_ONLINE unset:
+/* Online play is not in the macOS build yet (net_relay.c is built on Windows and Linux; tools/lifter/build.py leaves it
+ * out on macOS, or when the tree has no net_relay.c). These are the net_relay.h functions nnldn.c calls, answering as with SSBU_ONLINE unset:
  * net_online() is 0, so nnldn_register() registers nothing and the game's Local Wireless stays the offline console's. */
 #include <stdint.h>
 #include <string.h>

@@ -20,6 +20,10 @@ Online play is experimental and ON by default: the game joins the project's publ
 game and the other players see (`player_name` in `config\graphics.ini`); empty = your Windows user name.
 Used from the next start.
 
+**Linux:** the same, with `./play.sh`; the file is `build-linux/config/graphics.ini` and the name defaults to your
+user name. The lobby needs nothing open. LAN and host modes need UDP 39500 (and 39501 for LAN) let in by the firewall,
+if one runs (`sudo firewall-cmd --add-port=39500-39501/udp`, `sudo ufw allow 39500:39501/udp`). Rollback is Windows only.
+
 ## The easy way: the F1 menu
 
 Press **F1** (or the controller's Home button) -> **Experimental**. Online play is already ON; you can pick another mode:
