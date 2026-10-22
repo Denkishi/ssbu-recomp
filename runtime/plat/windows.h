@@ -208,6 +208,9 @@ typedef INIT_ONCE *PINIT_ONCE;
 #define INIT_ONCE_STATIC_INIT {0}
 typedef BOOL (*PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID *);
 BOOL InitOnceExecuteOnce(INIT_ONCE *once, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx);
+#define INIT_ONCE_INIT_FAILED 0x4
+BOOL InitOnceBeginInitialize(INIT_ONCE *once, DWORD flags, BOOL *pending, PVOID *ctx);   /* synchronous form only (flags 0) */
+BOOL InitOnceComplete(INIT_ONCE *once, DWORD flags, PVOID ctx);
 
 /* ---- handles: threads, events, semaphores, mutexes, timers, files ---- */
 typedef DWORD (*LPTHREAD_START_ROUTINE)(LPVOID);

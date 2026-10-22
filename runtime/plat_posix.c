@@ -233,6 +233,22 @@ BOOL InitOnceExecuteOnce(INIT_ONCE *once, PINIT_ONCE_FN fn, PVOID param, PVOID *
         sched_yield();
     }
 }
+BOOL InitOnceBeginInitialize(INIT_ONCE *once, DWORD flags, BOOL *pending, PVOID *ctx) {
+    /* the same states: the caller that moves 0 -> 1 gets pending = TRUE and must call InitOnceComplete; the others wait */
+    (void)flags;
+    if (ctx) *ctx = NULL;
+    for (;;) {
+        int st = __atomic_load_n(&once->state, __ATOMIC_ACQUIRE);
+        if (st == 2) { *pending = FALSE; return TRUE; }
+        if (st == 0 && __atomic_compare_exchange_n(&once->state, &st, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { *pending = TRUE; return TRUE; }
+        sched_yield();
+    }
+}
+BOOL InitOnceComplete(INIT_ONCE *once, DWORD flags, PVOID ctx) {
+    (void)ctx;
+    __atomic_store_n(&once->state, (flags & INIT_ONCE_INIT_FAILED) ? 0 : 2, __ATOMIC_RELEASE);
+    return TRUE;
+}
 
 /* ================================================================ handle objects */
 enum { PO_THREAD = 1, PO_EVENT, PO_SEM, PO_MUTEX, PO_TIMER, PO_FILE, PO_FIND, PO_MAPPING, PO_MODULE };

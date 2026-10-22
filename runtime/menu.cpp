@@ -1065,8 +1065,8 @@ static void sec_experimental(void) {
     ImGui::SameLine(); ImGui::Text("Online play");
     tag(1, (O.mode != 0) != (O0.mode != 0));
     ImGui::SameLine(); ImGui::TextDisabled("play with others through the game's Local Wireless menu");
-#ifndef _WIN32
-    if (O.mode) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Online play is not in the Linux / macOS build yet: these settings are kept for when it is.");
+#ifdef __APPLE__
+    if (O.mode) ImGui::TextColored(ImVec4(1, 0.6f, 0.3f, 1), "Online play is not in the macOS build yet: these settings are kept for when it is.");
 #endif
     if (O.mode) {
         /* (4) rollback netcode over the online connection: Play SSBU.bat (scripts/run.py) starts the normal exe with

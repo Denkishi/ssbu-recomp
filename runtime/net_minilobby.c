@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
@@ -136,9 +139,10 @@ static void ml_text(char *dst, size_t cap, const uint8_t *raw, size_t n) {   /* 
 }
 
 static uint64_t ml_random64(void) {
-    static BOOLEAN (WINAPI *rtlgen)(PVOID, ULONG);
     static int tried;
     uint64_t v = 0;
+#ifdef _WIN32
+    static BOOLEAN (WINAPI *rtlgen)(PVOID, ULONG);
     if (!tried) {
         HMODULE m = LoadLibraryA("advapi32.dll");
         rtlgen = m ? (BOOLEAN (WINAPI *)(PVOID, ULONG))GetProcAddress(m, "SystemFunction036") : NULL;
@@ -146,6 +150,10 @@ static uint64_t ml_random64(void) {
         tried = 1;
     }
     if (rtlgen && rtlgen(&v, sizeof v)) return v;
+#else
+    if (!tried) { ml_rng_state = GetTickCount64() * 0x9E3779B97F4A7C15ull ^ GetCurrentProcessId(); tried = 1; }
+    if (!getentropy(&v, sizeof v)) return v;           /* (the system's random bytes; unistd.h) */
+#endif
     ml_rng_state ^= ml_rng_state << 13; ml_rng_state ^= ml_rng_state >> 7; ml_rng_state ^= ml_rng_state << 17;
     return ml_rng_state;
 }
@@ -330,7 +338,7 @@ static void ml_on_join(const uint8_t *p, int len, const struct sockaddr_in *at, 
         memcpy(c->nonce, nonce, 8);
         snprintf(c->name, sizeof c->name, "%s", name); snprintf(c->build, sizeof c->build, "%s", build); snprintf(c->code, sizeof c->code, "%s", code);
         ml_log("%s joined (code '%s', build %s) as %s from %u.%u.%u.%u:%d, LAN %u.%u.%u.%u:%u, direct %s", name, code, build, ml_vip(ip),
-               at->sin_addr.S_un.S_un_b.s_b1, at->sin_addr.S_un.S_un_b.s_b2, at->sin_addr.S_un.S_un_b.s_b3, at->sin_addr.S_un.S_un_b.s_b4, ntohs(at->sin_port), lan_ip >> 24, lan_ip >> 16 & 255, lan_ip >> 8 & 255, lan_ip & 255,
+               ((uint8_t *)&at->sin_addr)[0], ((uint8_t *)&at->sin_addr)[1], ((uint8_t *)&at->sin_addr)[2], ((uint8_t *)&at->sin_addr)[3], ntohs(at->sin_port), lan_ip >> 24, lan_ip >> 16 & 255, lan_ip >> 8 & 255, lan_ip & 255,
                lan_port, direct ? "yes" : "no");
     }
     c->seen = now; c->lan_ip = lan_ip; c->lan_port = lan_port; c->direct = direct;

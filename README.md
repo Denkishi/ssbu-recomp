@@ -91,7 +91,7 @@ by default; **In progress**; **Planned**.
 | Freeze watchdog: a report with the stack of every thread | Done |
 | Fixed 60 fps in every mode | In progress |
 | Items and stages as source | Planned |
-| Native Linux build ([BUILDING_LINUX.md](BUILDING_LINUX.md)): movies, menus, a whole match at 60 fps with sound on one PC (CachyOS, NVIDIA, Wayland); F1 menu built (not yet tried on Linux), no online play there yet; Steam Deck not tested | In progress |
+| Native Linux build ([BUILDING_LINUX.md](BUILDING_LINUX.md)): movies, menus, a whole match at 60 fps with sound on one PC (CachyOS, NVIDIA, Wayland); F1 menu built (not yet tried on Linux), online play (Local Wireless rooms: two games on one PC identical frame by frame, matches over the internet played), no rollback; Steam Deck not tested | In progress |
 
 ### Game modes (measured on the development PC)
 

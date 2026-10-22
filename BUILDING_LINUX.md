@@ -27,7 +27,7 @@ Tested on one PC: CachyOS (Arch-based, kernel 7.2), 24 threads, 31 GB RAM, NVIDI
 | Keyboard | works (tested); controllers through SDL3 are the same code as on Windows but **not tested with a real pad on Linux** |
 | Album movie recording (the game's video capture to the album) | **not implemented** on Linux; the 7 self-test cases for it are accepted as known failures |
 | OpenGL renderer | not on Linux: Vulkan only |
-| Online play (experimental on Windows, `SSBU_ONLINE`) | not in the Linux build yet: the game's Local Wireless answers as an offline console |
+| Online play (experimental, `SSBU_ONLINE`, [docs/ONLINE.md](docs/ONLINE.md)) | the same code as on Windows. Tried: two games on one PC through a lobby on the PC (`tests/lwr_pair.py`, rollback off): a Local Wireless room match from start to results, identical frame by frame in both games; Local Wireless rooms of the public lobby, matches against players on Windows over the internet (one PC, 2026-10-21). UPnP is the IGD protocol on plain sockets: tried only against a simulated router (mapping made; its removal at exit does not run, `ExitProcess` is `_exit` here: the next start removes it), not on a real one. Rollback netcode: not on Linux (it needs the state save / restore of `r1_state.c`) |
 | Other distributions, AMD / Intel GPUs, X11, Steam Deck | not tested. The package lists for Debian/Ubuntu and Fedora in `install_deps.sh` are best guesses; `setup.py` checks every library and says which one is missing |
 
 ## What you need
@@ -185,8 +185,8 @@ keyboard key F1. Text boxes: in Desktop Mode use the keyboard or "Type in a dial
 Steam's on-screen keyboard (Steam + X) types into the active box (SDL may also open it by itself when a box is
 selected; not verified).
 
-Not on Linux yet: **Online play** (the Experimental page saves the settings for later and says so), and the Log page
-shows the log only when the game's output goes to a file (`play.sh` does that).
+Not on Linux yet: **Rollback netcode** (online matches use the game's own online netcode),
+and the Log page shows the log only when the game's output goes to a file (`play.sh` does that).
 
 ## Fonts
 
