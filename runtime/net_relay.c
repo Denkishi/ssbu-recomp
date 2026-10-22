@@ -1539,6 +1539,8 @@ void net_start(void) {
  *   players  in this player's Local Wireless room (this PC included); 1 while in the lobby but in no room
  *   ping_ms  round trip to the other player of the room: the direct path's last hello answer when the path is direct,
  *            otherwise the round trip to the lobby (relayed: the lobby is in between); -1 = unknown
+ *   ping_to  which of the two ping_ms is (NET_PING_DIRECT / NET_PING_LOBBY), NET_PING_ROLLBACK in a rollback match
+ *   peers, direct  the room's other players, and how many of them are reached directly (fresh direct path)
  *   delay, rollback_*  0: the game's own Local Wireless netcode is delay based and is not ours to measure (rollback, N1). */
 void net_stats_get(NetStats *o) {
     memset(o, 0, sizeof *o);
@@ -1548,14 +1550,17 @@ void net_stats_get(NetStats *o) {
     o->state = NET_CONNECTED;
     {   /* R3: an online rollback match (rb_net.c / rb_rollback.c) fills delay and rollback; its own round trip */
         int rbn_started(void), rbn_rtt_ms(void); void rbn_stats(int *delay, int *last, int *maxk);
-        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); return; }
+        if (rbn_started()) { rbn_stats(&o->delay, &o->rollback_last, &o->rollback_max); o->players = 2; o->ping_ms = rbn_rtt_ms(); o->ping_to = NET_PING_ROLLBACK; return; }
     }
     int in_room = nnldn_players();
     o->players = in_room ? in_room : 1;
     o->ping_ms = (int)g_ping;
     if (in_room > 1 && TryAcquireSRWLockShared(&g_peers_lock)) {
         uint64_t t = ms_now();
-        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) { o->ping_ms = g_peers[i].rtt; break; }
+        o->peers = g_npeers;
+        for (int i = 0; i < g_npeers; i++) if (fresh(&g_peers[i], t)) {
+            if (!o->direct++) { o->ping_ms = g_peers[i].rtt; o->ping_to = NET_PING_DIRECT; }
+        }
         ReleaseSRWLockShared(&g_peers_lock);
     }
 }
