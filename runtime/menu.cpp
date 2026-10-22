@@ -1106,7 +1106,10 @@ static void sec_online(void) {
     ImGui::Text("Now:"); ImGui::SameLine();
     if (ns.state == NET_CONNECTED) ImGui::TextColored(col, "%s - %s, %d player%s%s", st[2], k_online_name[O0.mode], ns.players, ns.players == 1 ? "" : "s", "");
     else ImGui::TextColored(col, "%s%s%s", ns.state >= 0 && ns.state <= 3 ? st[ns.state] : "?", O0.mode ? " - " : "", O0.mode ? k_online_name[O0.mode] : "");
-    if (ns.state == NET_CONNECTED && ns.ping_ms >= 0) { ImGui::SameLine(); ImGui::Text("  ping %d ms", ns.ping_ms); }
+    if (ns.state == NET_CONNECTED && ns.ping_ms >= 0) {
+        ImGui::SameLine();
+        ImGui::Text("  ping %d ms %s", ns.ping_ms, ns.ping_to == NET_PING_DIRECT ? "(to a player, direct)" : ns.ping_to == NET_PING_ROLLBACK ? "(rollback)" : "(to the lobby)");
+    }
     ImGui::Indent();
     ImGui::SetWindowFontScale(1.2f);
     int changed = 0;
@@ -1369,8 +1372,17 @@ static void draw_stats(void) {
     if (ns.state == NET_CONNECTED) ImGui::TextColored(col, "%s (%d players)", st[2], ns.players);
     else ImGui::TextColored(col, "%s", ns.state >= 0 && ns.state <= 3 ? st[ns.state] : "?");
     if (ns.state == NET_CONNECTED || ns.state == NET_CONNECTING) {
-        if (ns.ping_ms >= 0) ImGui::Text("ping %d ms  delay %d f", ns.ping_ms, ns.delay); else ImGui::Text("ping -  delay %d f", ns.delay);
-        ImGui::Text("rollback %d / %d f", ns.rollback_last, ns.rollback_max);
+        char ping[16] = "-";
+        if (ns.ping_ms >= 0) snprintf(ping, sizeof ping, "%d ms", ns.ping_ms);
+        if (ns.ping_to == NET_PING_ROLLBACK) {          /* delay and rollbacks are the rollback code's: only its matches have them */
+            ImGui::Text("ping %s  delay %d f", ping, ns.delay);
+            ImGui::Text("rollback %d / %d f", ns.rollback_last, ns.rollback_max);
+        } else if (ns.ping_to == NET_PING_DIRECT) {
+            ImGui::Text("ping %s to a player (direct)", ping);
+        } else ImGui::Text("ping %s to the lobby server", ping);
+        if (ns.peers > 0)                                /* the room's other players: direct, or each packet through the lobby */
+            ImGui::TextColored(ns.direct == ns.peers ? ImVec4(0.45f, 0.9f, 0.45f, 1) : ImVec4(1, 0.8f, 0.2f, 1), "direct to %d of %d player%s%s",
+                               ns.direct, ns.peers, ns.peers == 1 ? "" : "s", ns.direct < ns.peers ? " (rest via the lobby)" : "");
     }
     ImGui::Text("run-ahead %s", !ra_cfg ? "off" : r1_ra_phase() ? "on (running)" : "on");
     ImGui::End();

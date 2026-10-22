@@ -9,6 +9,8 @@
  *                                 session (this PC included), round-trip time to the other side in ms (-1 = unknown)
  *   delay                         the rollback code (rb_*.c, track N1/R2): input delay in frames used now
  *   rollback_last, rollback_max   the rollback code: frames rolled back at the last rollback, the most this session
+ *   ping_to, direct, peers        what ping_ms measures (NET_PING_*); of the other players of the room (peers), how many
+ *                                 are reached directly (direct); delay / rollback_* mean something only with NET_PING_ROLLBACK
  * Run-ahead is not here: the overlay reads it itself (graphics.ini runahead / SSBU_RUNAHEAD, r1_state.c r1_ra_phase). */
 #ifndef NET_STATS_H
 #define NET_STATS_H
@@ -17,7 +19,10 @@
 extern "C" {
 #endif
 enum { NET_OFFLINE = 0, NET_CONNECTING = 1, NET_CONNECTED = 2, NET_DISCONNECTED = 3 };
-typedef struct { int state; int players; int ping_ms; int delay; int rollback_last, rollback_max; } NetStats;
+/* ping_ms is the round trip to: the lobby server (no other player, or every one of them reached through the lobby); a
+ * player reached directly; the other game of an online rollback match (its own measure) */
+enum { NET_PING_LOBBY = 0, NET_PING_DIRECT = 1, NET_PING_ROLLBACK = 2 };
+typedef struct { int state; int players; int ping_ms; int delay; int rollback_last, rollback_max; int ping_to, direct, peers; } NetStats;
 void net_stats_get(NetStats *out);          /* fills every field; the default: state NET_OFFLINE, ping -1, the rest 0 */
 
 /* O1 (plan\phases\O1_room_browser.md): the room browser of the settings menu (F1 > Online rooms), net_relay.c.
