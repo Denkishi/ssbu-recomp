@@ -72,6 +72,10 @@ static ULONGLONG g_last_cfg_check;
 
 static void lock(void) { if (!g_cs_ready) { if (InterlockedCompareExchange(&g_cs_ready, 2, 0) == 0) { InitializeCriticalSection(&g_cs); g_cs_ready = 1; } while (g_cs_ready != 1) Sleep(0); } EnterCriticalSection(&g_cs); }
 static void unlock(void) { LeaveCriticalSection(&g_cs); }
+static volatile LONG g_bg;                       /* 1: the pad thread runs (see nnpad_background) */
+static __declspec(thread) int t_pad;              /* this is the pad thread */
+static SRWLOCK g_snap_lock = SRWLOCK_INIT;        /* the snapshot and the rumble asked for; no SDL call under it */
+static unsigned g_snap_menu;
 #define say(...) do { if (!g_quiet) printf(__VA_ARGS__); } while (0)
 
 /* ================================================================ sources
@@ -525,7 +529,8 @@ int nnpad_init(void) {
 void nnpad_poll(int force) {
     LARGE_INTEGER t;
     static unsigned s_gca_seen;
-    if (!g_sdl_ok) return;
+    if (!g_sdl_ok || (force == 0 && g_bg == 1)) return;      /* the pad thread polls (force 2 is its own call) */
+    if (force == 2) force = 0;
     QueryPerformanceCounter(&t);
     unsigned gs = gca_seq();                           /* an adapter report applied since the last refresh must not wait for the 1 ms gate */
     if (!force && (t.QuadPart - g_last_poll.QuadPart) * 1000 < g_qpf.QuadPart && gs == s_gca_seen) return;
@@ -630,6 +635,7 @@ static int menu_owns(const Dev *d, Src s) {
 unsigned nnpad_menu_keys(void) {                      /* bit 0: a Home / Guide button is down, bit 1: a Capture / Share button (any controller) */
     unsigned r = 0;
     if (!g_sdl_ok) return 0;
+    if (g_bg == 1 && !t_pad) { AcquireSRWLockShared(&g_snap_lock); r = g_snap_menu; ReleaseSRWLockShared(&g_snap_lock); return r; }
     nnpad_poll(0);
     lock();
     for (int i = 0; i < MAXDEV; i++) {
@@ -698,9 +704,69 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     }
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
+/* The pad thread (SSBU_PAD_THREAD; on by default on Linux / macOS, =1 on Windows too, =0 off). The game read every pad on
+ * its own thread: nnpad_poll's SDL_UpdateJoysticks, then the state through SDL. While a device comes or goes, SDL's update
+ * takes 8-24 ms with SDL's joystick lock held (measured on Linux: a wireless Xbox 360 pad switching off), and each read
+ * waits for that lock: frames of about 100 ms. With the thread, it alone calls SDL for the game: about once per ms it
+ * does nnpad_poll's work and makes a snapshot of every player (nnpad_present's drop rule, nnpad_is_gc, dev_state, the
+ * menu buttons) and sends the rumble asked since; the game's calls read the snapshot and note rumble, under a lock no SDL
+ * call is made in. It is started by nnhid.c for the game only: the tools and the self-test read SDL at once, as before. */
+typedef struct { int present, gc; SDL_JoystickID id; NnPadState st; } Snap;
+static Snap g_snap[8];
+static struct { int set; float low, high; } g_rq[8];
+static void rumble_locked(int player, float low, float high);
+static void bg_pass(void) {
+    Snap s[8];
+    struct { int set; float low, high; } rq[8];
+    unsigned menu;
+    AcquireSRWLockExclusive(&g_snap_lock);
+    memcpy(rq, g_rq, sizeof rq);
+    for (int p = 0; p < 8; p++) g_rq[p].set = 0;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+    nnpad_poll(2);
+    lock();
+    for (int p = 0; p < 8; p++) if (rq[p].set) rumble_locked(p, rq[p].low, rq[p].high);
+    memset(s, 0, sizeof s);
+    for (int p = 0; p < 8; p++) {
+        Dev *d = dev_of(p);
+        if (d && d->dropped) { NnPadState t; dev_state(d, &t); if (t.buttons) d->dropped = 0; }
+        s[p].gc = d && d->gca;
+        s[p].present = d && !d->dropped;
+        if (s[p].present) { s[p].id = d->id; dev_state(d, &s[p].st); }
+    }
+    unlock();
+    menu = nnpad_menu_keys();
+    AcquireSRWLockExclusive(&g_snap_lock);
+    memcpy(g_snap, s, sizeof s);
+    g_snap_menu = menu;
+    ReleaseSRWLockExclusive(&g_snap_lock);
+}
+static DWORD WINAPI pad_thread(void *arg) {
+    (void)arg;
+    t_pad = 1;
+    for (;;) { bg_pass(); Sleep(1); }
+    return 0;
+}
+#ifdef _WIN32
+#define PAD_THREAD_DEFAULT 0
+#else
+#define PAD_THREAD_DEFAULT 1
+#endif
+void nnpad_background(void) {
+    const char *e = getenv("SSBU_PAD_THREAD");
+    if (!g_sdl_ok || !(e && e[0] ? atoi(e) != 0 : PAD_THREAD_DEFAULT) || InterlockedExchange(&g_bg, 2)) return;
+    bg_pass();                                     /* the first snapshot before the game reads one */
+    HANDLE h = CreateThread(NULL, 0, pad_thread, NULL, 0, NULL);
+    if (!h) { InterlockedExchange(&g_bg, 0); return; }
+    CloseHandle(h);
+    InterlockedExchange(&g_bg, 1);
+    say("nn::pad: pads read on their own thread (SSBU_PAD_THREAD=0: on the game's)\n");
+}
+
 int nnpad_is_gc(int player) {
     int r;
     if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (g_bg == 1) { AcquireSRWLockShared(&g_snap_lock); r = g_snap[player].gc; ReleaseSRWLockShared(&g_snap_lock); return r; }
     lock();
     Dev *d = dev_of(player);
     r = d && d->gca;
@@ -712,6 +778,7 @@ int nnpad_gc_native(void) { return !g_cfg.gc_pro; }
 int nnpad_present(int player) {
     int r = 0;
     if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (g_bg == 1) { AcquireSRWLockShared(&g_snap_lock); r = g_snap[player].present; ReleaseSRWLockShared(&g_snap_lock); return r; }
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -723,6 +790,14 @@ int nnpad_present(int player) {
 int nnpad_get(int player, NnPadState *out) {
     int r = 0;
     if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (g_bg == 1) {
+        SDL_JoystickID id = 0; int gc = 0;
+        AcquireSRWLockShared(&g_snap_lock);
+        if ((r = g_snap[player].present) != 0) { *out = g_snap[player].st; id = g_snap[player].id; gc = g_snap[player].gc; }
+        ReleaseSRWLockShared(&g_snap_lock);
+        if (gc) gca_sample(id);
+        return r;
+    }
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -732,6 +807,9 @@ int nnpad_get(int player, NnPadState *out) {
 }
 void nnpad_disconnect(int player) {
     Dev *d;
+    if (g_bg == 1 && player >= 0 && player < 8) {      /* hidden at once; the pad thread may still hold the old snapshot's device */
+        AcquireSRWLockExclusive(&g_snap_lock); g_snap[player].present = 0; ReleaseSRWLockExclusive(&g_snap_lock);
+    }
     lock();
     if ((d = dev_of(player)) != NULL) { d->dropped = 1; if (d->gp) SDL_RumbleGamepad(d->gp, 0, 0, 0); d->rl = d->rh = 0; }
     unlock();
@@ -744,12 +822,12 @@ void nnpad_swap(int a, int b) {
     if (x) apply_player_index(x);
     if (y) apply_player_index(y);
     unlock();
+    if (g_bg == 1 && a >= 0 && a < 8 && b >= 0 && b < 8) {
+        AcquireSRWLockExclusive(&g_snap_lock); Snap t = g_snap[a]; g_snap[a] = g_snap[b]; g_snap[b] = t; ReleaseSRWLockExclusive(&g_snap_lock);
+    }
 }
-void nnpad_rumble(int player, float low, float high) {
-    Dev *d;
-    if (!g_sdl_ok || player < 0 || player > 7) return;
-    lock();
-    d = dev_of(player);
+static void rumble_locked(int player, float low, float high) {     /* lock held */
+    Dev *d = dev_of(player);
     if (d && (d->gp || d->js)) {
         float s = eff_rumble(d) ? EFF(d, rstr) : 0.0f;
         float l = low * s, h = high * s;
@@ -760,6 +838,12 @@ void nnpad_rumble(int player, float low, float high) {
             if (d->gp) SDL_RumbleGamepad(d->gp, rl, rh, rl || rh ? 30000 : 0); else SDL_RumbleJoystick(d->js, rl, rh, rl || rh ? 30000 : 0);
         }
     }
+}
+void nnpad_rumble(int player, float low, float high) {
+    if (!g_sdl_ok || player < 0 || player > 7) return;
+    if (g_bg == 1) { AcquireSRWLockExclusive(&g_snap_lock); g_rq[player].set = 1; g_rq[player].low = low; g_rq[player].high = high; ReleaseSRWLockExclusive(&g_snap_lock); return; }
+    lock();
+    rumble_locked(player, low, high);
     unlock();
 }
 

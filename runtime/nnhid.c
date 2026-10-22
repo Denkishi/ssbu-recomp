@@ -484,7 +484,7 @@ static void hid_setup(void) {
     /* default backend = SDL3 (nnpad_sdl.c, controllers.ini); SSBU_PAD_BACKEND=xinput keeps the older XInput path below, and is the fallback if SDL cannot start */
     if (!g_x_synth && !(backend && !_stricmp(backend, "xinput"))) {
         g_sdl_pad = nnpad_init();
-        if (g_sdl_pad) { g_keyboard_player = nnpad_keyboard_player(); printf("nn::hid: pads through SDL3; keyboard = player %d\n", g_keyboard_player + 1); return; }
+        if (g_sdl_pad) { g_keyboard_player = nnpad_keyboard_player(); printf("nn::hid: pads through SDL3; keyboard = player %d\n", g_keyboard_player + 1); if (!g_pad_test) nnpad_background(); return; }
         printf("nn::hid: SDL could not start, falling back to XInput\n");
     }
     printf("nn::hid: XInput %s; keyboard = player %d; buttons by %s\n", x_get_state ? "available" : "NOT available (no pads)",
