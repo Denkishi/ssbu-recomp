@@ -84,6 +84,9 @@ enum { T_MATCH = 20, T_MATCH_STATE };                 /* O2 matchmaking */
 #define LOBBY_TIMEOUT_MS 10000
 #define GONE_AFTER_MS 5000
 #define PUNCH_FOR_MS 5000          /* hellos every 200 ms this long; no answer -> relayed (hello every 5 s in case it opens) */
+/* hellos remembered per address: during punching one goes every 200 ms plus one per hello received, so with only the last
+ * two an answer slower than about 200 ms was never accepted (two players far apart stayed relayed through the lobby) */
+#define HELLO_KEEP 16
 #define FRESH_MS 1200              /* a direct path is used while its last answer is younger than this */
 #define NET_BUILD_DEFAULT "ssbu-recomp-ldn1"
 #define NET_PUBLIC_LOBBY "opensmash-lobby.duckdns.org:39500"     /* the project's public lobby (menu.cpp ONLINE_DEFAULT_LOBBY): the default without online_mode / online_server */
@@ -373,7 +376,8 @@ static volatile LONG64 g_out_relay, g_out_direct, g_in_relay, g_in_direct;
 enum { PS_PUNCHING, PS_DIRECT, PS_RELAYED };
 typedef struct {
     struct sockaddr_in at;
-    uint64_t hello, hello_at, prev, prev_at;          /* our last two hellos there */
+    uint64_t hello[HELLO_KEEP], hello_at[HELLO_KEEP];  /* our last hellos there (a ring; 0 = answered or unused) */
+    unsigned hello_n;
 } Cand;
 typedef struct {
     uint32_t ip;
@@ -502,9 +506,9 @@ static void punch(Peer *q, int c, int ack, uint64_t word) {     /* (peers lock h
 }
 static void hello(Peer *q, int c, uint64_t t) {
     Cand *k = &q->cand[c];
-    k->prev = k->hello; k->prev_at = k->hello_at;
-    k->hello = rnd64() | 1; k->hello_at = t;
-    punch(q, c, 0, k->hello);
+    unsigned i = k->hello_n++ % HELLO_KEEP;
+    k->hello[i] = rnd64() | 1; k->hello_at[i] = t;
+    punch(q, c, 0, k->hello[i]);
 }
 
 static void read_peers(const uint8_t *p, int n) {               /* PEERS body */
@@ -627,9 +631,11 @@ static void from_player(const uint8_t *p, int n, const struct sockaddr_in *from)
     if (q && q->ip == from_ip && to_ip == g_ip) {
         Cand *k = &q->cand[c];
         if (ack) {
-            uint64_t asked = word == k->hello ? k->hello_at : word == k->prev ? k->prev_at : 0;
+            uint64_t asked = 0;
+            int h = 0;
+            for (; word && h < HELLO_KEEP && !asked; h++) if (k->hello[h] == word) asked = k->hello_at[h];
             if (word && asked && t - asked < 2000) {
-                if (word == k->hello) k->hello = 0; else k->prev = 0;
+                k->hello[h - 1] = 0;
                 q->rtt = (int)(t - asked);
                 q->last_ack = t;
                 if (q->state != PS_DIRECT || (c == 1 && q->via == 0)) {
