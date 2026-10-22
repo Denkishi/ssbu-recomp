@@ -20,6 +20,7 @@ int  nnpad_init(void);                           /* SDL up (no video, no window)
 int  nnpad_is_gc(int player);                    /* the device of this player slot is a GameCube controller (from the adapter) */
 int  nnpad_gc_native(void);                      /* controllers.ini gamecube_style: 1 = native GameCube style (default), 0 = as a Pro Controller */
 void nnpad_poll(int force);                      /* hot-plug, config reload; cheap when called often (at most once per ms) */
+void nnpad_background(void);                     /* the game: the pad thread reads the pads from now on (nnpad_sdl.c) */
 int  nnpad_present(int player);                  /* a device is assigned to this player slot */
 int  nnpad_get(int player, NnPadState *out);     /* 0 = none */
 void nnpad_rumble(int player, float low, float high);   /* amplitudes 0..1 of the low and high band */
