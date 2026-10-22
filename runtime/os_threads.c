@@ -408,7 +408,31 @@ static void movie_preroll_diag(Ctx *c) {
         (long long)((rd64(ar + 0x78) - rd64(ar + 0x70)) / 0x40), (long long)((rd64(ar + 0x60) - rd64(ar + 0x58)) / 0x18), (int)rd32(ar + 0x40));
     printf("%c", 10);
 }
-static void os_SleepThread(Ctx *c) { movie_preroll_diag(c); sleep_ns((int64_t)A0); }
+/* The same loop, made to end when nothing can change any more. With accumulating (Vorbis) audio the condition is "more
+ * than 16 buffers filled" [0x71036f27e0], the pool has 16 (+0x44, set by the ctor 0x71036f5720; Init 0x71036f5c10 keeps
+ * it for 1-2 channels), and a buffer only comes back once the audio is started (Start 0x71036f5f40, called after the
+ * loop at 0x71036f282c): the loop always ran its 125 sleeps, 1.25 s with the player's mutex held and the main thread
+ * waiting for it. Once the video renderer holds more than 1 frame and the audio pool is full (no free buffer), the loop
+ * count is set to its limit: the game leaves the loop at 0x71036f2818 the way it does after the last sleep, and starts
+ * the movie. Measured on Linux only, so on there and on macOS; SSBU_MOVIE_PREROLL=1 turns it on (Windows), =0 off. */
+#ifdef _WIN32
+#define MOVIE_PREROLL_DEFAULT 0
+#else
+#define MOVIE_PREROLL_DEFAULT 1
+#endif
+static int movie_preroll_done(Ctx *c) {
+    static int on = -1; static LONG said;
+    if (on < 0) { const char *e = getenv("SSBU_MOVIE_PREROLL"); on = e && e[0] ? atoi(e) != 0 : MOVIE_PREROLL_DEFAULT; }
+    if (!on || c->import_from != GA(0x71036f2814ULL)) return 0;
+    uint64_t p = c->x[21], vr = rd64(p + 0x58) ? rd64(rd64(p + 0x58)) : 0, ar = rd64(p + 0x68) ? rd64(rd64(p + 0x68)) : 0;
+    if (!vr || !ar || (int64_t)rd64(vr + 0xb0) <= 1 || !rd8(ar + 0x50)) return 0;
+    if (rd64(ar + 0x78) != rd64(ar + 0x70) || (int64_t)rd64(ar + 0x110) < (int64_t)(int32_t)rd32(ar + 0x44)) return 0;
+    if (!InterlockedExchange(&said, 1)) printf("movie: pre-roll ended at sleep %u of %u: video frames queued %lld, audio pool full (%lld of %d buffers filled)\n",
+                                               (unsigned)c->x[24], (unsigned)c->x[25], (long long)rd64(vr + 0xb0), (long long)rd64(ar + 0x110), (int)rd32(ar + 0x44));
+    c->x[24] = c->x[25];
+    return 1;
+}
+static void os_SleepThread(Ctx *c) { movie_preroll_diag(c); if (movie_preroll_done(c)) return; sleep_ns((int64_t)A0); }
 static void os_GetCurrentStackInfo(Ctx *c) {
     Obj *o = t_thread ? obj(t_thread) : NULL;
     if (A0) wr64(A0, o ? o->stack : g_main_stack_base);
