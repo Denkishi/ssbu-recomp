@@ -611,11 +611,16 @@ static int g_mark; static int mark_setup(void); static void blk1_init(void);
 static int g_ra, g_save_failed; static int ra_hold_quiet(double limit); static const char *g_ra_busy_first_save(void);      /* (R3 lwr) the thread that kept the first save from being made */
 size_t nvn_r1_cb_save(void); void nvn_r1_cb_restore(void); static size_t g_ra_cb_bytes;      /* nvn_gl.c */
 static size_t g_saved_bytes;
+static int ls_lazy(void); static long ls_count(void); static uint8_t *ls_learned_addr(long k); static int g_ls_active;      /* rb_learned.c (SSBU_LS_LAZY) */
+static int g_save_lazy;                                 /* this save made no copy (lazy base): mark_setup fills nothing */
 static void save(Ctx *c) {
     double t0 = now_ms();
     collect(c);
     double t1 = now_ms();
     g_saved_bytes = 0;
+    /* (SSBU_LS_LAZY, rb_learned.c) the ring's base with the learned-set save: nothing is copied here. mark_setup protects the
+     * windows with every page "pending" and a page's first write copies it into the shadow; only the extras are copied now */
+    int lazy = g_save_lazy = g_rs_drop && g_mark > 0 && g_cycle == 0 && ls_lazy();
     {   /* (hs13) the commit this needs, checked first: the copy below (decommitted again while the shadow takes it when
          * g_rs_drop) + the shadow (as much again) + the ring's maps and pool; 1 GB more is left for the game and the driver */
         size_t tot = 0; for (int i = 0; i < g_nr; i++) tot += g_r[i].n;
@@ -630,10 +635,10 @@ static void save(Ctx *c) {
     {   int bad = 0;
         for (int i = 0; i < g_nr && !bad; i++) {
             Rng *r = &g_r[i];
-            r->s = (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
+            r->s = lazy ? NULL : (rb_test_nomem() == 2 && i == g_nr / 2) ? NULL : rs_alloc(r->n);
             r->dirty = calloc(r->n / PG, 1);
             r->async = calloc(r->n / PG, 1);
-            if (!r->s || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
+            if ((!r->s && !lazy) || !r->dirty || !r->async) { bad = 1; LOG("r1: FULL SAVE NOT MADE: allocation of %.1f MB for range %d of %d FAILED%s\n", r->n / 1048576.0, i, g_nr, rb_test_nomem() == 2 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=2)" : ""); }
         }
         if (!bad && !g_fpool) { g_fpool = malloc(g_fpool_cap); if (!g_fpool) { bad = 1; LOG("r1: FULL SAVE NOT MADE: fiber pool allocation FAILED\n"); } }
         if (!bad && g_ecap < 65536) { void *ne = realloc(g_e, 65536 * sizeof *g_e); if (ne) { g_e = ne; g_ecap = 65536; } else { bad = 1; LOG("r1: FULL SAVE NOT MADE: list allocation FAILED\n"); } }   /* no allocation while threads are held */
@@ -644,13 +649,26 @@ static void save(Ctx *c) {
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now (busy: %s)\n", g_ra_busy_first_save()); g_save_failed = 1; return; } } else park_quiet(0);
     fibers_save();
     double t1b = now_ms();
-    for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
+    if (!lazy) for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
     double t2 = now_ms();
     {   /* pages the OTHER threads write while main is held here (audio, vsync counter, loaders, render threads): they are
          * not the simulation's; they are left out of restore and verify. SSBU_R1_PAUSE=<ms> (default 50, 0 = none) */
         const char *pe = getenv("SSBU_R1_PAUSE"); int pause = pe ? atoi(pe) : 30;
-        size_t np = 0; int shown = 0;
-        if (pause > 0) {
+        size_t np = 0; int shown = 0, mfail = 0;
+        if (lazy) {                                     /* (lazy) the protection first: what the other threads write during the hold faults and is learned */
+            g_ctx_save = *c; mfail = !mark_setup();
+            if (!mfail && pause > 0) {
+                Sleep((DWORD)pause);
+                for (long k = 0, n = ls_count(); k < n; k++) {
+                    uint8_t *a = ls_learned_addr(k); if (!a) continue;
+                    for (int i = 0; i < g_nr; i++) if (a >= g_r[i].a && a < g_r[i].a + g_r[i].n) {
+                        g_r[i].async[(size_t)(a - g_r[i].a) / PG] = 1; np++; if (g_audio_free) async_add(a);
+                        if (shown < 40) g_e[shown++].a = a;
+                        break;
+                    }
+                }
+            }
+        } else if (pause > 0) {
             Sleep((DWORD)pause);
             for (int i = 0; i < g_nr; i++) {
                 Rng *r = &g_r[i];
@@ -662,8 +680,7 @@ static void save(Ctx *c) {
                     }
             }
         }
-        int mfail = 0;
-        if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
+        if (g_mark > 0 && g_cycle == 0 && !lazy) { g_ctx_save = *c; mfail = !mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
         if (g_ra > 0 && !mfail) nvn_r1_cb_save();
         unpark();
         if (mfail) { release(); g_save_failed = 2; return; }
@@ -672,7 +689,7 @@ static void save(Ctx *c) {
     }
     g_ctx_save = *c;
     g_nos = 0; os_r1_objs(os_cb); qsort(g_os, (size_t)g_nos, sizeof *g_os, cmp_os);
-    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)\n", g_cycle, g_ff, g_nr, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0);
+    LOG("r1: cycle %d SAVE at fight frame %lld: %d ranges, %.1f MB copied in %.2f ms (+ %.2f ms to list the ranges)%s\n", g_cycle, g_ff, g_nr, g_saved_bytes / 1048576.0, t2 - t1, t1 - t0, lazy ? "; lazy base (SSBU_LS_LAZY): the pages are copied at their first write" : "");
     if (g_cycle == 0) {
         for (int i = 0; i < g_nr; i++) if (g_r[i].n >= (4u << 20)) LOG("r1:   range %s + %.1f MB\n", where(g_r[i].a), g_r[i].n / 1048576.0);
         park_report("at the save");
@@ -1073,6 +1090,29 @@ static int mark_setup(void) {
         g_x[i].b = malloc(g_x[i].n); g_xbytes += g_x[i].n;
         if (!g_x[i].b) { LOG("r1: MARK setup: allocation of %.1f KB for an extra FAILED: marks OFF\n", g_x[i].n / 1024.0); mark_undo(); return 0; }
     }
+    if (g_save_lazy) {                       /* (SSBU_LS_LAZY, no full save made) the shadow committed range by range, NOT filled; the extras from memory */
+        int cx = 0; size_t xo = 0;
+        for (int i = 0; i < g_nr; i++) {
+            Rng *r = &g_r[i]; size_t np = r->n / PG;
+            for (size_t p = 0; p < np; p++) {
+                uint8_t *a = r->a + p * PG, *cm; size_t pi; uint8_t *sh = in_shadow(a, &cm, &pi);
+                if (sh) {
+                    if (cm[pi]) continue;
+                    size_t q = p; while (q + 1 < np && in_shadow(a + (q + 1 - p) * PG, &cm, &pi)) q++;      /* this range's pages in the same window */
+                    in_shadow(a, &cm, &pi);
+                    size_t c0 = pi & ~(size_t)15, c1 = (pi + (q - p) + 16) & ~(size_t)15, wn = (cm == g_sh1c ? g_wn1 : WN2) >> 12;
+                    if (c1 > wn) c1 = wn;
+                    if (rb_test_nomem() == 4 || !VirtualAlloc(sh - (pi - c0) * PG, (c1 - c0) * PG, MEM_COMMIT, PAGE_READWRITE)) {
+                        g_sh_fail++; LOG("r1: MARK setup: commit of the shadow FAILED (%.1f MB)%s: marks OFF\n", (c1 - c0) * (double)PG / 1048576.0, rb_test_nomem() == 4 ? " (TEST: SSBU_RB_NET_TEST_NOMEM=4)" : ""); mark_undo(); return 0; }
+                    memset(cm + c0, 1, c1 - c0); shb += (q - p + 1) * PG;
+                    p = q;
+                } else {
+                    if (cx < g_nx && xo == g_x[cx].n) { cx++; xo = 0; }
+                    if (cx < g_nx && g_x[cx].a + xo == a) { memcpy(g_x[cx].b + xo, a, PG); xo += PG; }
+                }
+            }
+        }
+    } else
     {   /* the bytes of the save point into the shadow and the extras; with g_rs_drop the copy of the full save is given back 1 MB at a time behind */
         int cx = 0; size_t xo = 0; long long dropped = 0;
         for (int i = 0; i < g_nr; i++) {
@@ -1112,9 +1152,10 @@ static int mark_setup(void) {
     }
     blk1_init();
     for (int i = 0; i < g_nx; i++) if (g_x[i].n >= 65536) LOG("r1:   extra %s + %.0f KB\n", where(g_x[i].a), g_x[i].n / 1024.0);
-    LOG("r1: MARK on: window 1 = region at %p, %.1f GB (map %.1f MB), window 2 = %llx + %.0f GB (map %.1f MB); shadow filled with %.1f MB; extras %d ranges %.1f MB copied whole each time\n",
-        (void *)g_win1, g_wn1 / 1073741824.0, (g_wn1 >> 12) / 1048576.0, WIN2, WN2 / 1073741824.0, (WN2 >> 12) / 1048576.0, shb / 1048576.0, g_nx, g_xbytes / 1048576.0);
+    LOG("r1: MARK on: window 1 = region at %p, %.1f GB (map %.1f MB), window 2 = %llx + %.0f GB (map %.1f MB); shadow %s %.1f MB; extras %d ranges %.1f MB copied whole each time\n",
+        (void *)g_win1, g_wn1 / 1073741824.0, (g_wn1 >> 12) / 1048576.0, WIN2, WN2 / 1073741824.0, (WN2 >> 12) / 1048576.0, g_save_lazy ? "committed for (lazy: filled at the first writes)" : "filled with", shb / 1048576.0, g_nx, g_xbytes / 1048576.0);
     ls_after_setup();                                   /* R4: the learned-set save protects the windows (threads still held) */
+    if (g_save_lazy && !g_ls_active) { LOG("r1: MARK setup: lazy base without the learned-set save: marks OFF\n"); mark_undo(); return 0; }
     return 1;
 }
 /* every marked page: dir 0 memory -> shadow (save), 1 shadow -> memory (restore); marks cleared. Returns pages. */
