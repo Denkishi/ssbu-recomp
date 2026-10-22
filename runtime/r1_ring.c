@@ -456,7 +456,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
                 if (w2 ? g_ns2[pi] : g_ns1[pi]) continue;                    /* not simulation (a host stack) */
                 in[w2 ? g_rg_n1 + pi : pi] = 1;
                 if (!sh_commit(sh, cm, pi)) { free(in); g_rg_nomem = 2; unpark(); LOG("r1: RING rebase: commit of the shadow FAILED (out of memory): no rollback ring for the rest of this session\n"); return 0; }
-                memcpy(sh, a, PG); copied++;
+                if (!ls_lazy()) memcpy(sh, a, PG);              /* (SSBU_LS_LAZY: the first write copies it, ls_open) */
+                copied++;
                 if (!w2) g_dc[pi] = 0;
             } else if (nnx < 8192) {
                 if (nnx && nx[nnx - 1].a + nx[nnx - 1].n == a) nx[nnx - 1].n += PG;
@@ -501,8 +502,8 @@ int r1_ring_rebase(long long frame, Ctx *c) {
     ls_rebase();                                          /* R4: the windows read-only again, the learned set emptied */
     unpark();
     g_rg_caps++;
-    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f, copy %.1f): %zu window pages copied into the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
-        frame, now_ms() - t0, t1 - t0, t2 - t1, copied, copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
+    LOG("r1: RING rebase: base state (frame %lld) made again in %.1f ms (hold %.1f, copy %.1f): %zu window pages %s the shadow (%.1f MB), %zu pool buffers freed, %zu shadow pages of pages not committed now dropped; extras %d ranges %.1f MB (%zu pages); %d modules got the mark maps\n",
+        frame, now_ms() - t0, t1 - t0, t2 - t1, copied, ls_lazy() ? "pending (lazy: copied at their first write) in" : "copied into", copied * (double)PG / 1048576.0, freed, dropped, g_nx, g_xbytes / 1048576.0, g_rg_nx, nmod);
     return 1;
 }
 /* (R3 hs13: tl4 / nmr / le3a / lg2a / lh4, c00000ff in ntdll's unwinder at a lua2cpp L2CExceptionShutdown throw, about 1 loop
