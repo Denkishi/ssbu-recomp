@@ -48,7 +48,8 @@
  *   SSBU_ONLINE_NAME                 online_name                      name in the lobby's log (default Player-xxxx)
  *   SSBU_ONLINE_CODE                 online_code                      lobby code: only players with the same code meet
  *   SSBU_ONLINE_DIRECT=0             online_direct = off              no direct paths: everything through the lobby
- *   SSBU_ONLINE_PORT=<n>             local UDP port (default: any)
+ *   SSBU_ONLINE_PORT=<n>             online_local_port                local UDP port (default: any): a fixed port lets a firewall
+ *                                                                    that drops unasked-for UDP (Linux ufw) be opened for direct paths
  *   SSBU_ONLINE_LOG=0..3             log level (default 1)
  *   SSBU_ONLINE_BUILD                build id override (players of different builds never meet) */
 #include <winsock2.h>
@@ -326,6 +327,7 @@ static void configure(void) {
     if ((e = getenv("SSBU_ONLINE_DIRECT"))) g_direct = !is_off(e);
     else if (ini_value("online_direct", v, sizeof v)) g_direct = !is_off(v);
     if ((e = getenv("SSBU_ONLINE_PORT")) && atoi(e) > 0 && atoi(e) < 65536) g_local_port = (uint16_t)atoi(e);
+    else if (ini_value("online_local_port", v, sizeof v) && atoi(v) > 0 && atoi(v) < 65536) g_local_port = (uint16_t)atoi(v);
     if ((e = getenv("SSBU_ONLINE_LOG"))) g_log = atoi(e);
     mods_scan();                       /* O1: the mods this game loads (their names and hashes go to the lobby) */
     if ((e = getenv("SSBU_ONLINE_BUILD")) && *e) snprintf(g_build, sizeof g_build, "%s", e);
@@ -1077,7 +1079,11 @@ static void bind_client(int loopback_only) {    /* (client thread) binds g_sock;
     a.sin_family = AF_INET;
     a.sin_port = htons(g_local_port);
     a.sin_addr.s_addr = loopback_only ? htonl(INADDR_LOOPBACK) : INADDR_ANY;
-    if (bind(g_sock, (struct sockaddr *)&a, sizeof a)) say("cannot bind UDP port %u (error %d)", g_local_port, WSAGetLastError());
+    if (bind(g_sock, (struct sockaddr *)&a, sizeof a)) {
+        say("cannot bind UDP port %u (error %d)%s", g_local_port, WSAGetLastError(), g_local_port ? ": any port instead" : "");
+        a.sin_port = 0;                              /* (in use, e.g. by a second copy of the game: still online) */
+        if (g_local_port) bind(g_sock, (struct sockaddr *)&a, sizeof a);
+    }
     int len = sizeof a;
     if (!getsockname(g_sock, (struct sockaddr *)&a, &len)) g_lan_port = ntohs(a.sin_port);
     g_lan_ip = loopback_only ? INADDR_LOOPBACK : outbound_ip();

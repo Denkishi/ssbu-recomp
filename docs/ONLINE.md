@@ -98,7 +98,9 @@ python tools/net/ssbu_lobby.py --bind 0.0.0.0 --port 39500 [--verbose]
 - `online_code` / `SSBU_ONLINE_CODE`: lobby code. Default: `public`.
 - `online_direct = off` / `SSBU_ONLINE_DIRECT=0`: no direct connections (see way 3).
 - `online_stun`: STUN server used to find your public address. Default `stun.l.google.com:19302`. Set `off` to disable.
-- `SSBU_ONLINE_PORT`: local UDP port.
+- `SSBU_ONLINE_PORT` / `online_local_port`: local UDP port (default: any). A fixed one lets a firewall that drops UDP
+  nobody asked for be opened for direct paths, e.g. on Linux with ufw: `online_local_port = 39510` and
+  `sudo ufw allow 39510/udp`. If the port is taken (a second copy of the game), any free port is used instead.
 - `SSBU_ONLINE_LOG=0..3`: log level. Default 1.
 
 ## Requirements
