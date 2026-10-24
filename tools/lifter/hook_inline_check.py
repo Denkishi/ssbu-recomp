@@ -30,7 +30,22 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OBJDUMP = os.environ.get('RECOMP_OBJDUMP') or os.path.join(os.path.dirname(os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')), 'llvm-objdump.exe')
+POSIX = os.environ.get('RECOMP_TARGET') in ('linux', 'macos')       # ELF / Mach-O objects of a Linux / macOS build
+
+
+def find_objdump():
+    """RECOMP_OBJDUMP, else llvm-objdump beside the compiler (on Linux / macOS also on the PATH, then GNU objdump, whose
+    -d -r output has the same shape for these objects)"""
+    if os.environ.get('RECOMP_OBJDUMP'):
+        return os.environ['RECOMP_OBJDUMP']
+    if not POSIX:
+        return os.path.join(os.path.dirname(os.environ.get('RECOMP_CLANG', r'C:\Program Files\LLVM\bin\clang.exe')), 'llvm-objdump.exe')
+    import shutil
+    near = os.path.join(os.path.dirname(os.environ.get('RECOMP_CLANG', '/usr/bin/clang')), 'llvm-objdump')
+    return near if os.path.exists(near) else shutil.which('llvm-objdump') or shutil.which('objdump') or 'llvm-objdump'
+
+
+OBJDUMP = find_objdump()
 BASE, BUCKET = 0x7100000000, 0xC000
 
 
@@ -193,10 +208,12 @@ def hk_move(p, at):
     return n, ''
 
 
-# ---------------------------------------------------------------- COFF
+# ---------------------------------------------------------------- COFF / ELF
 def coff_functions(path):
     """{symbol: (bytes of its section, offset)} for the f_ / u_ symbols of an object; also the list of all names"""
     data = open(path, 'rb').read()
+    if data[:4] == b'\x7fELF':                                     # Linux build (RECOMP_TARGET=linux)
+        return elf_functions(data)
     machine, nsec, _, symptr, nsym, optsz, _ = struct.unpack_from('<HHIIIHH', data, 0)
     sections = []
     for i in range(nsec):
@@ -219,6 +236,27 @@ def coff_functions(path):
             rptr, rsize = sections[secno - 1]
             out[name] = (rptr + value, rptr + rsize)
         i += 1 + aux
+    return data, out, names
+
+
+def elf_functions(data):
+    """coff_functions for a 64-bit ELF relocatable object: (file offset of the symbol, end of its section) per f_ / u_
+    symbol defined in a section, and every symbol name (clones such as f_<addr>.cold / .llvm.<n> are found by name)"""
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum = struct.unpack_from('<HH', data, 0x3a)
+    secs = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+    out, names = {}, []
+    for s in secs:
+        if s[1] != 2:                                               # SHT_SYMTAB
+            continue
+        strtab = secs[s[6]][4]
+        for k in range(s[5] // 24):
+            st_name, _, _, st_shndx, st_value, _ = struct.unpack_from('<IBBHQQ', data, s[4] + k * 24)
+            name = data[strtab + st_name:data.index(b'\0', strtab + st_name)].decode('latin-1')
+            names.append(name)
+            if 0 < st_shndx < 0xff00 and name[:2] in ('f_', 'u_'):
+                sh_offset, sh_size = secs[st_shndx][4], secs[st_shndx][5]
+                out[name] = (sh_offset + st_value, sh_offset + sh_size)
     return data, out, names
 
 
@@ -323,7 +361,8 @@ def c_calls(path, targets):
 
 FN_HDR = re.compile(r'^[0-9a-f]{16} <([^>]+)>:')
 INSN = re.compile(r'^\s+([0-9a-f]+):\s+(\S+)\s*(.*)$')
-RELOC = re.compile(r'^\s+[0-9a-f]+:\s+IMAGE_REL_AMD64_\w+\s+(\S+)')
+# COFF: IMAGE_REL_AMD64_REL32 f_x; ELF: R_X86_64_PLT32 f_x-0x4 (the addend is not part of the target's name)
+RELOC = re.compile(r'^\s+[0-9a-f]+:\s+(?:IMAGE_REL_AMD64|R_X86_64)_\w+\s+(.+?)(?:[-+]0x[0-9a-f]+)?\s*$')
 
 
 def disasm_refs(obj, targets):
