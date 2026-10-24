@@ -44,6 +44,8 @@ void r1_wrote(uint64_t a, uint64_t n) { (void)a; (void)n; }
 void r1_nosim(uint64_t a, uint64_t n) { (void)a; (void)n; }
 void r1_read_retry_note(void) {}
 void r1_register_heap(void) { r1_on(); }
+void r1_pad_id(int id, uint64_t *b, int *lx, int *ly, int *rx, int *ry) { (void)id; (void)b; (void)lx; (void)ly; (void)rx; (void)ry; }
+int r1_net_on(void) { return 0; }
 #else
 #include <stdio.h>
 #include <stdlib.h>

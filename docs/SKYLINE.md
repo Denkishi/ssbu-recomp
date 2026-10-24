@@ -98,6 +98,29 @@ All commands in `build\work` unless said otherwise; `RECOMP_CLANG` should name t
 
 The site list holds instruction words of the game (each patch line's original word): keep it on your PC, like the build.
 
+## Linux and macOS
+
+The same steps work in a native build (`scripts/setup.py --target linux` or `--target macos`, BUILDING_LINUX.md /
+BUILDING_MAC.md). The plugins, the re-lifted game and the re-lifted modules are made as `.so` (`.dylib`) files with the
+flags and the linker of the base set (`build.py`'s `PLAT_FLAGS` and `link_dll`); the runtime asks for the same `.dll`
+names, which `plat_posix.c` maps. On Linux `relift_sites.py` reads the free memory from `/proc/meminfo`, a compile's
+memory from `/proc/<pid>/status`, and checks the new `fn_table` entries in the ELF file itself. `scripts/skyline.py`
+runs each step with the environment `setup.py` gives its own steps, so nothing has to be set by hand (from the repository
+root, `--sd` an absolute or relative path to the SD folder):
+
+```
+deps/venv/bin/python scripts/skyline.py --target linux plugins --sd <sd folder>       1. lift the plugins
+./play.sh --env SSBU_SD=<sd folder>                                                     2. play into a match once
+deps/venv/bin/python scripts/skyline.py --target linux relift                          3. re-lift (game, then common)
+deps/venv/bin/python scripts/skyline.py --target linux link                            4. ssbu_sky linked to ssbu_game_sky.so
+deps/venv/bin/python scripts/skyline.py --target linux play --sd <sd folder>          5. play
+```
+
+`skyline.py` takes `--build <folder>` for a build outside `build-linux`, and passes other options through (`relift
+--jobs=4`, `play --userdata <folder>`). Run `scripts/setup.py` once after updating the sources (its stage step puts the
+new tools into `build-linux/work`). On macOS the `fn_table` check after the link is skipped; the first run's log shows the
+compiled-in sites.
+
 Switches: `SSBU_SD=<folder>` (default `<exe>\..\..\sd`), `SSBU_SKYLINE=0` (plugins off even with the folder present),
 `SSBU_PLUGIN_BIN=<folder>` (default `plugin_bin`), `SSBU_FSLOG=1` (file-system calls of the plugins). At exit the log
 lists how often each hook was called.

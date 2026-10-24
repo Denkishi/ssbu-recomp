@@ -13,6 +13,9 @@ Output (nothing of the base set is written): gen_<tag>\\ (the re-lifted bucket f
 obj_<tag>\\ (their objects, _relift_report.txt) and ssbu_game_<tag>.dll + .lib (+ .map). An exe selects the DLL by its
 import library:  RECOMP_DLL=ssbu_game_sky.dll RECOMP_EXE=ssbu_sky.exe python build.py link
 (the default shim and the re-lifted DLL's shim are the same file; build.py would only relink the DLL if an object were newer).
+RECOMP_TARGET=linux / macos: ssbu_game_<tag>.so / .dylib and nro_bin_<tag>/<m>.so / .dylib, compiled with build.py's
+PLAT_FLAGS and linked by build.link_dll with the base set's data objects (<base obj>_data); no .map, the new fn_table
+entries are checked in the ELF file (skipped on macOS). scripts/skyline.py runs these steps with setup.py's environment.
 
 SITE LIST: text, one site per line, `#` starts a comment, addresses are full guest addresses in hex.
   patch    <addr> <orig_word> <new_word>   the instruction word is replaced before lifting. orig is checked against the
@@ -60,7 +63,13 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-KINDS = {'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
+# RECOMP_TARGET=linux / macos (scripts/setup.py sets it for those builds): the re-lifted game and modules are .so / .dylib
+# files, compiled with build.py's PLAT_FLAGS and linked by build.link_dll as the base set was; the runtime still names
+# them .dll and plat_posix.c maps the name. Windows keeps its own path (lld / link.exe, /MAP and the PE check).
+TARGET = os.environ.get('RECOMP_TARGET', '')
+POSIX = TARGET in ('linux', 'macos')
+LIB_EXT = {'linux': '.so', 'macos': '.dylib'}.get(TARGET, '.dll')
+KINDS ={'patch': 1, 'inline': 2, 'midhook': 3, 'dynimm': 4, 'jtable': 5, 'noinline': 6}
 LOCK = os.environ.get('RECOMP_HEAVY_LOCK')      # optional: a lock file shared with other heavy builds of the machine
 
 
@@ -302,10 +311,47 @@ class MEMSTAT(ctypes.Structure):
 
 
 def free_gb():
+    if POSIX:
+        return posix_free_gb()
     m = MEMSTAT()
     m.dwLength = ctypes.sizeof(m)
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
     return m.ullAvailPhys / 2.0 ** 30
+
+
+def posix_free_gb():
+    """Linux: MemAvailable of /proc/meminfo (what can be used without swapping). macOS: free + inactive + speculative
+    pages of vm_stat. If neither can be read, a large value (the --min-free-gb gate then never holds a compile back)."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024 / 2.0 ** 30
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(['vm_stat'], capture_output=True, text=True).stdout
+        page = int(re.search(r'page size of (\d+) bytes', out).group(1))
+        pages = sum(int(m.group(1)) for m in re.finditer(r'Pages (?:free|inactive|speculative):\s+(\d+)', out))
+        return pages * page / 2.0 ** 30
+    except (OSError, AttributeError, ValueError):
+        return 1e6
+
+
+def posix_proc_mem(pid):
+    """(resident bytes, peak resident bytes) of a process from /proc/<pid>/status (clang compiles in the driver's own
+    process unless -fno-integrated-cc1, so the driver's numbers are the compile's); (0, 0) without /proc (macOS)."""
+    rss = peak = 0
+    try:
+        with open('/proc/%d/status' % pid) as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss = int(line.split()[1]) * 1024
+                elif line.startswith('VmHWM:'):
+                    peak = int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return rss, peak
 
 
 class PMC(ctypes.Structure):
@@ -317,6 +363,8 @@ class PMC(ctypes.Structure):
 
 def proc_mem(p):
     """(private bytes, peak private bytes) of a Popen'd process (clang runs cc1 in its own process: integrated cc1)"""
+    if POSIX:
+        return posix_proc_mem(p.pid)
     c = PMC()
     c.cb = ctypes.sizeof(c)
     h = ctypes.c_void_p(int(p._handle))
@@ -366,7 +414,8 @@ def base_settings(base_obj, module=None):
     prefix = re.escape(module + '/') if module else ''
     if os.path.exists(rep):
         for line in open(rep):
-            m = re.match(r'^# \S+ \S+\s+(.+?clang\.exe) (-O\d) (.*?)\s+optnone over (\d+) statements', line)
+            # the compiler: clang.exe on Windows, /usr/bin/clang (or clang-NN) on Linux / macOS
+            m = re.match(r'^# \S+ \S+\s+(.+?clang(?:-\d+)?(?:\.exe)?) (-O\d) (.*?)\s+optnone over (\d+) statements', line)
             if m:
                 clang, opt, extra = m.group(1), m.group(2), m.group(3).split()
                 continue
@@ -390,6 +439,12 @@ class Compiler:
         self.build_opt = build_opt
         self.base_obj, self.gen, self.obj = base_obj, gen, obj
         self.clang, self.opt, self.extra, self.per_file = base_settings(base_obj, module)
+        # Linux / macOS: the base set's platform flags (-fPIC, -fvisibility=hidden, plat_pre.h), so a re-lifted file differs
+        # from its base object only by the sites. Windows: none, as before.
+        self.plat = []
+        if POSIX:
+            import build
+            self.plat = list(build.NOCRT_FLAGS) + list(build.PLAT_FLAGS)
         self.jobs, self.min_free = jobs, min_free
         self.lock = threading.Lock()
         self.running = {}
@@ -399,7 +454,7 @@ class Compiler:
         src, obj = os.path.join(self.gen, name), os.path.join(self.obj, name[:-2] + '.obj')
         how = self.per_file.get(name)
         if how == 'O0':
-            return [self.clang, '-c', '-O0'] + self.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', self.gen, src, '-o', obj], 'whole file -O0 (as the base set)'
+            return [self.clang, '-c', '-O0'] + self.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', self.gen] + self.plat + [src, '-o', obj], 'whole file -O0 (as the base set)'
         names = optnone_names(os.path.join(self.base_obj, name[:-2] + '.optnone.h'))
         limit = how or self.build_opt.OPTNONE_LINES
         have = set(n for n, _ in names)
@@ -407,7 +462,7 @@ class Compiler:
             if fname not in have and n > limit and int(fname[2:], 16) in new_funcs:
                 names.append((fname, params))
         hdr = obj[:-4] + '.optnone.h'
-        cmd = [self.clang, '-c', self.opt] + self.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', self.gen]
+        cmd = [self.clang, '-c', self.opt] + self.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', self.gen] + self.plat
         if names:
             with open(hdr, 'w') as f:
                 f.write('/* relift_sites.py: the functions the base set compiled unoptimised (+ new ones over %d statements) */\n#include "runtime.h"\n' % limit)
@@ -538,8 +593,95 @@ def pe_fn_table_check(dll, mapfile, wanted, table_sym='fn_table'):
     return n, res
 
 
+def elf_fn_table_check(lib, wanted, table_sym='fn_table'):
+    """The same check on a Linux .so: fn_table, its count and f_<addr> from the ELF symbol table (.symtab; the build does
+    not strip), the table's function pointers from the dynamic relocations that fill them at load (R_X86_64_RELATIVE /
+    R_AARCH64_RELATIVE addends, or a RELR bitmap's implicit addends) when the file holds no value there.
+    Returns (entries, {addr: ok?})."""
+    data = open(lib, 'rb').read()
+    if data[:4] != b'\x7fELF' or data[4] != 2 or data[5] != 1:
+        raise ValueError('%s is not a 64-bit little-endian ELF file' % lib)
+    shoff, = struct.unpack_from('<Q', data, 0x28)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', data, 0x3a)
+    phoff, = struct.unpack_from('<Q', data, 0x20)
+    phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+    secs = [struct.unpack_from('<IIQQQQIIQQ', data, shoff + i * shentsize) for i in range(shnum)]
+    names = secs[shstrndx][4]
+
+    def sname(s):
+        return data[names + s[0]:data.index(b'\0', names + s[0])].decode('latin-1')
+    loads = []
+    for i in range(phnum):
+        p_type, _, p_offset, p_vaddr, _, p_filesz, _, _ = struct.unpack_from('<IIQQQQQQ', data, phoff + i * phentsize)
+        if p_type == 1:                                             # PT_LOAD
+            loads.append((p_vaddr, p_filesz, p_offset))
+
+    def at(va, n):
+        for vaddr, size, off in loads:
+            if vaddr <= va and va + n <= vaddr + size:
+                return data[off + va - vaddr: off + va - vaddr + n]
+        raise ValueError('address %x is not in a loaded segment of %s' % (va, lib))
+    want_syms = {table_sym, 'fn_table_count' + table_sym[len('fn_table'):]} | set('f_%x' % a for a in wanted)
+    sym = {}
+    for s in secs:
+        if s[1] != 2:                                               # SHT_SYMTAB
+            continue
+        strtab = secs[s[6]][4]
+        for k in range(s[5] // 24):
+            st_name, st_info, _, st_shndx, st_value, _ = struct.unpack_from('<IBBHQQ', data, s[4] + k * 24)
+            if not st_shndx:
+                continue
+            nm = data[strtab + st_name:data.index(b'\0', strtab + st_name)].decode('latin-1')
+            if nm in want_syms:
+                sym[nm] = st_value
+    reloc = {}                                                      # slot address -> value written at load
+    for s in secs:
+        if s[1] == 4 and sname(s) in ('.rela.dyn', '.rela.plt'):    # SHT_RELA
+            for k in range(s[5] // 24):
+                r_offset, r_info, r_addend = struct.unpack_from('<QQq', data, s[4] + k * 24)
+                if r_info & 0xffffffff in (8, 1027):                # R_X86_64_RELATIVE, R_AARCH64_RELATIVE
+                    reloc[r_offset] = r_addend & 0xffffffffffffffff
+        elif s[1] == 19:                                            # SHT_RELR: addends are the words in the file
+            where = 0
+            for k in range(s[5] // 8):
+                e, = struct.unpack_from('<Q', data, s[4] + k * 8)
+                if not e & 1:
+                    reloc.setdefault(e, None)
+                    where = e + 8
+                else:
+                    for bit in range(1, 64):
+                        if e >> bit & 1:
+                            reloc.setdefault(where + (bit - 1) * 8, None)
+                    where += 63 * 8
+    tab = sym.get(table_sym)
+    cnt = sym.get('fn_table_count' + table_sym[len('fn_table'):])
+    if tab is None or cnt is None:
+        raise ValueError('%s or its count is not in the symbol table of %s' % (table_sym, lib))
+    n = struct.unpack('<i', at(cnt, 4))[0]
+
+    def entry(i):
+        ga, fp = struct.unpack('<QQ', at(tab + i * 16, 16))
+        r = reloc.get(tab + i * 16 + 8)
+        return ga, (r if r is not None else fp)
+    res = {}
+    for a in wanted:
+        lo, hi, found = 0, n - 1, None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            ga, fp = entry(mid)
+            if ga == a:
+                found = fp
+                break
+            if ga < a:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        res[a] = found is not None and found == sym.get('f_%x' % a)
+    return n, res
+
+
 # ---------------------------------------------------------------------------------------------------- main
-ORDERING = [(re.compile(r'\blda(8|16|32|64)\('), r'rd\1('), (re.compile(r'\bstl(8|16|32|64)\('), r'wr\1('),
+ORDERING =[(re.compile(r'\blda(8|16|32|64)\('), r'rd\1('), (re.compile(r'\bstl(8|16|32|64)\('), r'wr\1('),
             (re.compile(r'__atomic_(thread|signal)_fence\(__ATOMIC_\w+\);'), ';')]
 
 
@@ -657,13 +799,13 @@ def main():
         base_eh = os.path.join(HERE, opts.get('base-eh', os.path.join('gen_nro_eh_o2', mname)))
         base_obj = os.path.join(HERE, opts.get('base-obj', os.path.join('obj_nro_fl23' if fl else 'obj_nro_eh_o2', mname)))
         gen, obj = os.path.join(HERE, 'gen_nro_' + tag, mname), os.path.join(HERE, 'obj_nro_' + tag, mname)
-        dll = os.path.join(HERE, 'nro_bin_' + tag, mname + '.dll')
+        dll = os.path.join(HERE, 'nro_bin_' + tag, mname + LIB_EXT)
     else:
         base_gen = os.path.join(HERE, opts.get('base-gen', 'gen_fl' if fl else 'gen_eh_o2'))
         base_eh = os.path.join(HERE, opts.get('base-eh', 'gen_eh_o2'))
         base_obj = os.path.join(HERE, opts.get('base-obj', 'obj_fl23' if fl else 'obj_eh_o1'))
         gen, obj = os.path.join(HERE, 'gen_' + tag), os.path.join(HERE, 'obj_' + tag)
-        dll = os.path.join(HERE, 'ssbu_game_%s.dll' % tag)
+        dll = os.path.join(HERE, 'ssbu_game_%s%s' % (tag, LIB_EXT))
     t0 = time.time()
     rl = Relifter(base_gen, module, fl)
     recomp = rl.recomp
@@ -897,11 +1039,12 @@ def main():
     mine = set(n[:-2] + '.obj' for n in names) | {'table.obj'}       # only this site list's files (not those of an earlier list)
     base = sorted(n for n in os.listdir(base_obj) if n.endswith('.obj'))
     objs = [os.path.join(obj if n in mine else base_obj, n) for n in base]
-    mapfile = dll[:-4] + '.map'
+    mapfile = dll[:-len(LIB_EXT)] + '.map'
+    rsp = dll + '.rsp'
     if rl.module:
         # a module DLL: its own shim (nro_shim.c with the site callouts, -DNRO_MODULE) and the site table as objects
         os.makedirs(os.path.dirname(dll), exist_ok=True)
-        flags = ['-c', comp.opt] + comp.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen]
+        flags = ['-c', comp.opt] + comp.extra + ['-w', '-fno-strict-aliasing', '-I', HERE, '-I', gen] + comp.plat
         for src, o, extra in ((os.path.join(HERE, 'nro_shim.c'), os.path.join(obj, '_shim.obj'), ['-DNRO_MODULE=' + rl.module]),
                               (os.path.join(gen, 'sky_sites.c'), os.path.join(obj, '_sky_sites.obj'), [])):
             r = subprocess.run([comp.clang] + flags + extra + [src, '-o', o], capture_output=True, text=True)
@@ -911,25 +1054,49 @@ def main():
         objs = [os.path.join(obj, '_shim.obj') if n == '_shim.obj' else o for n, o in zip(base, objs)] + [os.path.join(obj, '_sky_sites.obj')]
         mine |= {'_shim.obj'}
         cmd_head, cmd_tail = [comp.clang, '-shared'], []
+    elif POSIX:
+        # the game library as build.py links it on Linux / macOS (build_game_dll): the base objects, the shim and the
+        # dump-derived data sources (build.compile_game_data: <base obj>_data, only compiled where stale), plus the site table
+        import build
+        shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
+        data_objs = build.compile_game_data(base_obj + '_data', shim)
+        if data_objs is None:
+            return 1
+        o = os.path.join(obj, '_sky_sites.obj')
+        r = subprocess.run([comp.clang, '-c', '-O1', '-w', '-I', HERE, '-I', gen] + comp.plat + [os.path.join(gen, 'sky_sites.c'), '-o', o],
+                           capture_output=True, text=True)
+        if r.returncode:
+            log('could not compile sky_sites.c:\n%s' % (r.stdout + r.stderr)[-2000:])
+            return 1
+        objs = objs + data_objs + [o]
     else:
         shim = os.path.join(HERE, os.environ.get('RECOMP_SHIM', 'game_shim_eh.c'))
         cmd_head, cmd_tail = [comp.clang, '-shared', '-O1', '-w', '-I', HERE, '-I', gen, shim, os.path.join(gen, 'sky_sites.c')], []
-    rsp = dll + '.rsp'
-    with open(rsp, 'w') as f:
-        f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
-    cmd = cmd_head + ['@' + rsp, '-o', dll, '-Wl,/MAP:' + mapfile] + cmd_tail
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    if POSIX:                                       # .so / .dylib: build.link_dll, the way the base set was linked
+        import build
+        r = build.link_dll(objs, dll, rsp, implib=False, fltused=bool(rl.module))
+    else:
+        with open(rsp, 'w') as f:
+            f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
+        cmd = cmd_head + ['@' + rsp, '-o', dll, '-Wl,/MAP:' + mapfile] + cmd_tail
+        r = subprocess.run(cmd, capture_output=True, text=True)
     t_link = time.time() - t2
     log((r.stdout + r.stderr)[-3000:])
     log('link %s: exit %d, %d objects (%d re-compiled), %.0f MB, %.0fs' % (os.path.basename(dll), r.returncode, len(objs), len(mine & set(base)),
                                                                      os.path.getsize(dll) / 2.0 ** 20 if os.path.exists(dll) else 0, t_link))
     if r.returncode:
         return r.returncode
-    if rl.module:
+    if rl.module and not POSIX:
         for ext in ('.lib', '.exp'):                                    # nothing links against a module DLL (build_nro.py)
             if os.path.exists(dll[:-4] + ext):
                 os.remove(dll[:-4] + ext)
-    n, res = pe_fn_table_check(dll, mapfile, new, rl.table_sym)
+    if TARGET == 'macos':                                               # Mach-O: not read here; the run-time log shows the sites
+        n, res = len(rl.func_set), {a: True for a in new}
+        log('fn_table check skipped on macOS (the log of the first run lists the compiled-in sites)')
+    elif POSIX:
+        n, res = elf_fn_table_check(dll, new, rl.table_sym)
+    else:
+        n, res = pe_fn_table_check(dll, mapfile, new, rl.table_sym)
     line = 'fn_table of %s: %d entries (base %d); new entries %s' % (os.path.basename(dll), n, len(rl.all_funcs),
                                                                   ', '.join('%x %s' % (a, 'present' if ok else 'MISSING') for a, ok in sorted(res.items())) or 'none')
     log(line)
